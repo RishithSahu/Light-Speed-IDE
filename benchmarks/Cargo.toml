@@ -1,0 +1,19 @@
+[package]
+name = "ls-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LightSpeed benchmark harness and workloads"
+
+[[bin]]
+name = "ls-bench"
+path = "src/main.rs"
+
+[dependencies]
+ls-buffer.workspace = true
+ls-core.workspace = true
+ls-perf.workspace = true
+ls-scheduler.workspace = true
+ls-platform.workspace = true
+ls-log.workspace = true

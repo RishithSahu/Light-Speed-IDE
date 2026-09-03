@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+/benchmarks/results/*.json
+/workloads/generated/
+*.pdb
+
+# Agent/editor tooling that is not part of LightSpeed itself
+/.claude/
+/CLAUDE.md

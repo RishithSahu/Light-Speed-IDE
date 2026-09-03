@@ -1,0 +1,315 @@
+    Finished `release` profile [optimized + debuginfo] target(s) in 0.12s
+     Running `target\release\ls-bench.exe --json benchmarks/results/stage-1.1-item3.json`
+LightSpeed benchmark - editor core v0.1.0
+workload definitions v1
+Windows_NT / 12th Gen Intel(R) Core(TM) i5-12450HX / 12 cores / 16.0 GB RAM / release build
+gpu: not used by the headless benchmark
+
+D1_1KB - 1031 bytes, 48 lines, 21 bytes/line, flavor Source
+  rope: depth 1, 8.0 KB resident for 1.0 KB of text (7.95x)
+
+D2_64KB - 65539 bytes, 2448 lines, 27 bytes/line, flavor Source
+  rope: depth 3, 56.0 KB resident for 64.0 KB of text (0.87x)
+
+D3_1MB - 1048582 bytes, 37674 lines, 28 bytes/line, flavor Source
+  rope: depth 4, 1.2 MB resident for 1.0 MB of text (1.19x)
+
+D4_10MB - 10485796 bytes, 375675 lines, 28 bytes/line, flavor Source
+  rope: depth 5, 11.8 MB resident for 10.0 MB of text (1.18x)
+
+D5_100MB - 104857615 bytes, 3752539 lines, 28 bytes/line, flavor Source
+  rope: depth 6, 116.0 MB resident for 100.0 MB of text (1.16x)
+
+U1_1MB_unicode - 1048578 bytes, 29186 lines, 36 bytes/line, flavor Unicode
+  rope: depth 4, 664.0 KB resident for 1.0 MB of text (0.65x)
+
+L1_10MB_one_line - 10485796 bytes, 1 lines, 10485796 bytes/line, flavor SingleLine
+  rope: depth 5, 10.6 MB resident for 10.0 MB of text (1.06x)
+
+scenario                   workload               n        p50        p95        p99        max       rss budget
+----------------------------------------------------------------------------------------------------------------
+startup.core_construct     W1_empty              20    82.6 us   203.0 us   373.5 us   373.5 us    5.6 MB      -
+    headless core only; process RSS 5.6 MB (baseline 5.1 MB)
+scheduler.submit           S1_scheduler        2000     900 ns     7.7 us    64.9 us   693.8 us    6.0 MB      -
+    interactive-thread cost of admission; part of the input-to-state budget
+scheduler.drain_completions S1_scheduler         500     500 ns     900 ns     1.3 us     7.2 us    5.9 MB      -
+    interactive-thread cost of collecting eight finished tasks
+scheduler.turnaround_empty S1_scheduler         500     1.9 us     3.0 us     9.6 us    52.4 us    5.9 MB      -
+    submit to completion for a no-op task, including worker wake
+scheduler.queue_wait_saturated S1_scheduler         512     6.5 us   344.1 us   503.9 us   515.4 us    6.2 MB      -
+    512 tasks, 4 workers; submitted in 978.2 us, all finished in 1.22 ms; 0 rejected
+scheduler.task_wall_time   S1_scheduler         512     700 ns     1.4 us     2.2 us    42.7 us    6.2 MB      -
+    512 records retained for accounting
+buffer.build               D1_1KB                30     800 ns     1.0 us     1.1 us     1.1 us    5.8 MB      -
+document.open              D1_1KB                20   587.3 us   812.6 us   833.6 us   833.6 us    5.9 MB     ok
+document.save              D1_1KB                20    2.91 ms    4.37 ms    4.39 ms    4.39 ms    6.5 MB      -
+edit.type_char_start       D1_1KB              2000     1.3 us     2.5 us     3.7 us    32.1 us    6.7 MB     ok
+edit.type_char_middle      D1_1KB              2000     800 ns     900 ns     1.5 us    17.1 us    6.9 MB     ok
+edit.type_char_end         D1_1KB              2000     700 ns     900 ns     1.1 us    14.2 us    7.0 MB     ok
+edit.backspace             D1_1KB              2000     900 ns     1.0 us     1.8 us    22.1 us    7.4 MB     ok
+edit.paste_1kb             D1_1KB               200     3.2 us     7.4 us    14.2 us    22.1 us    7.9 MB     ok
+cursor.char                D1_1KB              2000     1.1 us     2.4 us     2.6 us     6.9 us    8.0 MB     ok
+cursor.word                D1_1KB              2000     1.3 us     2.3 us     2.6 us     3.8 us    8.1 MB     ok
+cursor.line                D1_1KB              2000     2.2 us     4.0 us     4.7 us     9.1 us    8.1 MB     ok
+cursor.page                D1_1KB              2000     700 ns     2.1 us     3.8 us     4.9 us    8.1 MB     ok
+selection.extend_line      D1_1KB              2000     2.3 us     4.2 us     4.6 us     9.2 us    8.1 MB     ok
+cursor.document_end        D1_1KB                50     500 ns     700 ns     800 ns     800 ns    8.1 MB     ok
+edit.undo                  D1_1KB               400     900 ns     1.2 us     1.8 us     2.5 us    8.2 MB     ok
+edit.redo                  D1_1KB               400     800 ns     1.1 us     1.1 us     1.2 us    8.2 MB     ok
+render.snapshot_50_lines   D1_1KB              1000    35.4 us    41.0 us    44.4 us    51.4 us    8.3 MB     ok
+tab.switch                 D1_1KB               500     200 ns     200 ns     200 ns     200 ns    8.3 MB     ok
+query.line_to_char         D1_1KB              2000     300 ns     600 ns     700 ns     1.0 us    8.3 MB      -
+document.open_request      D1_1KB                60   171.1 us   213.2 us   396.0 us   396.0 us    6.0 MB     ok
+    interactive part of an open: canonicalize, identity, submit - the read is elsewhere
+document.open_join         D1_1KB                64    88.6 us   147.2 us   253.2 us   253.2 us    6.0 MB     ok
+    64 duplicate requests, 64 joined, 1 underlying load(s); task 1
+document.save_request      D1_1KB                28     2.9 us    16.8 us    46.4 us    46.4 us    6.1 MB     ok
+    interactive part of a save: snapshot the rope, capture both versions, submit (1.0 KB written)
+document.save_end_to_end   D1_1KB                16    2.14 ms    2.43 ms    2.43 ms    2.43 ms    6.1 MB      -
+    request to applied completion; 1.0 KB written, last queue wait 1.4 us
+A2.save_supersession       D1_1KB                64     1.2 us     1.9 us     7.7 us     7.7 us    6.2 MB     ok
+    64 rapid requests: 1 started, 1 queued, 62 replaced a queued one
+A2.save_request_behind_queued_work D1_1KB                24     8.5 us    68.7 us    70.5 us    70.5 us    6.4 MB     ok
+    24 second-document save requests with another save already admitted, 0 not started immediately
+buffer.build               D2_64KB               30    39.9 us    40.4 us    45.1 us    45.1 us    7.0 MB      -
+document.open              D2_64KB               20   838.6 us    1.43 ms    2.69 ms    2.69 ms    7.0 MB     ok
+document.save              D2_64KB               20    3.28 ms    4.17 ms    5.81 ms    5.81 ms    7.3 MB      -
+edit.type_char_start       D2_64KB             2000     1.0 us     1.2 us     2.1 us    16.1 us    7.5 MB     ok
+edit.type_char_middle      D2_64KB             2000     1.0 us     1.3 us     1.9 us    79.8 us    7.6 MB     ok
+edit.type_char_end         D2_64KB             2000     1.0 us     1.2 us     1.8 us   120.8 us    7.7 MB     ok
+edit.backspace             D2_64KB             2000     1.0 us     1.1 us     2.0 us     6.8 us    7.8 MB     ok
+edit.paste_1kb             D2_64KB              200     3.3 us     7.9 us    13.0 us    24.8 us    8.3 MB     ok
+cursor.char                D2_64KB             2000     1.4 us     2.0 us     2.6 us   112.4 us    8.2 MB     ok
+cursor.word                D2_64KB             2000     1.5 us     2.3 us     2.5 us    20.7 us    8.3 MB     ok
+cursor.line                D2_64KB             2000     2.3 us     3.9 us     4.8 us   116.8 us    8.4 MB     ok
+cursor.page                D2_64KB             2000     1.1 us     3.5 us     4.3 us     6.4 us    8.4 MB     ok
+selection.extend_line      D2_64KB             2000     2.6 us     4.2 us     5.1 us   109.8 us    8.4 MB     ok
+cursor.document_end        D2_64KB               50     1.0 us     1.2 us    18.5 us    18.5 us    8.4 MB     ok
+edit.undo                  D2_64KB              400     900 ns     1.3 us     8.3 us    18.3 us    8.5 MB     ok
+edit.redo                  D2_64KB              400     800 ns     1.0 us     1.1 us     1.2 us    8.5 MB     ok
+render.snapshot_50_lines   D2_64KB             1000    37.1 us    50.1 us    82.4 us   160.3 us    8.5 MB     ok
+tab.switch                 D2_64KB              500     200 ns     200 ns     200 ns     200 ns    8.5 MB     ok
+query.line_to_char         D2_64KB             2000     400 ns     700 ns     800 ns     5.1 us    8.6 MB      -
+document.open_request      D2_64KB               60   175.5 us   249.0 us   304.5 us   304.5 us    7.0 MB     ok
+    interactive part of an open: canonicalize, identity, submit - the read is elsewhere
+document.open_join         D2_64KB               64    81.7 us   123.2 us   160.6 us   160.6 us    7.3 MB     ok
+    64 duplicate requests, 64 joined, 1 underlying load(s); task 1
+document.save_request      D2_64KB               28     4.1 us    19.8 us    20.7 us    20.7 us    7.2 MB     ok
+    interactive part of a save: snapshot the rope, capture both versions, submit (64.0 KB written)
+document.save_end_to_end   D2_64KB               16    3.11 ms    4.17 ms    4.17 ms    4.17 ms    7.3 MB      -
+    request to applied completion; 64.0 KB written, last queue wait 6.3 us
+A2.save_supersession       D2_64KB               64     1.3 us     1.9 us     4.6 us     4.6 us    7.3 MB     ok
+    64 rapid requests: 1 started, 1 queued, 62 replaced a queued one
+A2.save_request_behind_queued_work D2_64KB               24     6.3 us    22.6 us    29.0 us    29.0 us    7.3 MB     ok
+    24 second-document save requests with another save already admitted, 0 not started immediately
+buffer.build               D3_1MB                30   968.5 us    1.27 ms    1.78 ms    1.78 ms    9.3 MB      -
+document.open              D3_1MB                20    3.56 ms    8.55 ms    8.64 ms    8.64 ms    8.7 MB      -
+document.save              D3_1MB                20    5.50 ms    9.53 ms   10.96 ms   10.96 ms    9.7 MB      -
+edit.type_char_start       D3_1MB              1000     900 ns     1.2 us     2.1 us    16.1 us    9.9 MB     ok
+edit.type_char_middle      D3_1MB              1000     900 ns     1.1 us     1.3 us     9.2 us    9.7 MB     ok
+edit.type_char_end         D3_1MB              1000     1.1 us     1.4 us     1.7 us     9.2 us    9.8 MB     ok
+edit.backspace             D3_1MB              1000     1.3 us     1.5 us     1.9 us    10.5 us    9.8 MB     ok
+edit.paste_1kb             D3_1MB               100     4.6 us    15.6 us    21.1 us   137.6 us   10.1 MB     ok
+cursor.char                D3_1MB              1000     1.4 us     2.3 us     2.3 us     2.4 us   10.1 MB     ok
+cursor.word                D3_1MB              1000     2.7 us     4.0 us     4.4 us     9.1 us   10.2 MB     ok
+cursor.line                D3_1MB              1000     3.8 us     7.3 us     9.4 us   127.6 us   10.2 MB     ok
+cursor.page                D3_1MB              1000     1.9 us     4.4 us     4.9 us    14.8 us   10.2 MB     ok
+selection.extend_line      D3_1MB              1000     2.9 us     4.4 us     4.7 us   108.2 us   10.2 MB     ok
+cursor.document_end        D3_1MB                50     1.1 us     1.4 us     1.5 us     1.5 us   10.2 MB     ok
+edit.undo                  D3_1MB               250     900 ns     1.4 us     2.5 us     6.6 us   10.3 MB     ok
+edit.redo                  D3_1MB               250     800 ns     1.0 us     1.1 us     6.6 us   10.3 MB     ok
+render.snapshot_50_lines   D3_1MB               500    44.2 us    60.9 us    85.4 us   208.8 us   10.3 MB     ok
+tab.switch                 D3_1MB               500     200 ns     200 ns     200 ns     200 ns   10.3 MB     ok
+query.line_to_char         D3_1MB              1000     500 ns     900 ns     1.0 us     6.6 us   10.3 MB      -
+document.open_request      D3_1MB                60   156.8 us   218.7 us   253.9 us   253.9 us    8.7 MB     ok
+    interactive part of an open: canonicalize, identity, submit - the read is elsewhere
+document.open_join         D3_1MB                64    81.1 us   118.7 us   172.5 us   172.5 us    9.6 MB     ok
+    64 duplicate requests, 64 joined, 1 underlying load(s); task 1
+document.save_request      D3_1MB                28     5.6 us    19.5 us    32.2 us    32.2 us    9.9 MB     ok
+    interactive part of a save: snapshot the rope, capture both versions, submit (1.0 MB written)
+document.save_end_to_end   D3_1MB                16    4.99 ms    8.85 ms    8.85 ms    8.85 ms    9.7 MB      -
+    request to applied completion; 1.0 MB written, last queue wait 3.0 us
+A2.save_supersession       D3_1MB                64     1.4 us     1.7 us    10.8 us    10.8 us    9.6 MB     ok
+    64 rapid requests: 1 started, 1 queued, 62 replaced a queued one
+A2.save_request_behind_queued_work D3_1MB                24     4.6 us    43.1 us    56.0 us    56.0 us    9.9 MB     ok
+    24 second-document save requests with another save already admitted, 0 not started immediately
+A2.keystroke_during_save   D3_1MB              3626     1.1 us     1.6 us     2.2 us    51.8 us    9.8 MB     ok
+    3626 keystrokes while 1.0 MB was written in 5.15 ms; RSS before 9.7 MB -> after snapshot 9.7 MB -> during write 9.8 MB -> after completion 9.7 MB
+A2.pump_during_save        D3_1MB              3626     100 ns     100 ns     100 ns     8.2 us    9.8 MB     ok
+    cost of checking for the save completion each frame
+A2.cursor_during_save      D3_1MB              6569     500 ns     700 ns     1.1 us    15.0 us    9.9 MB     ok
+    6569 cursor movements while the save was in flight
+A2.render_snapshot_during_save D3_1MB               190    23.7 us    30.2 us    34.6 us    41.7 us    9.3 MB     ok
+    190 snapshots published while the save was in flight
+buffer.build               D4_10MB                5   11.17 ms   13.39 ms   13.39 ms   13.39 ms   29.1 MB      -
+document.open              D4_10MB                3   30.28 ms   31.26 ms   31.26 ms   31.26 ms   18.1 MB      -
+document.save              D4_10MB                3   43.21 ms   46.02 ms   46.02 ms   46.02 ms   29.6 MB      -
+edit.type_char_start       D4_10MB              500     1.8 us     2.2 us    11.6 us    51.1 us   29.8 MB     ok
+edit.type_char_middle      D4_10MB              500     1.8 us     2.1 us     5.3 us    25.4 us   29.9 MB     ok
+edit.type_char_end         D4_10MB              500     1.9 us     3.4 us     4.1 us   192.2 us   30.0 MB     ok
+edit.backspace             D4_10MB              500     2.2 us     2.6 us     3.8 us    48.6 us   30.0 MB     ok
+edit.paste_1kb             D4_10MB               50     6.9 us    18.4 us    24.0 us    24.0 us   30.1 MB     ok
+cursor.char                D4_10MB              500     3.6 us     4.1 us     4.2 us    36.5 us   30.1 MB     ok
+cursor.word                D4_10MB              500     2.4 us     4.1 us     4.7 us    20.8 us   30.1 MB     ok
+cursor.line                D4_10MB              500     4.4 us     7.4 us     7.8 us    25.7 us   30.1 MB     ok
+cursor.page                D4_10MB              500     5.3 us     8.1 us     8.6 us    27.1 us   30.1 MB     ok
+selection.extend_line      D4_10MB              500     4.9 us     8.0 us     8.3 us    17.7 us   30.1 MB     ok
+cursor.document_end        D4_10MB               50     1.9 us     2.3 us     2.4 us     2.4 us   30.1 MB     ok
+edit.undo                  D4_10MB              125     1.7 us     3.1 us     6.2 us    15.0 us   30.1 MB     ok
+edit.redo                  D4_10MB              125     1.5 us     1.8 us     1.9 us     2.3 us   30.1 MB     ok
+render.snapshot_50_lines   D4_10MB              250    87.0 us    95.6 us   102.0 us   234.9 us   30.1 MB     ok
+tab.switch                 D4_10MB              500     300 ns     400 ns     400 ns     400 ns   30.1 MB     ok
+query.line_to_char         D4_10MB              500     900 ns     1.6 us     1.9 us   199.1 us   30.1 MB      -
+document.open_request      D4_10MB               60   186.7 us   340.2 us   404.0 us   404.0 us   18.1 MB     ok
+    interactive part of an open: canonicalize, identity, submit - the read is elsewhere
+document.open_join         D4_10MB               64    89.9 us   265.7 us   283.6 us   283.6 us   29.3 MB     ok
+    64 duplicate requests, 64 joined, 1 underlying load(s); task 1
+A1.keystroke_during_open   D4_10MB            27722     800 ns     1.1 us     1.4 us   518.9 us   32.3 MB     ok
+    27722 keystrokes while 10.0 MB loaded in 29.10 ms (375676 lines)
+A1.pump_during_open        D4_10MB            27722     100 ns     100 ns     100 ns    20.9 us   32.3 MB     ok
+    cost of checking for finished background work each frame
+document.save_request      D4_10MB               28    14.7 us    50.4 us   129.3 us   129.3 us   29.5 MB     ok
+    interactive part of a save: snapshot the rope, capture both versions, submit (10.0 MB written)
+document.save_end_to_end   D4_10MB                3   50.36 ms   68.15 ms   68.15 ms   68.15 ms   29.5 MB      -
+    request to applied completion; 10.0 MB written, last queue wait 61.6 us
+A2.save_supersession       D4_10MB               64     4.1 us     7.5 us   105.9 us   105.9 us   29.6 MB     ok
+    64 rapid requests: 1 started, 1 queued, 62 replaced a queued one
+A2.save_request_behind_queued_work D4_10MB               24    12.3 us   128.2 us   911.0 us   911.0 us   29.8 MB     ok
+    24 second-document save requests with another save already admitted, 0 not started immediately
+A2.keystroke_during_save   D4_10MB            23777     1.9 us     2.3 us     3.0 us   292.8 us   33.2 MB     ok
+    23777 keystrokes while 10.0 MB was written in 58.26 ms; RSS before 29.5 MB -> after snapshot 29.5 MB -> during write 33.2 MB -> after completion 33.2 MB
+A2.pump_during_save        D4_10MB            23777     100 ns     200 ns     200 ns    13.3 us   33.2 MB     ok
+    cost of checking for the save completion each frame
+A2.cursor_during_save      D4_10MB            33094     1.0 us     1.5 us     1.6 us   231.0 us   31.7 MB     ok
+    33094 cursor movements while the save was in flight
+A2.render_snapshot_during_save D4_10MB              829    57.0 us    68.4 us   209.2 us   494.3 us   29.8 MB     ok
+    829 snapshots published while the save was in flight
+buffer.build               D5_100MB               5  197.35 ms  204.51 ms  204.51 ms  204.51 ms  224.3 MB      -
+document.open              D5_100MB               3  558.83 ms  590.01 ms  590.01 ms  590.01 ms  109.9 MB      -
+document.save              D5_100MB               3     1.21 s     7.63 s     7.63 s     7.63 s  224.8 MB      -
+edit.type_char_start       D5_100MB             250     2.3 us     2.6 us    22.1 us    89.5 us  224.9 MB     ok
+edit.type_char_middle      D5_100MB             250     2.5 us     2.7 us    14.8 us    34.4 us  225.0 MB     ok
+edit.type_char_end         D5_100MB             250     2.6 us     2.9 us     5.0 us    11.5 us  225.1 MB     ok
+edit.backspace             D5_100MB             250     3.2 us     3.7 us     6.9 us    63.2 us  225.1 MB     ok
+edit.paste_1kb             D5_100MB              25     7.9 us    26.1 us    27.2 us    27.2 us  225.2 MB     ok
+cursor.char                D5_100MB             250     3.1 us     3.4 us     3.5 us    15.7 us  225.2 MB     ok
+cursor.word                D5_100MB             250     3.1 us     4.8 us     5.3 us     5.4 us  225.2 MB     ok
+cursor.line                D5_100MB             250     5.8 us     9.5 us    13.9 us   262.3 us  225.2 MB     ok
+cursor.page                D5_100MB             250     6.9 us    10.4 us    10.9 us   131.1 us  225.2 MB     ok
+selection.extend_line      D5_100MB             250     6.4 us    10.5 us    10.8 us    28.2 us  225.2 MB     ok
+cursor.document_end        D5_100MB              50     2.0 us     2.7 us     2.9 us     2.9 us  225.2 MB     ok
+edit.undo                  D5_100MB              62     1.9 us     3.1 us     7.1 us     7.1 us  225.3 MB     ok
+edit.redo                  D5_100MB              62     1.7 us     2.2 us     2.3 us     2.3 us  225.3 MB     ok
+render.snapshot_50_lines   D5_100MB             125   101.4 us   114.8 us   128.5 us   230.1 us  225.3 MB     ok
+tab.switch                 D5_100MB             500     400 ns     400 ns     400 ns     400 ns  225.3 MB     ok
+query.line_to_char         D5_100MB             250     1.0 us     1.9 us     2.0 us     2.1 us  225.3 MB      -
+document.open_request      D5_100MB              60   632.5 us    1.22 ms    3.78 ms    3.78 ms  110.0 MB     ok
+    interactive part of an open: canonicalize, identity, submit - the read is elsewhere
+document.open_join         D5_100MB              64   716.6 us    1.33 ms    2.82 ms    2.82 ms  224.8 MB     ok
+    64 duplicate requests, 64 joined, 1 underlying load(s); task 1
+A1.keystroke_during_open   D5_100MB          256695     1.5 us     1.8 us     2.2 us    1.90 ms  247.1 MB     ok
+    256695 keystrokes while 100.0 MB loaded in 520.36 ms (3752540 lines)
+A1.pump_during_open        D5_100MB          256695     100 ns     200 ns     200 ns   198.2 us  247.1 MB     ok
+    cost of checking for finished background work each frame
+document.save_request      D5_100MB              28    21.8 us    99.6 us   188.7 us   188.7 us  225.2 MB     ok
+    interactive part of a save: snapshot the rope, capture both versions, submit (100.0 MB written)
+document.save_end_to_end   D5_100MB               3  688.27 ms  719.57 ms  719.57 ms  719.57 ms  225.1 MB      -
+    request to applied completion; 100.0 MB written, last queue wait 16.7 us
+A2.save_supersession       D5_100MB              64     3.6 us     5.3 us    20.3 us    20.3 us  225.3 MB     ok
+    64 rapid requests: 1 started, 1 queued, 62 replaced a queued one
+A2.save_request_behind_queued_work D5_100MB              24    13.9 us    86.8 us   213.8 us   213.8 us  225.3 MB     ok
+    24 second-document save requests with another save already admitted, 0 not started immediately
+A2.keystroke_during_save   D5_100MB          420069     2.1 us     2.7 us     2.9 us    4.31 ms  261.1 MB     ok
+    420069 keystrokes while 100.0 MB was written in 1.16 s; RSS before 225.1 MB -> after snapshot 225.1 MB -> during write 261.1 MB -> after completion 261.1 MB
+A2.pump_during_save        D5_100MB          420069     100 ns     200 ns     200 ns   981.4 us  261.1 MB     ok
+    cost of checking for the save completion each frame
+A2.cursor_during_save      D5_100MB          369224     1.0 us     1.7 us     1.9 us    1.83 ms  231.8 MB     ok
+    369224 cursor movements while the save was in flight
+A2.render_snapshot_during_save D5_100MB            8528    58.1 us    73.2 us   214.7 us    2.33 ms  225.4 MB     ok
+    8528 snapshots published while the save was in flight
+buffer.build               U1_1MB_unicode        30    1.55 ms    1.90 ms    3.52 ms    3.52 ms   11.8 MB      -
+document.open              U1_1MB_unicode        20    7.90 ms   10.29 ms   11.01 ms   11.01 ms   11.0 MB      -
+document.save              U1_1MB_unicode        20    8.31 ms    9.74 ms    9.86 ms    9.86 ms   12.0 MB      -
+edit.type_char_start       U1_1MB_unicode      1000     2.9 us     4.3 us     5.6 us    48.4 us   12.2 MB     ok
+edit.type_char_middle      U1_1MB_unicode      1000     3.6 us     4.6 us     4.8 us    23.6 us   12.2 MB     ok
+edit.type_char_end         U1_1MB_unicode      1000     3.5 us     4.8 us     5.1 us    19.2 us   12.3 MB     ok
+edit.backspace             U1_1MB_unicode      1000     5.6 us     8.8 us     9.3 us   110.4 us   12.3 MB     ok
+edit.paste_1kb             U1_1MB_unicode       100     9.9 us    26.2 us    33.7 us    37.0 us   12.6 MB     ok
+cursor.char                U1_1MB_unicode      1000     6.7 us     9.2 us     9.6 us    14.5 us   12.6 MB     ok
+cursor.word                U1_1MB_unicode      1000     8.5 us    17.2 us    19.8 us   142.6 us   12.6 MB     ok
+cursor.line                U1_1MB_unicode      1000    10.2 us    16.3 us    17.2 us   157.6 us   12.6 MB     ok
+cursor.page                U1_1MB_unicode      1000     3.3 us    17.8 us    19.3 us    26.9 us   12.6 MB     ok
+selection.extend_line      U1_1MB_unicode      1000    11.1 us    18.1 us    22.1 us   138.8 us   12.6 MB     ok
+cursor.document_end        U1_1MB_unicode        50     3.4 us     4.1 us     4.2 us     4.2 us   12.6 MB     ok
+edit.undo                  U1_1MB_unicode       250     3.2 us     6.1 us     7.8 us    11.8 us   12.7 MB     ok
+edit.redo                  U1_1MB_unicode       250     2.5 us     3.8 us     4.0 us     4.1 us   12.7 MB     ok
+render.snapshot_50_lines   U1_1MB_unicode       500   227.7 us   268.0 us   396.3 us   510.2 us   12.7 MB     ok
+tab.switch                 U1_1MB_unicode       500     400 ns     400 ns     400 ns     400 ns   12.7 MB     ok
+query.line_to_char         U1_1MB_unicode      1000     1.2 us     2.0 us     2.1 us    20.6 us   12.7 MB      -
+document.open_request      U1_1MB_unicode        60   533.9 us   656.2 us   860.1 us   860.1 us   11.0 MB     ok
+    interactive part of an open: canonicalize, identity, submit - the read is elsewhere
+document.open_join         U1_1MB_unicode        64   147.4 us   362.9 us   545.1 us   545.1 us   11.4 MB     ok
+    64 duplicate requests, 64 joined, 1 underlying load(s); task 1
+document.save_request      U1_1MB_unicode        28    22.7 us   109.1 us   472.3 us   472.3 us   11.7 MB     ok
+    interactive part of a save: snapshot the rope, capture both versions, submit (1.0 MB written)
+document.save_end_to_end   U1_1MB_unicode        16    7.95 ms   10.80 ms   10.80 ms   10.80 ms   11.7 MB      -
+    request to applied completion; 1.0 MB written, last queue wait 4.6 us
+A2.save_supersession       U1_1MB_unicode        64     3.2 us     4.4 us   514.4 us   514.4 us   11.8 MB     ok
+    64 rapid requests: 1 started, 1 queued, 62 replaced a queued one
+A2.save_request_behind_queued_work U1_1MB_unicode        24    12.4 us   150.7 us   233.1 us   233.1 us   11.6 MB     ok
+    24 second-document save requests with another save already admitted, 0 not started immediately
+A2.keystroke_during_save   U1_1MB_unicode      1935     3.1 us     4.4 us     4.6 us   139.4 us   11.9 MB     ok
+    1935 keystrokes while 1.0 MB was written in 7.21 ms; RSS before 11.8 MB -> after snapshot 11.8 MB -> during write 11.9 MB -> after completion 11.9 MB
+A2.pump_during_save        U1_1MB_unicode      1935     100 ns     200 ns     200 ns     8.5 us   11.9 MB     ok
+    cost of checking for the save completion each frame
+A2.cursor_during_save      U1_1MB_unicode      1513     3.0 us     5.0 us     7.7 us   416.2 us   11.8 MB     ok
+    1513 cursor movements while the save was in flight
+A2.render_snapshot_during_save U1_1MB_unicode        56   151.2 us   423.7 us   523.9 us   523.9 us   11.8 MB     ok
+    56 snapshots published while the save was in flight
+buffer.build               L1_10MB_one_line       5   20.04 ms   20.50 ms   20.50 ms   20.50 ms   30.8 MB      -
+document.open              L1_10MB_one_line       3   50.90 ms   57.92 ms   57.92 ms   57.92 ms   20.8 MB      -
+document.save              L1_10MB_one_line       3   60.74 ms  151.68 ms  151.68 ms  151.68 ms   30.9 MB      -
+edit.type_char_start       L1_10MB_one_line     500     1.5 us     1.8 us     4.8 us    52.1 us   31.1 MB     ok
+edit.type_char_middle      L1_10MB_one_line     500     1.6 us     1.9 us     4.0 us    24.3 us   31.2 MB     ok
+edit.type_char_end         L1_10MB_one_line     500     1.6 us     1.8 us     2.3 us    16.5 us   31.2 MB     ok
+edit.backspace             L1_10MB_one_line     500     1.9 us     2.1 us     2.7 us    18.1 us   31.2 MB     ok
+edit.paste_1kb             L1_10MB_one_line      50     6.1 us    24.1 us    27.4 us    27.4 us   31.4 MB     ok
+cursor.char                L1_10MB_one_line     500     1.0 us     1.1 us     1.1 us     1.3 us   31.4 MB     ok
+cursor.word                L1_10MB_one_line     500     900 ns     1.3 us     1.4 us     1.9 us   31.4 MB     ok
+cursor.line                L1_10MB_one_line     500     4.2 us     7.9 us    10.0 us   115.0 us   31.5 MB     ok
+cursor.page                L1_10MB_one_line     500     1.3 us     4.2 us     8.1 us    23.6 us   31.5 MB     ok
+selection.extend_line      L1_10MB_one_line     500     4.6 us     8.1 us     9.0 us    17.0 us   31.5 MB     ok
+cursor.document_end        L1_10MB_one_line      50     800 ns     1.5 us     1.5 us     1.5 us   31.5 MB     ok
+edit.undo                  L1_10MB_one_line     125     1.8 us     2.5 us     8.3 us     8.7 us   31.5 MB     ok
+edit.redo                  L1_10MB_one_line     125     1.5 us     1.9 us     2.0 us     2.4 us   31.5 MB     ok
+render.snapshot_50_lines   L1_10MB_one_line     250    77.8 us    89.1 us   182.5 us   254.9 us   31.5 MB     ok
+tab.switch                 L1_10MB_one_line     500     300 ns     400 ns     400 ns     500 ns   31.5 MB     ok
+query.line_to_char         L1_10MB_one_line     500     700 ns     1.3 us     1.4 us     1.5 us   31.5 MB      -
+document.open_request      L1_10MB_one_line      60   638.6 us    3.52 ms    4.32 ms    4.32 ms   20.8 MB   over
+    interactive part of an open: canonicalize, identity, submit - the read is elsewhere
+document.open_join         L1_10MB_one_line      64   270.3 us   732.4 us   802.3 us   802.3 us   31.1 MB     ok
+    64 duplicate requests, 64 joined, 1 underlying load(s); task 1
+A1.keystroke_during_open   L1_10MB_one_line   23381     1.8 us     2.3 us     2.6 us   395.3 us   34.5 MB     ok
+    23381 keystrokes while 10.0 MB loaded in 58.11 ms (1 lines)
+A1.pump_during_open        L1_10MB_one_line   23381     200 ns     200 ns     300 ns    42.2 us   34.5 MB     ok
+    cost of checking for finished background work each frame
+document.save_request      L1_10MB_one_line      28    40.6 us    97.4 us   118.2 us   118.2 us   31.3 MB     ok
+    interactive part of a save: snapshot the rope, capture both versions, submit (10.0 MB written)
+document.save_end_to_end   L1_10MB_one_line       3   61.47 ms   68.43 ms   68.43 ms   68.43 ms   31.2 MB      -
+    request to applied completion; 10.0 MB written, last queue wait 3.8 us
+A2.save_supersession       L1_10MB_one_line      64     2.7 us     3.8 us    23.1 us    23.1 us   31.3 MB     ok
+    64 rapid requests: 1 started, 1 queued, 62 replaced a queued one
+A2.save_request_behind_queued_work L1_10MB_one_line      24    14.5 us   147.3 us   260.9 us   260.9 us   31.3 MB     ok
+    24 second-document save requests with another save already admitted, 0 not started immediately
+A2.keystroke_during_save   L1_10MB_one_line   26078     1.6 us     1.8 us     2.7 us   557.6 us   35.0 MB     ok
+    26078 keystrokes while 10.0 MB was written in 57.51 ms; RSS before 31.1 MB -> after snapshot 31.1 MB -> during write 35.0 MB -> after completion 35.0 MB
+A2.pump_during_save        L1_10MB_one_line   26078     100 ns     200 ns     200 ns   183.7 us   35.0 MB     ok
+    cost of checking for the save completion each frame
+A2.cursor_during_save      L1_10MB_one_line     624     800 ns   250.7 us   556.3 us    1.02 ms   31.3 MB     ok
+    624 cursor movements while the save was in flight
+A2.render_snapshot_during_save L1_10MB_one_line   19101     2.6 us     2.8 us     2.9 us   551.3 us   32.2 MB     ok
+    19101 snapshots published while the save was in flight
+
+over target: document.open_request on L1_10MB_one_line - p95 3.52 ms (target 2.00 ms)
+
+wrote benchmarks/results/stage-1.1-item3.json

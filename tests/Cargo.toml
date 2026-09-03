@@ -1,0 +1,16 @@
+[package]
+name = "ls-tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LightSpeed cross-crate integration, architecture and regression tests"
+publish = false
+
+[dependencies]
+ls-buffer.workspace = true
+ls-core.workspace = true
+ls-perf.workspace = true
+ls-scheduler.workspace = true
+ls-platform.workspace = true
+ls-log.workspace = true

@@ -1,0 +1,17 @@
+[package]
+name = "ls-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LightSpeed editor core: documents, revisions, selection, undo, encoding, persistence, snapshots"
+
+[dependencies]
+ls-buffer.workspace = true
+ls-log.workspace = true
+ls-perf.workspace = true
+ls-platform.workspace = true
+# The editor core submits document I/O through admission (amendment section 3.4).
+ls-scheduler.workspace = true
+serde.workspace = true
+toml.workspace = true

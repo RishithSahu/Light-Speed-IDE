@@ -1,0 +1,53 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/log",
+    "crates/perf",
+    "crates/platform",
+    "crates/scheduler",
+    "crates/buffer",
+    "crates/core",
+    "app",
+    "benchmarks",
+    "tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lightspeed-ide/lightspeed"
+
+[workspace.dependencies]
+ls-log = { path = "crates/log" }
+ls-perf = { path = "crates/perf" }
+ls-platform = { path = "crates/platform" }
+ls-scheduler = { path = "crates/scheduler" }
+ls-buffer = { path = "crates/buffer" }
+ls-core = { path = "crates/core" }
+
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+windows-sys = "0.61"
+wgpu = "30.0"
+winit = "0.30.12"
+glyphon = "0.12"
+pollster = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = 1
+panic = "unwind"
+
+[profile.bench]
+inherits = "release"
+
+# Benchmarks and large-file tests are unusable in a debug build; keep deps optimized
+# even in dev so `cargo test` on 100 MB documents finishes in reasonable time.
+[profile.dev.package."*"]
+opt-level = 2

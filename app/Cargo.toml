@@ -1,0 +1,22 @@
+[package]
+name = "lightspeed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "LightSpeed IDE application shell and GPU renderer"
+
+[[bin]]
+name = "lightspeed"
+path = "src/main.rs"
+
+[dependencies]
+ls-core.workspace = true
+ls-buffer.workspace = true
+ls-log.workspace = true
+ls-perf.workspace = true
+ls-platform.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+glyphon.workspace = true
+pollster.workspace = true
