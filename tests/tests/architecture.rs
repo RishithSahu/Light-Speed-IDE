@@ -28,7 +28,20 @@ const LIBRARY_ROOTS: &[&str] = &[
 /// This list is literal on purpose: adding an entry is a reviewable change to
 /// this file, not an invisible consequence of writing `thread::spawn`
 /// somewhere.
-const WORKER_CREATION_ALLOW_LIST: &[&str] = &["crates/scheduler/src/worker.rs"];
+const WORKER_CREATION_ALLOW_LIST: &[&str] = &[
+    "crates/scheduler/src/worker.rs",
+    // A shelled-out command's stdout/stderr pipes block on read, and the
+    // scheduler's task model is bounded one-shot work, not a standing pump --
+    // there is no task shape for "read forever until the child exits". These
+    // reader threads only append bytes to a shared buffer and wake the event
+    // loop; every byte is interpreted and every state change applied on the
+    // event-loop thread, same as everywhere else (item 10).
+    "app/src/terminal.rs",
+    // Same reasoning, for a language server's stdout (item 9): reading its
+    // JSON-RPC stream blocks for the process's whole lifetime, which has no
+    // shape as a scheduler task either.
+    "app/src/lsp.rs",
+];
 
 const SHELL_ROOT: &str = "app/src";
 
@@ -75,21 +88,23 @@ fn is_allow_listed(path: &std::path::Path) -> bool {
 
 #[test]
 fn the_worker_allow_list_is_exactly_the_scheduler() {
-    // Two failure modes, both caught here: the list growing silently, and the
-    // list naming a file that no longer creates workers, which would let a real
-    // violation hide behind a stale exemption.
+    // Two failure modes, both caught here: the list growing silently beyond
+    // what is reviewed here, and the list naming a file that no longer
+    // creates workers, which would let a real violation hide behind a stale
+    // exemption.
     assert_eq!(
         WORKER_CREATION_ALLOW_LIST,
-        &["crates/scheduler/src/worker.rs"],
-        "the allow-list may only contain the scheduler's worker module"
+        &["crates/scheduler/src/worker.rs", "app/src/terminal.rs", "app/src/lsp.rs"],
+        "the allow-list may only contain what this test itself reviews"
     );
 
-    let worker = workspace_root().join("crates/scheduler/src/worker.rs");
-    let source = source_without_tests(&worker);
-    assert!(
-        source.contains("thread::Builder"),
-        "the allow-listed file should be the one that actually creates workers"
-    );
+    for allowed in WORKER_CREATION_ALLOW_LIST {
+        let source = source_without_tests(&workspace_root().join(allowed));
+        assert!(
+            source.contains("thread::Builder"),
+            "{allowed}: allow-listed but does not actually create a worker"
+        );
+    }
 }
 
 #[test]
@@ -682,4 +697,38 @@ fn tab_actions_are_addressed_by_document_id() {
         !app.contains("tabs().get(index)"),
         "the shell must not resolve a tab click through a positional index"
     );
+}
+
+// --- Resource Center (item 4: admission, accounting, pressure) -------------
+
+#[test]
+fn the_resource_center_reads_the_scheduler_only_through_ls_core() {
+    // Same boundary as `only_the_editor_core_talks_to_the_scheduler`, checked
+    // from the panel's side: it must reach admission and accounting state
+    // through re-exported types, never by adding ls-scheduler to the shell's
+    // own manifest.
+    let shell = std::fs::read_to_string(workspace_root().join("app/Cargo.toml"))
+        .expect("the shell manifest should be readable");
+    assert!(!shell.contains("ls-scheduler"), "the Resource Center must not add this dependency");
+
+    let resources = source_without_tests(&workspace_root().join(SHELL_ROOT).join("resources.rs"));
+    assert!(
+        resources.contains("ls_core::") || resources.contains("use ls_core"),
+        "the panel reads scheduler state through ls_core's re-exports"
+    );
+    assert!(!resources.contains("ls_scheduler::"), "never through the scheduler crate directly");
+}
+
+#[test]
+fn the_scheduler_still_has_no_automatic_retry() {
+    // The overload policy is reject, not retry-with-backoff (amendment
+    // section 3.5.1), and that is a deliberate, reviewed decision. This pins
+    // it down so a future "just add retry" change does not slip in silently
+    // as part of an unrelated patch -- it would need to update this test and
+    // the amendment together, which is the point.
+    let queue = source_without_tests(&workspace_root().join("crates/scheduler/src/queue.rs"));
+    let lib = source_without_tests(&workspace_root().join("crates/scheduler/src/lib.rs"));
+    for forbidden in ["fn retry", "Backoff", "exponential_backoff"] {
+        assert!(!queue.contains(forbidden) && !lib.contains(forbidden), "found {forbidden}");
+    }
 }

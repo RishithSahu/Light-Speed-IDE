@@ -15,6 +15,7 @@ pub mod dialog;
 pub mod fsops;
 pub mod paths;
 pub mod process;
+pub mod recents;
 
 use ls_log::diag::{LsError, Recoverability};
 use std::fmt;

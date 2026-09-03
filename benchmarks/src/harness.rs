@@ -18,6 +18,14 @@ impl Samples {
         self.values.push(value);
     }
 
+    /// A one-sample set, for a measurement that only happens once per
+    /// workload (an admission cost, a queue wait) rather than per keystroke.
+    pub fn from_single(value: Duration) -> Self {
+        let mut samples = Samples::new();
+        samples.push(value);
+        samples
+    }
+
     pub fn stats(&self) -> Stats {
         if self.values.is_empty() {
             return Stats::default();

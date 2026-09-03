@@ -81,11 +81,16 @@ fn resolve_named(key: NamedKey, control: bool, shift: bool) -> Binding {
         NamedKey::Enter => Binding::command("edit.insert_newline"),
         NamedKey::Tab if control && shift => Binding::command("view.previous_tab"),
         NamedKey::Tab if control => Binding::command("view.next_tab"),
+        NamedKey::Tab if shift => Binding::command("edit.dedent"),
         NamedKey::Tab => Binding::command("edit.insert_tab"),
         NamedKey::Space => Binding::InsertText,
 
         NamedKey::F12 => Binding::command("view.toggle_performance_overlay"),
         NamedKey::F9 => Binding::command("view.toggle_dev_panel"),
+        NamedKey::F10 => Binding::command("view.toggle_resource_center"),
+        NamedKey::F11 => Binding::command("view.toggle_terminal"),
+        NamedKey::F3 if shift => Binding::command("edit.find_previous"),
+        NamedKey::F3 => Binding::command("edit.find_next"),
         NamedKey::F5 => Binding::command("diagnostics.duplicate_storm"),
         NamedKey::F6 => Binding::command("diagnostics.slow_load"),
         NamedKey::F7 => Binding::command("diagnostics.failing_load"),
@@ -95,11 +100,20 @@ fn resolve_named(key: NamedKey, control: bool, shift: bool) -> Binding {
 }
 
 fn resolve_control_character(text: &str, shift: bool) -> Binding {
+    if let Some(digit) = text.chars().next().filter(|c| c.is_ascii_digit()) {
+        if !shift && digit != '0' {
+            // Ctrl+1..9: jump straight to that tab, matching how every other
+            // tabbed editor spells it.
+            let number = digit as usize - '0' as usize;
+            return Binding::Command("view.go_to_tab", CommandArgs::Index(number));
+        }
+    }
     match text.to_ascii_lowercase().as_str() {
         "n" => Binding::command("file.new"),
         "o" => Binding::command("file.open"),
         "s" if shift => Binding::command("file.save_as"),
         "s" => Binding::command("file.save"),
+        "w" if shift => Binding::command("file.close_all_clean_tabs"),
         "w" => Binding::command("file.close_tab"),
         "q" => Binding::command("app.quit"),
         "z" if shift => Binding::command("edit.redo"),
@@ -109,7 +123,38 @@ fn resolve_control_character(text: &str, shift: bool) -> Binding {
         "x" => Binding::command("edit.cut"),
         "v" => Binding::command("edit.paste"),
         "a" => Binding::command("edit.select_all"),
+        "f" if shift => Binding::command("view.workspace_search"),
+        "f" => Binding::command("edit.find"),
+        "e" if shift => Binding::command("view.toggle_file_tree"),
+        "g" if shift => Binding::command("view.toggle_git_status"),
         _ => Binding::None,
+    }
+}
+
+/// What a keystroke does while the find bar owns the keyboard.
+///
+/// A separate, tiny table -- the same reason [`resolve_prompt`] is separate --
+/// rather than a mode folded into [`resolve`]: the find bar is not editing the
+/// document, so none of `resolve`'s bindings apply to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FindAction {
+    Backspace,
+    /// Enter, or Shift+Enter for the opposite direction.
+    Next,
+    Previous,
+    Close,
+    None,
+}
+
+pub fn resolve_find(key: &Key, shift: bool) -> FindAction {
+    match key {
+        Key::Named(NamedKey::Escape) => FindAction::Close,
+        Key::Named(NamedKey::Backspace) => FindAction::Backspace,
+        Key::Named(NamedKey::Enter) if shift => FindAction::Previous,
+        Key::Named(NamedKey::Enter) => FindAction::Next,
+        Key::Named(NamedKey::F3) if shift => FindAction::Previous,
+        Key::Named(NamedKey::F3) => FindAction::Next,
+        _ => FindAction::None,
     }
 }
 
@@ -172,6 +217,65 @@ mod tests {
         let control_shift = modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
         assert_eq!(command_of(resolve(&character("s"), &control_shift)), Some("file.save_as"));
         assert_eq!(command_of(resolve(&character("z"), &control_shift)), Some("edit.redo"));
+        assert_eq!(
+            command_of(resolve(&character("w"), &control_shift)),
+            Some("file.close_all_clean_tabs")
+        );
+    }
+
+    #[test]
+    fn shift_tab_dedents_and_plain_tab_still_indents() {
+        let shift = modifiers(ModifiersState::SHIFT);
+        let none = modifiers(ModifiersState::empty());
+        assert_eq!(command_of(resolve(&Key::Named(NamedKey::Tab), &shift)), Some("edit.dedent"));
+        assert_eq!(command_of(resolve(&Key::Named(NamedKey::Tab), &none)), Some("edit.insert_tab"));
+    }
+
+    #[test]
+    fn ctrl_digit_jumps_to_that_tab() {
+        let control = modifiers(ModifiersState::CONTROL);
+        for digit in 1..=9 {
+            let binding = resolve(&character(&digit.to_string()), &control);
+            assert_eq!(binding, Binding::Command("view.go_to_tab", CommandArgs::Index(digit)));
+        }
+    }
+
+    #[test]
+    fn ctrl_0_and_ctrl_shift_digit_are_not_tab_jumps() {
+        let control = modifiers(ModifiersState::CONTROL);
+        assert_eq!(resolve(&character("0"), &control), Binding::None);
+
+        let control_shift = modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
+        assert_ne!(
+            resolve(&character("1"), &control_shift),
+            Binding::Command("view.go_to_tab", CommandArgs::Index(1))
+        );
+    }
+
+    #[test]
+    fn ctrl_f_opens_find() {
+        let control = modifiers(ModifiersState::CONTROL);
+        assert_eq!(command_of(resolve(&character("f"), &control)), Some("edit.find"));
+    }
+
+    #[test]
+    fn f3_finds_next_and_shift_f3_finds_previous() {
+        let none = modifiers(ModifiersState::empty());
+        let shift = modifiers(ModifiersState::SHIFT);
+        assert_eq!(command_of(resolve(&Key::Named(NamedKey::F3), &none)), Some("edit.find_next"));
+        assert_eq!(
+            command_of(resolve(&Key::Named(NamedKey::F3), &shift)),
+            Some("edit.find_previous")
+        );
+    }
+
+    #[test]
+    fn the_find_bar_table_handles_navigation_and_close() {
+        assert_eq!(resolve_find(&Key::Named(NamedKey::Escape), false), FindAction::Close);
+        assert_eq!(resolve_find(&Key::Named(NamedKey::Backspace), false), FindAction::Backspace);
+        assert_eq!(resolve_find(&Key::Named(NamedKey::Enter), false), FindAction::Next);
+        assert_eq!(resolve_find(&Key::Named(NamedKey::Enter), true), FindAction::Previous);
+        assert_eq!(resolve_find(&character("x"), false), FindAction::None);
     }
 
     #[test]

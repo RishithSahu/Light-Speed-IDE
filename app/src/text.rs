@@ -30,6 +30,8 @@ pub enum Region {
     StatusRight,
     /// The performance overlay.
     Overlay,
+    /// The docked explorer / search / git-status sidebar.
+    Sidebar,
     /// Menu bar titles.
     Menu,
     /// The open dropdown's items that can be run now.
@@ -40,7 +42,7 @@ pub enum Region {
     Prompt,
 }
 
-const REGION_COUNT: usize = 10;
+const REGION_COUNT: usize = 11;
 
 fn region_index(region: Region) -> usize {
     match region {
@@ -54,6 +56,7 @@ fn region_index(region: Region) -> usize {
         Region::MenuDropdown => 7,
         Region::MenuDropdownDisabled => 8,
         Region::Prompt => 9,
+        Region::Sidebar => 10,
     }
 }
 
@@ -170,6 +173,59 @@ impl TextEngine {
         let entry = &mut self.regions[index];
         entry.buffer.set_size(Some(width.max(1.0)), Some(height.max(1.0)));
         entry.buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        entry.buffer.shape_until_scroll(&mut self.font_system, false);
+        entry.text.clear();
+        entry.text.push_str(text);
+        entry.width = width;
+        entry.height = height;
+        self.reshaped += 1;
+    }
+
+    /// Like [`Self::set_text`], but `spans` colors byte ranges of `text`
+    /// differently from the surrounding default color -- syntax highlighting's
+    /// hook into text shaping. Ranges must be sorted by start and
+    /// non-overlapping (the [`Decoration`](ls_core::Decoration) list a
+    /// [`RenderSnapshot`](ls_core::RenderSnapshot) produces already is, since
+    /// it is built by scanning lines in order).
+    pub fn set_rich_text(
+        &mut self,
+        region: Region,
+        text: &str,
+        width: f32,
+        height: f32,
+        default_color: Color,
+        spans: &[(usize, usize, Color)],
+    ) {
+        let index = region_index(region);
+        // Rich text has no single string to compare against for the "nothing
+        // changed" fast path `set_text` uses, so it always reshapes. That is
+        // fine: it is only used for the editor region, and only while a
+        // recognized language's document is visible.
+        let base = Attrs::new().family(Family::Name(&self.family));
+        let mut runs: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
+        let mut cursor = 0usize;
+        for &(start, end, color) in spans {
+            if start < cursor || end <= start || end > text.len() {
+                continue;
+            }
+            if start > cursor {
+                runs.push((&text[cursor..start], base.clone()));
+            }
+            runs.push((&text[start..end], base.clone().color(color.to_glyphon())));
+            cursor = end;
+        }
+        if cursor < text.len() {
+            runs.push((&text[cursor..], base.clone()));
+        }
+
+        let entry = &mut self.regions[index];
+        entry.buffer.set_size(Some(width.max(1.0)), Some(height.max(1.0)));
+        entry.buffer.set_rich_text(
+            runs,
+            &base.color(default_color.to_glyphon()),
+            Shaping::Advanced,
+            None,
+        );
         entry.buffer.shape_until_scroll(&mut self.font_system, false);
         entry.text.clear();
         entry.text.push_str(text);

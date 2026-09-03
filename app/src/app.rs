@@ -11,6 +11,7 @@ use crate::keymap::{self, Binding};
 use crate::layout::Layout;
 use crate::menu::{self, MenuHit, MenuState};
 use crate::renderer::{Frame, Renderer};
+use crate::resources;
 use crate::tabs::{self, TabGeometry, TabHit};
 use crate::theme::Theme;
 use ls_core::{
@@ -19,7 +20,7 @@ use ls_core::{
 };
 use ls_platform::ProcessSampler;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -40,6 +41,16 @@ const WHEEL_LINES: f32 = 3.0;
 /// so a blinking caret costs two small redraws a second rather than a frame
 /// loop that never sleeps.
 const CARET_BLINK: Duration = Duration::from_millis(500);
+
+/// How often open documents are checked against disk.
+///
+/// **Explicitly temporary (docs/adr/ADR-0017-filesystem-change-notification.md).**
+/// A poll, not a native filesystem watcher (ReadDirectoryChangesW / inotify):
+/// cheap today (one `stat` per open tab every 1.5s, riding the same
+/// timer-driven-redraw mechanism the caret already proved out) but not the
+/// target architecture. Do not read this as "polling is the design" -- read
+/// the ADR before assuming this can stay forever.
+const EXTERNAL_WATCH_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// A double click has to be two clicks close together in time and space.
 const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
@@ -72,6 +83,16 @@ pub enum InputFocus {
     Menu,
     /// A confirmation is up and owns input until it is answered.
     Prompt,
+    /// The find bar owns keys; the wheel still scrolls the editor underneath
+    /// it, which is why this is not folded into `Prompt`.
+    Find,
+    /// Typing a workspace-search query.
+    SearchQuery,
+    /// A navigable list owns the keyboard: the file tree, search results, or
+    /// git status. Arrow keys move the selection, Enter acts on it.
+    List,
+    /// The command-runner panel owns the keyboard.
+    Terminal,
 }
 
 /// Where a wheel event should go.
@@ -96,8 +117,15 @@ pub enum WheelTarget {
 /// ```
 pub fn wheel_target(layout: &Layout, focus: InputFocus, x: f32, y: f32) -> WheelTarget {
     match focus {
-        InputFocus::Menu | InputFocus::Prompt => WheelTarget::Blocked,
-        InputFocus::Editor => {
+        InputFocus::Menu
+        | InputFocus::Prompt
+        | InputFocus::SearchQuery
+        | InputFocus::List
+        | InputFocus::Terminal => WheelTarget::Blocked,
+        // The find bar takes the keyboard, not the mouse: looking elsewhere in
+        // the document while search results are up is normal, not a reason to
+        // swallow the wheel.
+        InputFocus::Editor | InputFocus::Find => {
             if layout.text.contains(x, y)
                 || layout.gutter.contains(x, y)
                 || layout.scrollbar.contains(x, y)
@@ -110,12 +138,105 @@ pub fn wheel_target(layout: &Layout, focus: InputFocus, x: f32, y: f32) -> Wheel
     }
 }
 
+/// Appends one directory's visible rows to a file tree, recursing into
+/// whichever children are in `expanded`. A pure function of core state (for
+/// the same reason `wheel_target` and `should_apply_lsp_diagnostics` are):
+/// the tree's shape is worth asserting on directly, without a window.
+///
+/// Bounded by what the user actually opened, not by workspace size: `depth`
+/// only grows by descending into an expanded directory, so a workspace with
+/// ten thousand files but three expanded folders costs three `read_dir`
+/// calls, not ten thousand.
+fn append_tree_level(
+    core: &EditorCore,
+    expanded: &std::collections::HashSet<PathBuf>,
+    dir: &Path,
+    depth: usize,
+    rows: &mut Vec<ListRow>,
+) {
+    let indent = "  ".repeat(depth);
+    match core.workspace().enumerate_children(dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry.kind {
+                    ls_core::EntryKind::Directory => {
+                        let is_expanded = expanded.contains(&entry.path);
+                        let glyph = if is_expanded { '\u{25be}' } else { '\u{25b8}' };
+                        rows.push(ListRow {
+                            label: format!("{indent}{glyph} {}", entry.name),
+                            action: Some(ListAction::ToggleDirectory(entry.path.clone())),
+                        });
+                        if is_expanded {
+                            append_tree_level(core, expanded, &entry.path, depth + 1, rows);
+                        }
+                    }
+                    _ => {
+                        rows.push(ListRow {
+                            label: format!("{indent}  {}", entry.name),
+                            action: Some(ListAction::OpenFile(entry.path.clone())),
+                        });
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            rows.push(ListRow { label: format!("{indent}{error}"), action: None });
+        }
+    }
+}
+
+/// Whether an incoming diagnostics version should replace what is applied.
+///
+/// A pure function for the same reason `wheel_target` is: the staleness rule
+/// is worth asserting on directly. `latest_applied` is the version currently
+/// shown for this path (`None` if nothing has been applied yet); `incoming`
+/// is the version the notification that just arrived claims to be for
+/// (`None` if the server never echoes one, in which case there is nothing to
+/// compare and it is applied unconditionally -- the pre-existing behavior).
+pub fn should_apply_lsp_diagnostics(latest_applied: Option<u64>, incoming: Option<u64>) -> bool {
+    match incoming {
+        None => true,
+        Some(version) => version >= latest_applied.unwrap_or(0),
+    }
+}
+
 /// How the user answered a confirmation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PromptAnswer {
     Save,
     Discard,
     Cancel,
+}
+
+/// What a row in a navigable list panel does when chosen.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ListAction {
+    OpenFile(PathBuf),
+    /// Opens the file and moves the caret to this 1-based line.
+    OpenFileAt(PathBuf, usize),
+    /// Expands this directory if it was collapsed, or collapses it if it was
+    /// open -- a real tree, where several branches can be open across the
+    /// whole workspace at once, not a single-directory drill-down.
+    ToggleDirectory(PathBuf),
+}
+
+/// One row of a navigable list panel. `action: None` marks a row that is
+/// informational only (a "no results" line, a status message).
+#[derive(Clone, Debug)]
+struct ListRow {
+    label: String,
+    action: Option<ListAction>,
+}
+
+/// Which navigable list is on screen. Items 6, 7 and 11 (file tree, workspace
+/// search, git status) share one mechanism rather than three: each is "a list
+/// of rows, pick one", so they share the input handling and the overlay
+/// rendering, and differ only in how their rows are produced.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum ListKind {
+    FileTree,
+    SearchResults,
+    GitStatus,
 }
 
 /// What the editor is waiting for the user to decide.
@@ -134,6 +255,14 @@ pub enum Prompt {
 pub enum UserEvent {
     /// A scheduler task finished; drain and apply completions.
     TaskCompleted,
+    /// The terminal's child process produced output; drain it into the
+    /// scrollback. Carries no data itself -- the bytes live in the shared
+    /// buffer `Terminal` owns, the same split the completion waker uses.
+    TerminalOutput,
+    /// The LSP server published diagnostics; drain and apply them. Same
+    /// split as the two events above: the reader thread only appends to a
+    /// shared buffer and wakes the loop.
+    LspDiagnostics,
 }
 
 /// How prominently a status message should read.
@@ -185,6 +314,8 @@ pub struct LightSpeed {
     proxy: EventLoopProxy<UserEvent>,
     dev_panel_visible: bool,
     dev_panel_rows: Vec<String>,
+    resource_center_visible: bool,
+    resource_center_rows: Vec<String>,
     heartbeat: Heartbeat,
     menu: MenuState,
     menu_geometry: Option<menu::MenuGeometry>,
@@ -208,10 +339,61 @@ pub struct LightSpeed {
     caret_deadline: Instant,
     /// The confirmation the user is being asked for, if any.
     prompt: Option<Prompt>,
-    last_click: Option<(Instant, f32, f32)>,
+    /// When and where the last click landed, and how many consecutive clicks
+    /// have now happened there -- 1 places the caret, 2 selects a word, 3
+    /// selects a line. A click elsewhere, or a slow one, resets to 1.
+    last_click: Option<(Instant, f32, f32, u32)>,
     window_title: String,
     /// Path the diagnostics commands act on: the last file that was opened.
     diagnostics_path: Option<PathBuf>,
+    /// When open documents are next checked against disk.
+    next_watch_check: Instant,
+    /// External state as of the last check, so a transition (not just "still
+    /// changed") is what triggers a status message.
+    last_external_state: HashMap<DocumentId, ls_core::ExternalState>,
+    /// Where the recent-files list is persisted, if the platform gives us
+    /// somewhere standard to put it. `None` just means the feature is
+    /// in-memory only for this run -- never a reason to fail startup.
+    recent_files_path: Option<PathBuf>,
+    /// Which navigable list (file tree / search results / git status) is
+    /// shown, if any.
+    active_list: Option<ListKind>,
+    /// Where the file tree is rooted: the workspace root, or the active
+    /// document's directory if no workspace has been opened.
+    file_tree_root: Option<PathBuf>,
+    /// Which directories are expanded. A real tree, not a single-directory
+    /// drill-down: several branches across the workspace can be open at
+    /// once, exactly as many are collapsed by default (only the root's
+    /// immediate children are read until the user asks for more), so
+    /// building the visible rows only ever touches directories the user
+    /// actually opened -- one `read_dir` per expanded entry, not a walk of
+    /// the workspace.
+    expanded_dirs: std::collections::HashSet<PathBuf>,
+    list_selected: usize,
+    /// The workspace-search query as it is being typed, before Enter submits
+    /// it. `None` when the search bar is not open.
+    search_query_input: Option<String>,
+    /// A line to jump to once the file a list row just requested finishes
+    /// opening (it may still be loading asynchronously).
+    pending_jump: Option<(PathBuf, usize)>,
+    terminal: Option<crate::terminal::Terminal>,
+    terminal_visible: bool,
+    terminal_scrollback: String,
+    terminal_input: String,
+    /// The one running language server, if a recognized document has been
+    /// opened. Keyed by nothing -- Stage 1.1 runs at most one, for whichever
+    /// language last needed it, since only Rust has a server configured.
+    lsp: Option<crate::lsp::LspClient>,
+    /// Documents the server has already been told about, so `didOpen` is
+    /// sent exactly once per document.
+    lsp_opened: std::collections::HashSet<DocumentId>,
+    /// Persistence state as of the last check, so a save *completing* (not
+    /// every frame while it stays completed) is what triggers a resync.
+    lsp_last_persistence: HashMap<DocumentId, ls_core::PersistenceState>,
+    /// The highest diagnostics version applied per path, so an
+    /// out-of-order server response for an older edit cannot overwrite a
+    /// newer one.
+    lsp_applied_version: HashMap<PathBuf, u64>,
 }
 
 struct ShellMetrics {
@@ -244,8 +426,15 @@ impl LightSpeed {
         ls_core::editor::install_default_budgets();
         let mut sampler = ProcessSampler::new();
         let process_stats = sampler.sample();
+
+        let mut core = EditorCore::new(config);
+        let recent_files_path = ls_platform::recents::default_path();
+        if let Some(path) = &recent_files_path {
+            core.set_recent_files(ls_platform::recents::load(path));
+        }
+
         LightSpeed {
-            core: EditorCore::new(config),
+            core,
             theme: Theme::dark(),
             window: None,
             renderer: None,
@@ -273,6 +462,8 @@ impl LightSpeed {
             proxy,
             dev_panel_visible: false,
             dev_panel_rows: Vec::new(),
+            resource_center_visible: false,
+            resource_center_rows: Vec::new(),
             heartbeat: Heartbeat::new(),
             menu: MenuState::default(),
             menu_geometry: None,
@@ -287,6 +478,87 @@ impl LightSpeed {
             last_click: None,
             window_title: String::new(),
             diagnostics_path: None,
+            recent_files_path,
+            next_watch_check: Instant::now() + EXTERNAL_WATCH_INTERVAL,
+            last_external_state: HashMap::new(),
+            active_list: None,
+            file_tree_root: None,
+            expanded_dirs: std::collections::HashSet::new(),
+            list_selected: 0,
+            search_query_input: None,
+            pending_jump: None,
+            terminal: None,
+            terminal_visible: false,
+            terminal_scrollback: String::new(),
+            terminal_input: String::new(),
+            lsp: None,
+            lsp_opened: std::collections::HashSet::new(),
+            lsp_last_persistence: HashMap::new(),
+            lsp_applied_version: HashMap::new(),
+        }
+    }
+
+    /// Checks every open document against disk, on a timer.
+    ///
+    /// Runs from `about_to_wait`, the same place the caret ticks, so it costs
+    /// nothing while the window is idle beyond the wakeup itself.
+    fn poll_external_changes(&mut self) {
+        if Instant::now() < self.next_watch_check {
+            return;
+        }
+        self.next_watch_check = Instant::now() + EXTERNAL_WATCH_INTERVAL;
+
+        for id in self.core.tabs().to_vec() {
+            let Some(state) = self.core.refresh_external_state(id) else { continue };
+            let previous = self.last_external_state.insert(id, state);
+            if previous == Some(state) {
+                continue;
+            }
+            let name = self
+                .core
+                .document(id)
+                .map(|document| document.display_name().to_string())
+                .unwrap_or_default();
+            match state {
+                ls_core::ExternalState::ExternallyChanged => {
+                    self.set_status(format!("{name} changed on disk"), Severity::Warning);
+                }
+                ls_core::ExternalState::Missing => {
+                    self.set_status(format!("{name} was deleted or moved"), Severity::Warning);
+                }
+                ls_core::ExternalState::Conflict => {
+                    self.set_status(
+                        format!("{name} changed on disk and has unsaved edits here"),
+                        Severity::Warning,
+                    );
+                }
+                ls_core::ExternalState::Unchanged => {}
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// The File menu's dynamic tail: recently opened files, from core state.
+    fn recent_rows(&self) -> Vec<menu::RecentRow> {
+        self.core
+            .recent_files()
+            .iter()
+            .map(|path| {
+                let label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                menu::RecentRow { label, path: path.clone() }
+            })
+            .collect()
+    }
+
+    /// Best-effort: a failure to persist the recent list must never interrupt
+    /// the user's actual work, so it goes to the log and nowhere else.
+    fn save_recent_files(&self) {
+        let Some(path) = &self.recent_files_path else { return };
+        if let Err(error) = ls_platform::recents::save(path, self.core.recent_files()) {
+            ls_log::warn!(SUBSYSTEM, "recent_files_not_saved", "{error}");
         }
     }
 
@@ -387,7 +659,14 @@ impl LightSpeed {
     }
 
     fn after_state_change(&mut self) {
+        // Focus is derived from whatever surfaces are up, recomputed on every
+        // state change rather than tracked at each place that could open or
+        // close one -- opening find from the Edit menu, for instance, needs no
+        // separate call here to hand it the keyboard.
+        self.refresh_focus();
         self.reveal_cursor = true;
+        self.apply_pending_jump();
+        self.sync_lsp_for_active_document();
         let active = self.core.active();
         if active != self.last_active {
             self.last_active = active;
@@ -425,6 +704,14 @@ impl LightSpeed {
                 ShellRequest::ToggleDevPanel => {
                     self.dev_panel_visible = !self.dev_panel_visible;
                 }
+                ShellRequest::ToggleResourceCenter => {
+                    self.resource_center_visible = !self.resource_center_visible;
+                }
+                ShellRequest::ToggleFileTree => self.toggle_file_tree(),
+                ShellRequest::OpenFolderDialog => self.show_open_folder_dialog(),
+                ShellRequest::WorkspaceSearch => self.open_search_query(),
+                ShellRequest::ToggleGitStatus => self.toggle_git_status(),
+                ShellRequest::ToggleTerminal => self.toggle_terminal(),
                 ShellRequest::ToggleStatusBar => {
                     self.show_status_bar = !self.show_status_bar;
                 }
@@ -519,6 +806,7 @@ impl LightSpeed {
             Ok(request) => {
                 self.adopt_new_document(request.document);
                 self.diagnostics_path = Some(path.clone());
+                self.save_recent_files();
                 let message = if request.already_open {
                     format!("{} is already open", path.display())
                 } else if request.joined {
@@ -708,7 +996,7 @@ impl LightSpeed {
 
         // The menu is drawn over everything, so it gets the click first.
         if let Some(geometry) = &self.menu_geometry {
-            match menu::hit(geometry, self.menu, x, y) {
+            match menu::hit(geometry, self.menu, x, y, &self.recent_rows()) {
                 MenuHit::Title(index) => {
                     self.menu.toggle(index);
                     self.refresh_focus();
@@ -725,6 +1013,12 @@ impl LightSpeed {
                     } else {
                         self.request_redraw();
                     }
+                    return;
+                }
+                MenuHit::OpenRecent(path) => {
+                    self.menu.close();
+                    self.refresh_focus();
+                    self.open_path(path);
                     return;
                 }
                 MenuHit::Swallowed => return,
@@ -745,16 +1039,20 @@ impl LightSpeed {
             return;
         }
 
-        // A second click in the same place selects the word under it.
-        let double = self
-            .last_click
-            .map(|(at, last_x, last_y)| {
-                at.elapsed() < DOUBLE_CLICK_TIME
+        // A second click in the same place selects the word under it; a
+        // third selects the line. A fourth stays at "line", rather than
+        // growing a click count nothing consumes.
+        let click_count = match self.last_click {
+            Some((at, last_x, last_y, count))
+                if at.elapsed() < DOUBLE_CLICK_TIME
                     && (last_x - x).abs() < DOUBLE_CLICK_SLOP
-                    && (last_y - y).abs() < DOUBLE_CLICK_SLOP
-            })
-            .unwrap_or(false);
-        self.last_click = Some((Instant::now(), x, y));
+                    && (last_y - y).abs() < DOUBLE_CLICK_SLOP =>
+            {
+                (count + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.last_click = Some((Instant::now(), x, y, click_count));
 
         if layout.tab_bar.contains(x, y) {
             // The close control is its own region, resolved before the body, so
@@ -773,12 +1071,26 @@ impl LightSpeed {
             return;
         }
 
+        if layout.sidebar_visible && layout.sidebar.contains(x, y) && self.active_list.is_some() {
+            // Row 0 is the header, drawn but not itself a list entry.
+            let row = ((y - layout.sidebar.y) / layout.metrics.line_height) as usize;
+            if row >= 1 {
+                let rows = self.list_rows();
+                let index = row - 1;
+                if index < rows.len() {
+                    self.list_selected = index;
+                    self.activate_list_selection();
+                }
+            }
+            return;
+        }
+
         if layout.text.contains(x, y) || layout.gutter.contains(x, y) {
             self.place_cursor_at(x, y, self.modifiers.contains(ModifiersState::SHIFT));
-            if double {
-                self.select_word_at_cursor();
-            } else {
-                self.dragging_selection = true;
+            match click_count {
+                2 => self.select_word_at_cursor(),
+                3 => self.select_line_at_cursor(),
+                _ => self.dragging_selection = true,
             }
             self.wake_caret();
         }
@@ -789,6 +1101,14 @@ impl LightSpeed {
     fn select_word_at_cursor(&mut self) {
         let _ = self.core.execute("cursor.word_left", CommandArgs::None);
         let _ = self.core.execute("cursor.word_right.select", CommandArgs::None);
+        self.after_state_change();
+    }
+
+    /// Selects the whole line the caret is on (triple-click), the same way:
+    /// existing movement commands, not a separate definition of a line.
+    fn select_line_at_cursor(&mut self) {
+        let _ = self.core.execute("cursor.line_start", CommandArgs::None);
+        let _ = self.core.execute("cursor.line_end.select", CommandArgs::None);
         self.after_state_change();
     }
 
@@ -830,6 +1150,7 @@ impl LightSpeed {
         match self.core.close_document(id) {
             Ok(()) => {
                 self.views.remove(&id);
+                self.last_external_state.remove(&id);
                 self.request_redraw();
             }
             Err(ls_core::EditorError::UnsavedChanges(_)) => {
@@ -954,6 +1275,14 @@ impl LightSpeed {
             InputFocus::Prompt
         } else if self.menu.is_open() {
             InputFocus::Menu
+        } else if self.terminal_visible {
+            InputFocus::Terminal
+        } else if self.search_query_input.is_some() {
+            InputFocus::SearchQuery
+        } else if self.active_list.is_some() {
+            InputFocus::List
+        } else if self.core.is_find_open() {
+            InputFocus::Find
         } else {
             InputFocus::Editor
         };
@@ -1005,13 +1334,447 @@ impl LightSpeed {
         Some(format!("{name} has unsaved changes.    [S] Save     [D] Don't Save     [Esc] Cancel"))
     }
 
+    /// The find bar's text, when it is open: the query typed so far and a
+    /// running "3 of 12" (or "No results"), so the count is always current
+    /// rather than only updating when a match is found.
+    fn find_bar_text(&self) -> Option<String> {
+        if !self.core.is_find_open() {
+            return None;
+        }
+        let find = self.core.find_state()?;
+        let position = match find.position() {
+            Some((current, total)) => format!("{current} of {total}"),
+            None if find.query().is_empty() => String::new(),
+            None => "No results".to_string(),
+        };
+        Some(format!(
+            "Find: {}    {position}    [Enter] Next  [Shift+Enter] Prev  [Esc] Close",
+            find.query()
+        ))
+    }
+
+    /// One banner strip's text: a close confirmation and the find bar are
+    /// mutually exclusive (`refresh_focus` gives the confirmation priority),
+    /// so they share the single overlay strip rather than needing two.
+    fn search_query_bar_text(&self) -> Option<String> {
+        let query = self.search_query_input.as_ref()?;
+        Some(format!("Search workspace: {query}    [Enter] Search  [Esc] Cancel"))
+    }
+
+    fn banner_text(&self) -> Option<String> {
+        self.prompt_text().or_else(|| self.find_bar_text()).or_else(|| self.search_query_bar_text())
+    }
+
+    /// Builds the rows for whichever list is currently shown, fresh every
+    /// call. All three lists are cheap to (re)build: git status and search
+    /// results just format state `EditorCore` already has, and the file tree
+    /// only reads directories the user actually expanded (never a recursive
+    /// walk), so nothing here is worth caching and nothing can go stale.
+    fn list_rows(&self) -> Vec<ListRow> {
+        let root = self.core.workspace().root().map(|c| c.as_path().to_path_buf());
+        match self.active_list {
+            None => Vec::new(),
+            Some(ListKind::FileTree) => match &self.file_tree_root {
+                Some(tree_root) => {
+                    let mut rows = Vec::new();
+                    self.append_tree_level(tree_root, 0, &mut rows);
+                    if rows.is_empty() {
+                        rows.push(ListRow { label: "(empty)".to_string(), action: None });
+                    }
+                    rows
+                }
+                None => Vec::new(),
+            },
+            Some(ListKind::GitStatus) => match self.core.git_status() {
+                Some(status) if status.is_clean() => {
+                    vec![ListRow { label: "Working tree clean".to_string(), action: None }]
+                }
+                Some(status) => status
+                    .files
+                    .iter()
+                    .map(|file| {
+                        let flag = if file.staged { "staged  " } else { "        " };
+                        let full = root.as_ref().map(|r| r.join(&file.path));
+                        ListRow {
+                            label: format!("{flag}{:?}  {}", file.state, file.path.display()),
+                            action: full.map(ListAction::OpenFile),
+                        }
+                    })
+                    .collect(),
+                None if self.core.is_git_status_pending() => {
+                    vec![ListRow { label: "Checking git status...".to_string(), action: None }]
+                }
+                None => vec![ListRow {
+                    label: "Not a git repository, or git is not installed".to_string(),
+                    action: None,
+                }],
+            },
+            Some(ListKind::SearchResults) => match self.core.workspace_search_result() {
+                Some(result) if result.hits.is_empty() => vec![ListRow {
+                    label: format!("No matches for \"{}\"", result.query),
+                    action: None,
+                }],
+                Some(result) => {
+                    let mut rows: Vec<ListRow> = result
+                        .hits
+                        .iter()
+                        .map(|hit| ListRow {
+                            label: format!(
+                                "{}:{}  {}",
+                                hit.path.display(),
+                                hit.line_number,
+                                hit.preview
+                            ),
+                            action: Some(ListAction::OpenFileAt(hit.path.clone(), hit.line_number)),
+                        })
+                        .collect();
+                    if result.truncated {
+                        rows.push(ListRow {
+                            label: "... more results exist; narrow the query".to_string(),
+                            action: None,
+                        });
+                    }
+                    rows
+                }
+                None if self.core.is_workspace_search_pending() => {
+                    vec![ListRow { label: "Searching...".to_string(), action: None }]
+                }
+                None => Vec::new(),
+            },
+        }
+    }
+
+    /// Appends one directory's visible rows, recursing into whichever of its
+    /// children are themselves expanded. `depth` only ever grows by walking
+    /// into directories the user opened, so this cannot run away on a huge
+    /// workspace the way a "expand everything" tree would.
+    fn append_tree_level(&self, dir: &Path, depth: usize, rows: &mut Vec<ListRow>) {
+        append_tree_level(&self.core, &self.expanded_dirs, dir, depth, rows);
+    }
+
+    /// Opens the file tree, rooted at the workspace root, or at the active
+    /// document's directory if no workspace has been opened yet.
+    fn toggle_file_tree(&mut self) {
+        if self.active_list == Some(ListKind::FileTree) {
+            self.active_list = None;
+            self.refresh_focus();
+            self.request_redraw();
+            return;
+        }
+        let start = self.core.workspace().root().map(|c| c.as_path().to_path_buf()).or_else(|| {
+            self.core
+                .active_document()
+                .and_then(|d| d.path())
+                .and_then(|p| p.as_path().parent().map(|parent| parent.to_path_buf()))
+        });
+        let Some(start) = start else {
+            self.set_status("Open a file first, or use File > Open Folder", Severity::Warning);
+            return;
+        };
+        self.file_tree_root = Some(start);
+        self.list_selected = 0;
+        self.active_list = Some(ListKind::FileTree);
+        self.refresh_focus();
+        self.request_redraw();
+    }
+
+    /// Opens the native folder picker and, if the user chooses one, opens it
+    /// as the workspace root and shows the explorer. This never depends on a
+    /// document already being open -- the picker itself is where the folder
+    /// comes from.
+    fn show_open_folder_dialog(&mut self) {
+        let owner = self.window_handle_id();
+        let initial_dir =
+            self.core.workspace().root().map(|c| c.as_path().to_path_buf()).or_else(|| {
+                self.core
+                    .active_document()
+                    .and_then(|d| d.path())
+                    .and_then(|p| p.as_path().parent().map(|parent| parent.to_path_buf()))
+            });
+        match ls_platform::dialog::open_folder(owner, "Open Folder", initial_dir.as_deref()) {
+            Ok(Some(dir)) => {
+                if let Err(error) = self.core.open_workspace(&dir) {
+                    self.set_status(error.to_string(), Severity::Error);
+                    return;
+                }
+                self.file_tree_root = Some(dir);
+                self.list_selected = 0;
+                self.active_list = Some(ListKind::FileTree);
+                self.refresh_focus();
+                self.request_redraw();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                ls_log::diag::log_error(&error);
+                self.set_status(error.to_string(), Severity::Error);
+            }
+        }
+    }
+
+    fn toggle_git_status(&mut self) {
+        if self.active_list == Some(ListKind::GitStatus) {
+            self.active_list = None;
+            self.refresh_focus();
+            self.request_redraw();
+            return;
+        }
+        if let Err(error) = self.core.request_git_status() {
+            self.set_status(error.to_string(), Severity::Error);
+            return;
+        }
+        self.active_list = Some(ListKind::GitStatus);
+        self.list_selected = 0;
+        self.refresh_focus();
+        self.request_redraw();
+    }
+
+    fn open_search_query(&mut self) {
+        self.active_list = None;
+        self.search_query_input = Some(String::new());
+        self.refresh_focus();
+        self.request_redraw();
+    }
+
+    /// Shows or hides the command runner. The child process, once spawned,
+    /// keeps running while the panel is hidden -- hiding is not closing.
+    fn toggle_terminal(&mut self) {
+        if self.terminal_visible {
+            self.terminal_visible = false;
+            self.refresh_focus();
+            self.request_redraw();
+            return;
+        }
+        if self.terminal.is_none() {
+            let proxy = self.proxy.clone();
+            match crate::terminal::Terminal::spawn(move || {
+                let _ = proxy.send_event(UserEvent::TerminalOutput);
+            }) {
+                Ok(terminal) => self.terminal = Some(terminal),
+                Err(error) => {
+                    self.set_status(format!("could not start a shell: {error}"), Severity::Error);
+                    return;
+                }
+            }
+        }
+        self.terminal_visible = true;
+        self.refresh_focus();
+        self.request_redraw();
+    }
+
+    fn drain_terminal_output(&mut self) {
+        let Some(terminal) = self.terminal.as_ref() else { return };
+        let text = terminal.drain_output();
+        if text.is_empty() {
+            return;
+        }
+        self.terminal_scrollback.push_str(&text);
+        let cap = 64 * 1024;
+        if self.terminal_scrollback.len() > cap {
+            let cut = self.terminal_scrollback.len() - cap;
+            // Cut on a character boundary, not mid-codepoint.
+            let boundary = (cut..self.terminal_scrollback.len())
+                .find(|&i| self.terminal_scrollback.is_char_boundary(i))
+                .unwrap_or(cut);
+            self.terminal_scrollback.drain(..boundary);
+        }
+        if self.terminal_visible {
+            self.request_redraw();
+        }
+    }
+
+    /// Starts (or reuses) a language server for the active document if one
+    /// is configured for its language, and keeps it synced: `didOpen` once,
+    /// then a full-text resync each time a save completes.
+    fn sync_lsp_for_active_document(&mut self) {
+        let Some(id) = self.core.active() else { return };
+        if self.core.is_loading(id) {
+            return;
+        }
+        let Some(document) = self.core.document(id) else { return };
+        // An untitled document has no URI to report itself under.
+        let Some(path) = document.path().map(|p| p.as_path().to_path_buf()) else { return };
+        let language = document.language();
+
+        if let Some(client) = self.lsp.as_mut() {
+            if !client.is_alive() {
+                // The server crashed or exited; a future recognized document
+                // gets a fresh one rather than silently having none forever.
+                self.lsp = None;
+                self.lsp_opened.clear();
+            }
+        }
+
+        if !self.lsp_opened.contains(&id) {
+            if self.lsp.is_none() {
+                let proxy = self.proxy.clone();
+                let root = self
+                    .core
+                    .workspace()
+                    .root()
+                    .map(|c| c.as_path().to_path_buf())
+                    .or_else(|| path.parent().map(|p| p.to_path_buf()))
+                    .unwrap_or_else(|| PathBuf::from("."));
+                self.lsp = crate::lsp::LspClient::spawn(language, &root, move || {
+                    let _ = proxy.send_event(UserEvent::LspDiagnostics);
+                });
+            }
+            if let Some(client) = self.lsp.as_mut() {
+                client.notify_opened(&path, language, &document.text().to_string());
+            }
+            // Marked regardless of whether a client actually started: there
+            // is no server for most languages, and retrying that check on
+            // every keystroke would be wasted work for a "no" that never
+            // changes for this document.
+            self.lsp_opened.insert(id);
+            return;
+        }
+
+        let persistence = document.persistence_state();
+        let previous = self.lsp_last_persistence.insert(id, persistence);
+        if previous != Some(persistence) && persistence == ls_core::PersistenceState::SaveSucceeded
+        {
+            if let Some(client) = self.lsp.as_mut() {
+                client.notify_saved(&path, &document.text().to_string());
+            }
+        }
+    }
+
+    /// Applies diagnostics the server sent, gated against staleness: the
+    /// same class of bug the async save path already solved with
+    /// `ContentRevision` (a stale save must not report a document clean),
+    /// here for a stale diagnostic that must not overwrite a newer one.
+    ///
+    /// A slow re-analysis for an old `didChange` can complete *after* a
+    /// faster one for a newer edit, so "arrived later" does not mean "is
+    /// newer". What does mean that is the version number this client put in
+    /// the request -- rust-analyzer echoes it back in
+    /// `PublishDiagnosticsParams.version`. Diagnostics naming a version older
+    /// than the last one already applied for that path are dropped rather
+    /// than allowed to overwrite it. A server that omits the (optional)
+    /// version field gets applied unconditionally, which is the pre-existing
+    /// behavior and the best any client can do without that signal.
+    fn drain_lsp_diagnostics(&mut self) {
+        let Some(client) = self.lsp.as_ref() else { return };
+        let updates = client.drain_diagnostics();
+        if updates.is_empty() {
+            return;
+        }
+        for (path, version, diagnostics) in updates {
+            let latest = self.lsp_applied_version.get(&path).copied();
+            if !should_apply_lsp_diagnostics(latest, version) {
+                continue;
+            }
+            if let Some(version) = version {
+                self.lsp_applied_version.insert(path.clone(), version);
+            }
+            self.core.apply_diagnostics(&path, diagnostics);
+        }
+        self.request_redraw();
+    }
+
+    fn send_terminal_line(&mut self) {
+        let line = std::mem::take(&mut self.terminal_input);
+        if let Some(terminal) = self.terminal.as_mut() {
+            if !terminal.is_alive() {
+                self.set_status("The shell has exited", Severity::Warning);
+                self.terminal = None;
+                return;
+            }
+            self.terminal_scrollback.push_str("> ");
+            self.terminal_scrollback.push_str(&line);
+            self.terminal_scrollback.push('\n');
+            terminal.send_line(&line);
+        }
+    }
+
+    /// The terminal panel's rows: a fixed window of the scrollback plus the
+    /// line being typed, in the same `Vec<String>` shape every other panel
+    /// uses.
+    fn terminal_rows(&self) -> Vec<String> {
+        let mut rows = Vec::new();
+        rows.push("Terminal  (Enter to run, F11 to hide)".to_string());
+        let visible_lines = 12;
+        let tail: Vec<&str> = self.terminal_scrollback.lines().collect();
+        let start = tail.len().saturating_sub(visible_lines);
+        rows.extend(tail[start..].iter().map(|line| line.to_string()));
+        rows.push(format!("> {}", self.terminal_input));
+        rows
+    }
+
+    /// Once a file a list row opened finishes loading, moves the caret to the
+    /// line the row named. Opening is asynchronous, so this cannot happen
+    /// inline with the click -- it runs on every pump until the load settles.
+    fn apply_pending_jump(&mut self) {
+        let Some((path, line)) = self.pending_jump.clone() else { return };
+        let Some(active) = self.core.active() else { return };
+        if self.core.is_loading(active) {
+            return;
+        }
+        let Some(document) = self.core.document(active) else {
+            self.pending_jump = None;
+            return;
+        };
+        if document.path().map(|p| p.as_path()) != Some(path.as_path()) {
+            // The active tab changed before the load settled; give up quietly
+            // rather than jumping in the wrong document.
+            self.pending_jump = None;
+            return;
+        }
+        self.core.go_to(line.saturating_sub(1), 0);
+        self.pending_jump = None;
+    }
+
+    /// Runs whatever a list row's selection means.
+    fn activate_list_selection(&mut self) {
+        let rows = self.list_rows();
+        let Some(row) = rows.get(self.list_selected) else { return };
+        match row.action.clone() {
+            Some(ListAction::OpenFile(path)) => {
+                // The sidebar is a docked panel, not a modal picker -- opening
+                // a file from the explorer or git status leaves it open, the
+                // way VS Code's does, instead of yanking it away every time.
+                // `open_path` already moves keyboard focus to the editor (via
+                // `adopt_new_document`), so this must not call
+                // `refresh_focus` afterwards -- that would see `active_list`
+                // still set and hand focus straight back to the list.
+                self.open_path(path);
+                self.request_redraw();
+                return;
+            }
+            Some(ListAction::OpenFileAt(path, line)) => {
+                self.pending_jump = Some((path.clone(), line));
+                self.open_path(path);
+                self.request_redraw();
+                return;
+            }
+            Some(ListAction::ToggleDirectory(dir)) => {
+                if !self.expanded_dirs.remove(&dir) {
+                    self.expanded_dirs.insert(dir);
+                }
+                // The row count changes (a subtree appeared or disappeared);
+                // keep the selection in range rather than pointing past the
+                // end of a collapsed branch.
+                let len = self.list_rows().len();
+                if len > 0 {
+                    self.list_selected = self.list_selected.min(len - 1);
+                }
+            }
+            None => {}
+        }
+        self.refresh_focus();
+        self.request_redraw();
+    }
+
     /// When the loop should wake next, if anything is on a timer.
     fn next_wakeup(&self) -> Option<Instant> {
-        // Only the caret needs a timer; everything else is event-driven.
-        if self.core.active().is_some() && self.prompt.is_none() {
-            Some(self.caret_deadline)
-        } else {
-            None
+        // The caret and the disk-change poll are the only timers; everything
+        // else is event-driven. Whichever fires first is when the loop wakes.
+        let caret =
+            (self.core.active().is_some() && self.prompt.is_none()).then_some(self.caret_deadline);
+        let watch = (!self.core.tabs().is_empty()).then_some(self.next_watch_check);
+        match (caret, watch) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
@@ -1058,12 +1821,67 @@ impl LightSpeed {
         }
     }
 
-    /// Rows for the floating panel: the performance overlay, the loading
-    /// panel, or both stacked.
+    /// Whether the docked sidebar (explorer, search, or git status) should
+    /// be shown this frame. Typing a search query shows it before any
+    /// request has gone out, so the query itself is never invisible.
+    fn sidebar_visible(&self) -> bool {
+        self.active_list.is_some() || self.search_query_input.is_some()
+    }
+
+    /// Rows for the docked sidebar: a header (row 0, never itself
+    /// selectable) followed by the active list's rows, or -- while the user
+    /// is typing a workspace-search query -- the live query as an editable
+    /// line.
+    fn sidebar_rows(&self) -> Vec<String> {
+        if let Some(query) = &self.search_query_input {
+            return vec![
+                "Search  (Enter to run, Esc to cancel)".to_string(),
+                format!("  {query}\u{2588}"),
+            ];
+        }
+        let Some(kind) = self.active_list else { return Vec::new() };
+        let title = match kind {
+            ListKind::FileTree => "Explorer",
+            ListKind::SearchResults => "Search Results",
+            ListKind::GitStatus => "Source Control",
+        };
+        let mut rows = vec![format!("{title}  (Up/Down, Enter, Esc)")];
+        for row in self.list_rows() {
+            rows.push(row.label);
+        }
+        rows
+    }
+
+    /// Which sidebar row is selected, in the row numbering `sidebar_rows`
+    /// uses (the header is row 0). `None` while typing a query: the input
+    /// line is not a "selection" in the list sense.
+    fn sidebar_selected_row(&self) -> Option<usize> {
+        if self.search_query_input.is_some() {
+            return None;
+        }
+        self.active_list.map(|_| self.list_selected + 1)
+    }
+
+    /// Rows for the floating performance/dev-tool panel, top-right. The
+    /// explorer/search/git list lives in the docked sidebar instead (see
+    /// `sidebar_rows`), not here -- this panel is diagnostics, not the UI the
+    /// user works in day to day.
     fn panel_rows(&self) -> Vec<String> {
         let mut rows = Vec::new();
+        if self.terminal_visible {
+            rows.extend(self.terminal_rows());
+        }
         if self.dev_panel_visible {
+            if !rows.is_empty() {
+                rows.push(String::new());
+            }
             rows.extend(self.dev_panel_rows.iter().cloned());
+        }
+        if self.resource_center_visible {
+            if !rows.is_empty() {
+                rows.push(String::new());
+            }
+            rows.extend(self.resource_center_rows.iter().cloned());
         }
         if self.overlay_visible {
             if !rows.is_empty() {
@@ -1145,6 +1963,7 @@ impl LightSpeed {
             digits,
             self.core.config().appearance.show_line_numbers,
             self.show_status_bar,
+            self.sidebar_visible(),
         );
         self.last_layout = Some(layout);
         self.core.set_page_lines(layout.visible_lines());
@@ -1190,12 +2009,14 @@ impl LightSpeed {
             self.window_title = title;
         }
 
+        let recent_rows = self.recent_rows();
         let geometry = menu::geometry(
             layout.menu_bar,
             self.menu,
             layout.metrics.digit_width,
             layout.metrics.line_height,
             layout.scale,
+            &recent_rows,
         );
         self.menu_geometry = Some(geometry.clone());
         if self.overlay_visible {
@@ -1204,8 +2025,13 @@ impl LightSpeed {
         if self.dev_panel_visible {
             self.dev_panel_rows = devpanel::lines(&self.core, &self.heartbeat);
         }
+        if self.resource_center_visible {
+            self.resource_center_rows = resources::lines(&self.core, &self.process_stats);
+        }
 
         let panel_rows = self.panel_rows();
+        let sidebar_rows = self.sidebar_rows();
+        let sidebar_selected_row = self.sidebar_selected_row();
         let status_left = self.status_left();
         let status_right = self.status_right();
         let status_color = self.status_color();
@@ -1224,14 +2050,22 @@ impl LightSpeed {
             self.core.active().and_then(|id| self.views.get(&id).copied()).unwrap_or_default();
 
         let menu_enabled: Vec<bool> = match self.menu.open {
-            Some(open) => menu::MENUS[open]
-                .items
-                .iter()
-                .map(|item| menu::is_enabled(&self.core, item))
-                .collect(),
+            Some(open) => {
+                let mut enabled: Vec<bool> = menu::MENUS[open]
+                    .items
+                    .iter()
+                    .map(|item| menu::is_enabled(&self.core, item))
+                    .collect();
+                // Opening a recent file is always allowed; only the registry
+                // command items above are ever refused.
+                if open == menu::FILE_MENU_INDEX {
+                    enabled.extend(std::iter::repeat_n(true, recent_rows.len()));
+                }
+                enabled
+            }
             None => Vec::new(),
         };
-        let prompt_text = self.prompt_text();
+        let prompt_text = self.banner_text();
         let menu_state = self.menu;
         let empty_geometry =
             menu::MenuGeometry { titles: Vec::new(), dropdown: None, items: Vec::new() };
@@ -1253,9 +2087,12 @@ impl LightSpeed {
             menu: menu_state,
             menu_geometry,
             menu_enabled: &menu_enabled,
+            recent_files: &recent_rows,
             caret_visible,
             prompt: prompt_text.as_deref(),
             placeholder: "  LightSpeed IDE\n\n  Ctrl+O  open a file\n  Ctrl+N  new file\n  F12     performance overlay",
+            sidebar: (!sidebar_rows.is_empty()).then_some(sidebar_rows.as_slice()),
+            sidebar_selected_row,
         };
 
         match renderer.render(&frame) {
@@ -1380,6 +2217,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
         if self.tick_caret() {
             self.request_redraw();
         }
+        self.poll_external_changes();
         match self.next_wakeup() {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -1390,6 +2228,8 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::TaskCompleted => self.pump_background_work(),
+            UserEvent::TerminalOutput => self.drain_terminal_output(),
+            UserEvent::LspDiagnostics => self.drain_lsp_diagnostics(),
         }
     }
 
@@ -1425,6 +2265,151 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                         self.resolve_prompt(answer);
                         if self.take_exit() {
                             event_loop.exit();
+                        }
+                    }
+                    return;
+                }
+
+                // A navigable list (file tree / search results / git status)
+                // owns the keyboard while it is open.
+                // The command runner owns the keyboard while it is shown.
+                if self.focus == InputFocus::Terminal {
+                    match &event.logical_key {
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
+                        | winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
+                            self.toggle_terminal();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                            self.send_terminal_line();
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
+                            self.terminal_input.pop();
+                            self.request_redraw();
+                        }
+                        _ => {
+                            if let Some(text) = event.text.as_ref() {
+                                let printable: String =
+                                    text.chars().filter(|c| !c.is_control()).collect();
+                                if !printable.is_empty() {
+                                    self.terminal_input.push_str(&printable);
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                if self.focus == InputFocus::List {
+                    match &event.logical_key {
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
+                            let len = self.list_rows().len();
+                            if len > 0 {
+                                self.list_selected = (self.list_selected + 1).min(len - 1);
+                            }
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                            self.list_selected = self.list_selected.saturating_sub(1);
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                            self.activate_list_selection();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
+                            self.active_list = None;
+                            self.refresh_focus();
+                            self.request_redraw();
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
+                // Typing a workspace-search query.
+                if self.focus == InputFocus::SearchQuery {
+                    let shift = self.modifiers.contains(ModifiersState::SHIFT);
+                    match keymap::resolve_find(&event.logical_key, shift) {
+                        keymap::FindAction::Close => {
+                            self.search_query_input = None;
+                            self.refresh_focus();
+                            self.request_redraw();
+                        }
+                        keymap::FindAction::Backspace => {
+                            if let Some(query) = self.search_query_input.as_mut() {
+                                query.pop();
+                            }
+                            self.request_redraw();
+                        }
+                        keymap::FindAction::Next | keymap::FindAction::Previous => {
+                            if let Some(query) = self.search_query_input.take() {
+                                if let Err(error) = self.core.request_workspace_search(query) {
+                                    self.set_status(error.to_string(), Severity::Error);
+                                } else {
+                                    self.active_list = Some(ListKind::SearchResults);
+                                    self.list_selected = 0;
+                                }
+                                self.refresh_focus();
+                                self.request_redraw();
+                            }
+                        }
+                        keymap::FindAction::None => {
+                            if let Some(text) = event.text.as_ref() {
+                                let printable: String =
+                                    text.chars().filter(|c| !c.is_control()).collect();
+                                if !printable.is_empty() {
+                                    if let Some(query) = self.search_query_input.as_mut() {
+                                        query.push_str(&printable);
+                                    }
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // The find bar owns the keyboard while it is open: typing goes
+                // into the query, not the document.
+                if self.focus == InputFocus::Find {
+                    let shift = self.modifiers.contains(ModifiersState::SHIFT);
+                    match keymap::resolve_find(&event.logical_key, shift) {
+                        keymap::FindAction::Close => {
+                            self.core.close_find();
+                            self.after_state_change();
+                        }
+                        keymap::FindAction::Backspace => {
+                            let mut query =
+                                self.core.find_state().map(|f| f.query()).unwrap_or("").to_string();
+                            query.pop();
+                            self.core.set_find_query(query);
+                            self.after_state_change();
+                        }
+                        keymap::FindAction::Next => {
+                            self.core.find_next();
+                            self.after_state_change();
+                        }
+                        keymap::FindAction::Previous => {
+                            self.core.find_previous();
+                            self.after_state_change();
+                        }
+                        keymap::FindAction::None => {
+                            if let Some(text) = event.text.as_ref() {
+                                let printable: String =
+                                    text.chars().filter(|c| !c.is_control()).collect();
+                                if !printable.is_empty() {
+                                    let mut query = self
+                                        .core
+                                        .find_state()
+                                        .map(|f| f.query())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    query.push_str(&printable);
+                                    self.core.set_find_query(query);
+                                    self.after_state_change();
+                                }
+                            }
                         }
                     }
                     return;
@@ -1538,6 +2523,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
 mod tests {
     use super::*;
     use crate::layout::FontMetrics;
+    use ls_platform::MemoryClipboard;
 
     fn layout() -> Layout {
         Layout::with_chrome(
@@ -1548,6 +2534,7 @@ mod tests {
             4,
             true,
             true,
+            false,
         )
     }
 
@@ -1597,6 +2584,149 @@ mod tests {
         let (x, y) = centre(layout.text);
         assert_eq!(wheel_target(&layout, InputFocus::Menu, x, y), WheelTarget::Blocked);
         assert_eq!(wheel_target(&layout, InputFocus::Prompt, x, y), WheelTarget::Blocked);
+    }
+
+    #[test]
+    fn a_newer_diagnostics_version_is_applied() {
+        assert!(should_apply_lsp_diagnostics(Some(5), Some(6)));
+        assert!(should_apply_lsp_diagnostics(None, Some(1)), "the first version ever seen applies");
+    }
+
+    #[test]
+    fn an_older_diagnostics_version_is_dropped() {
+        // The exact bug this exists to prevent: a slow re-analysis for
+        // revision 41 finishing after revision 45's result already landed
+        // must not overwrite it.
+        assert!(!should_apply_lsp_diagnostics(Some(45), Some(41)));
+    }
+
+    #[test]
+    fn the_same_version_reapplying_is_allowed() {
+        // A server may republish the same analysis (e.g. after an unrelated
+        // file changed); it is not older, so it is not rejected as stale.
+        assert!(should_apply_lsp_diagnostics(Some(5), Some(5)));
+    }
+
+    #[test]
+    fn a_server_that_never_sends_a_version_is_always_applied() {
+        assert!(should_apply_lsp_diagnostics(Some(100), None));
+    }
+
+    // --- the file tree: one geometry-free row-builder, tested directly ------------
+
+    fn scratch_workspace(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "lightspeed-app-tree-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn editor_at(root: &Path) -> EditorCore {
+        let mut core = EditorCore::with_clipboard(
+            EffectiveConfig::default(),
+            Box::new(MemoryClipboard::new()),
+        );
+        core.open_workspace(root).expect("open the scratch workspace");
+        core
+    }
+
+    #[test]
+    fn collapsed_directories_show_only_their_own_name() {
+        let root = scratch_workspace("collapsed");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("README.md"), "").unwrap();
+        let core = editor_at(&root);
+
+        let mut rows = Vec::new();
+        append_tree_level(&core, &std::collections::HashSet::new(), &root, 0, &mut rows);
+
+        assert_eq!(rows.len(), 2, "one directory row, one file row, nothing from inside src/");
+        let dir_row = rows.iter().find(|r| r.label.contains("src")).unwrap();
+        assert!(
+            dir_row.label.starts_with('\u{25b8}'),
+            "a collapsed directory shows the closed glyph"
+        );
+        assert!(matches!(dir_row.action, Some(ListAction::ToggleDirectory(_))));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn expanding_a_directory_reveals_its_children_indented_one_level_deeper() {
+        let root = scratch_workspace("expanded");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), "").unwrap();
+        let core = editor_at(&root);
+
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(root.join("src"));
+        let mut rows = Vec::new();
+        append_tree_level(&core, &expanded, &root, 0, &mut rows);
+
+        assert_eq!(rows.len(), 2, "the directory row, plus main.rs inside it");
+        let dir_row = &rows[0];
+        assert!(
+            dir_row.label.starts_with('\u{25be}'),
+            "an expanded directory shows the open glyph"
+        );
+        let file_row = &rows[1];
+        assert!(file_row.label.contains("main.rs"));
+        assert!(
+            file_row.label.starts_with("    "),
+            "a child is indented two steps deeper than its parent's zero: {:?}",
+            file_row.label
+        );
+        assert!(
+            matches!(&file_row.action, Some(ListAction::OpenFile(p)) if p.ends_with("main.rs"))
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_separate_branches_can_be_expanded_at_once() {
+        // The whole point of a real tree over a drill-down browser: opening
+        // one branch does not require closing another.
+        let root = scratch_workspace("two-branches");
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        std::fs::write(root.join("alpha/a.rs"), "").unwrap();
+        std::fs::write(root.join("beta/b.rs"), "").unwrap();
+        let core = editor_at(&root);
+
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert(root.join("alpha"));
+        expanded.insert(root.join("beta"));
+        let mut rows = Vec::new();
+        append_tree_level(&core, &expanded, &root, 0, &mut rows);
+
+        assert_eq!(rows.len(), 4, "alpha, a.rs, beta, b.rs");
+        assert!(rows.iter().any(|r| r.label.contains("a.rs")));
+        assert!(rows.iter().any(|r| r.label.contains("b.rs")));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_collapsed_directory_never_touches_its_children_on_disk() {
+        // Bounded by what is expanded, not by workspace size: a directory
+        // that is not open must not even be read.
+        let root = scratch_workspace("bounded");
+        std::fs::create_dir_all(root.join("huge")).unwrap();
+        for index in 0..50 {
+            std::fs::write(root.join("huge").join(format!("f{index}.txt")), "").unwrap();
+        }
+        let core = editor_at(&root);
+
+        let mut rows = Vec::new();
+        append_tree_level(&core, &std::collections::HashSet::new(), &root, 0, &mut rows);
+        assert_eq!(rows.len(), 1, "only the collapsed huge/ row itself, none of its 50 files");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

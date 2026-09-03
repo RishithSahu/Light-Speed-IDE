@@ -15,6 +15,7 @@ mod async_save_bench;
 mod harness;
 mod scheduler_bench;
 mod workload;
+mod workspace_search_bench;
 
 use harness::{format_bytes, format_duration, measure, time, Environment, Measurement, Samples};
 use ls_buffer::{CharOffset, LineIndex, TextBuffer};
@@ -79,6 +80,9 @@ fn main() {
         std::process::exit(1);
     }
     measurements.extend(scheduler_bench::run(&mut sampler));
+    if !options.quick {
+        measurements.extend(workspace_search_bench::run(&mut sampler));
+    }
 
     let mut workloads: Vec<Workload> = workload::DOCUMENT_WORKLOADS.to_vec();
     if options.quick {

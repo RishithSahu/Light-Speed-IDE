@@ -14,12 +14,16 @@
 mod app;
 mod compose;
 mod devpanel;
+mod json;
 mod keymap;
 mod layout;
+mod lsp;
 mod menu;
 mod quads;
 mod renderer;
+mod resources;
 mod tabs;
+mod terminal;
 mod text;
 mod theme;
 

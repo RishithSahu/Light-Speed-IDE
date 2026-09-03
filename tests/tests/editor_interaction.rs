@@ -13,8 +13,9 @@
 //! own document, and that closing acts on a `DocumentId` rather than on a
 //! position in a list.
 
-use ls_core::{CommandArgs, DocumentId, EditorCore, EditorError, Viewport};
+use ls_core::{CommandArgs, DocumentId, EditorCore, EditorError, RenderSnapshot, Viewport};
 use ls_tests::{headless_editor, TempDir};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn pump_until(editor: &mut EditorCore, mut settled: impl FnMut(&EditorCore) -> bool) {
@@ -31,6 +32,17 @@ fn visible_text(editor: &mut EditorCore) -> String {
     let id = editor.active().expect("a document is active");
     let snapshot = editor.render_snapshot(id, Viewport::default()).expect("the document exists");
     snapshot.lines.iter().map(|line| line.text.to_string()).collect::<Vec<_>>().join("\n")
+}
+
+/// The snapshot the renderer would be handed for the active document.
+fn frame(editor: &mut EditorCore) -> Arc<RenderSnapshot> {
+    let id = editor.active().expect("a document is active");
+    editor.render_snapshot(id, Viewport::default()).expect("the document exists")
+}
+
+/// The active document's text, as a string.
+fn text(editor: &EditorCore) -> String {
+    editor.active_document().expect("a document is active").text().to_string()
 }
 
 /// Two documents with distinct content, B active, as the shell would have them
@@ -311,4 +323,314 @@ fn enablement_tracks_the_active_document_not_the_last_one_looked_at() {
     assert!(editor.is_command_enabled("edit.undo"));
     editor.set_active(fresh).unwrap();
     assert!(!editor.is_command_enabled("edit.undo"));
+}
+
+// --- direct tab shortcuts (Ctrl+1..9) -----------------------------------------
+
+#[test]
+fn ctrl_digit_activates_the_tab_at_that_position() {
+    let mut editor = headless_editor();
+    let a = editor.new_document();
+    let b = editor.new_document();
+    let c = editor.new_document();
+
+    editor.execute("view.go_to_tab", CommandArgs::Index(1)).unwrap();
+    assert_eq!(editor.active(), Some(a));
+    editor.execute("view.go_to_tab", CommandArgs::Index(3)).unwrap();
+    assert_eq!(editor.active(), Some(c));
+    editor.execute("view.go_to_tab", CommandArgs::Index(2)).unwrap();
+    assert_eq!(editor.active(), Some(b));
+}
+
+#[test]
+fn ctrl_digit_past_the_last_tab_does_nothing() {
+    let mut editor = headless_editor();
+    let only = editor.new_document();
+    editor.execute("view.go_to_tab", CommandArgs::Index(9)).unwrap();
+    assert_eq!(editor.active(), Some(only), "an out-of-range index leaves the selection alone");
+}
+
+// --- recent files ---------------------------------------------------------------
+
+#[test]
+fn opening_a_file_adds_it_to_the_recent_list_most_recent_first() {
+    let directory = TempDir::new("interaction-recent");
+    let a = directory.write("a.txt", "a\n");
+    let b = directory.write("b.txt", "b\n");
+
+    let mut editor = headless_editor();
+    editor.open_document(&a).expect("opened a");
+    editor.open_document(&b).expect("opened b");
+
+    let recent = editor.recent_files();
+    assert_eq!(recent.len(), 2);
+    assert!(recent[0].ends_with("b.txt"), "the most recently opened file leads");
+    assert!(recent[1].ends_with("a.txt"));
+}
+
+#[test]
+fn reopening_a_file_moves_it_to_the_front_without_duplicating_it() {
+    let directory = TempDir::new("interaction-recent-dedup");
+    let a = directory.write("a.txt", "a\n");
+    let b = directory.write("b.txt", "b\n");
+
+    let mut editor = headless_editor();
+    editor.open_document(&a).expect("opened a");
+    editor.open_document(&b).expect("opened b");
+    editor.open_document(&a).expect("reopened a");
+
+    let recent = editor.recent_files();
+    assert_eq!(recent.len(), 2, "reopening must not duplicate the entry");
+    assert!(recent[0].ends_with("a.txt"));
+    assert!(recent[1].ends_with("b.txt"));
+}
+
+#[test]
+fn the_recent_list_is_capped() {
+    let directory = TempDir::new("interaction-recent-cap");
+    let mut editor = headless_editor();
+    for index in 0..(ls_core::MAX_RECENT_FILES + 5) {
+        let path = directory.write(&format!("f{index}.txt"), "x");
+        editor.open_document(&path).expect("opened");
+    }
+    assert_eq!(editor.recent_files().len(), ls_core::MAX_RECENT_FILES);
+}
+
+#[test]
+fn set_recent_files_seeds_the_list_for_the_open_recent_menu() {
+    let mut editor = headless_editor();
+    let seeded = vec![std::path::PathBuf::from("seen-before.rs")];
+    editor.set_recent_files(seeded.clone());
+    assert_eq!(editor.recent_files(), seeded.as_slice());
+}
+
+// --- find in current document ---------------------------------------------------
+
+#[test]
+fn opening_find_and_typing_a_query_highlights_matches_in_the_snapshot() {
+    let mut editor = launched_empty_for_find();
+    editor.type_text("cat dog cat");
+    editor.execute("edit.find", CommandArgs::None).unwrap();
+    assert!(editor.is_find_open());
+
+    editor.set_find_query("cat".to_string());
+    let snapshot = frame(&mut editor);
+    let matches: Vec<_> = snapshot
+        .decorations
+        .iter()
+        .filter(|d| d.kind == ls_core::DecorationKind::SearchMatch)
+        .collect();
+    assert_eq!(matches.len(), 2, "both occurrences of cat are decorated");
+}
+
+#[test]
+fn find_next_and_previous_cycle_through_matches() {
+    let mut editor = launched_empty_for_find();
+    editor.type_text("a b a b a");
+    editor.set_find_query("a".to_string());
+    assert_eq!(editor.find_state().unwrap().position(), Some((1, 3)));
+
+    editor.find_next();
+    assert_eq!(editor.find_state().unwrap().position(), Some((2, 3)));
+    editor.find_next();
+    assert_eq!(editor.find_state().unwrap().position(), Some((3, 3)));
+    editor.find_next();
+    assert_eq!(editor.find_state().unwrap().position(), Some((1, 3)), "wraps forward");
+
+    editor.find_previous();
+    assert_eq!(editor.find_state().unwrap().position(), Some((3, 3)), "wraps backward");
+}
+
+#[test]
+fn the_current_match_becomes_the_selection() {
+    let mut editor = launched_empty_for_find();
+    editor.type_text("xx needle xx");
+    editor.set_find_query("needle".to_string());
+
+    let snapshot = frame(&mut editor);
+    assert!(!snapshot.selections.is_empty(), "the current match is selected");
+    assert!(!text(&editor).is_empty());
+    // Typing now replaces the match, exactly like any other selection.
+    editor.type_text("Z");
+    assert_eq!(text(&editor), "xx Z xx");
+}
+
+#[test]
+fn closing_find_clears_the_highlights_but_keeps_the_cursor_where_it_landed() {
+    let mut editor = launched_empty_for_find();
+    editor.type_text("alpha beta alpha");
+    editor.set_find_query("beta".to_string());
+    editor.close_find();
+
+    assert!(!editor.is_find_open());
+    let snapshot = frame(&mut editor);
+    assert!(
+        snapshot.decorations.iter().all(|d| d.kind != ls_core::DecorationKind::SearchMatch),
+        "closing find removes the match highlights"
+    );
+    // The selection find left behind (the word "beta") is untouched.
+    assert!(!snapshot.selections.is_empty());
+}
+
+#[test]
+fn a_query_with_no_matches_reports_none_current() {
+    let mut editor = launched_empty_for_find();
+    editor.type_text("hello world");
+    editor.set_find_query("zzz".to_string());
+    assert_eq!(editor.find_state().unwrap().position(), None);
+}
+
+#[test]
+fn find_next_with_an_empty_query_does_nothing_and_never_panics() {
+    let mut editor = launched_empty_for_find();
+    editor.type_text("hello");
+    editor.find_next();
+    editor.find_previous();
+    assert_eq!(text(&editor), "hello", "no query means nothing to navigate");
+}
+
+#[test]
+fn switching_documents_does_not_carry_one_documents_search_into_another() {
+    let mut editor = headless_editor();
+    let a = editor.new_document();
+    editor.type_text("needle here");
+    editor.set_find_query("needle".to_string());
+    assert_eq!(editor.find_state().unwrap().position(), Some((1, 1)));
+
+    let b = editor.new_document();
+    editor.type_text("no match here");
+    assert!(
+        editor.find_state().unwrap().query().is_empty(),
+        "a new document starts with no search of its own"
+    );
+
+    editor.set_active(a).unwrap();
+    assert_eq!(
+        editor.find_state().unwrap().query(),
+        "needle",
+        "document A's search is exactly as it was left"
+    );
+    let _ = b;
+}
+
+fn launched_empty_for_find() -> EditorCore {
+    let mut editor = headless_editor();
+    editor.new_document();
+    editor
+}
+
+// --- diagnostics (item 9: LSP) -------------------------------------------------
+
+#[test]
+fn diagnostics_reach_the_render_snapshot_for_the_matching_open_document() {
+    let directory = TempDir::new("interaction-diagnostics");
+    let path = directory.write("f.rs", "fn main() {}\n");
+
+    let mut editor = headless_editor();
+    editor.open_document(&path).expect("opened");
+
+    editor.apply_diagnostics(
+        &path,
+        vec![ls_core::Diagnostic {
+            line: ls_core::LineIndex::new(0),
+            start_column_chars: 0,
+            end_column_chars: 2,
+            severity: ls_core::DiagnosticSeverity::Warning,
+            message: "unused".to_string(),
+        }],
+    );
+
+    let snapshot = frame(&mut editor);
+    assert_eq!(snapshot.diagnostics.len(), 1);
+    assert_eq!(snapshot.diagnostics[0].message, "unused");
+}
+
+#[test]
+fn diagnostics_for_a_document_that_is_not_open_are_dropped_without_panicking() {
+    let mut editor = headless_editor();
+    editor.new_document();
+    editor.apply_diagnostics(
+        std::path::Path::new("nonexistent.rs"),
+        vec![ls_core::Diagnostic {
+            line: ls_core::LineIndex::new(0),
+            start_column_chars: 0,
+            end_column_chars: 1,
+            severity: ls_core::DiagnosticSeverity::Error,
+            message: "irrelevant".to_string(),
+        }],
+    );
+    // No panic is the assertion; there is nowhere for this to land.
+}
+
+// --- editor navigation gaps (Shift+Tab dedent, Ctrl+Shift+W) -------------------
+
+#[test]
+fn dedent_removes_one_indent_step_from_the_callers_line() {
+    let mut editor = headless_editor();
+    editor.new_document();
+    editor.type_text("    indented");
+    editor.execute("edit.dedent", CommandArgs::None).unwrap();
+    assert_eq!(text(&editor), "indented");
+}
+
+#[test]
+fn dedent_prefers_removing_a_leading_tab_over_spaces() {
+    let mut editor = headless_editor();
+    editor.new_document();
+    editor.type_text("\tindented");
+    editor.execute("edit.dedent", CommandArgs::None).unwrap();
+    assert_eq!(text(&editor), "indented");
+}
+
+#[test]
+fn dedent_on_a_line_with_no_leading_whitespace_does_nothing() {
+    let mut editor = headless_editor();
+    editor.new_document();
+    editor.type_text("no indent");
+    editor.execute("edit.dedent", CommandArgs::None).unwrap();
+    assert_eq!(text(&editor), "no indent");
+}
+
+#[test]
+fn dedent_applies_to_every_line_a_selection_touches() {
+    let mut editor = headless_editor();
+    editor.new_document();
+    editor.type_text("    one\n    two\n    three");
+    editor.execute("edit.select_all", CommandArgs::None).unwrap();
+    editor.execute("edit.dedent", CommandArgs::None).unwrap();
+    assert_eq!(text(&editor), "one\ntwo\nthree");
+}
+
+#[test]
+fn close_all_clean_tabs_leaves_dirty_ones_open() {
+    let mut editor = headless_editor();
+    let clean = editor.new_document();
+    editor.undo_active();
+    let dirty = editor.new_document();
+    editor.type_text("unsaved");
+
+    editor.execute("file.close_all_clean_tabs", CommandArgs::None).unwrap();
+    assert!(!editor.tabs().contains(&clean), "the clean tab closed");
+    assert!(editor.tabs().contains(&dirty), "the dirty tab was not silently discarded");
+}
+
+#[test]
+fn selecting_a_line_via_its_movement_commands_selects_the_whole_line() {
+    // What triple-click drives: line_start then line_end.select. Testing the
+    // command sequence directly, since mouse click counting itself lives in
+    // the shell and needs a window.
+    let mut editor = headless_editor();
+    editor.new_document();
+    editor.type_text("first\nsecond line\nthird");
+    editor.go_to(1, 4);
+
+    editor.execute("cursor.line_start", CommandArgs::None).unwrap();
+    editor.execute("cursor.line_end.select", CommandArgs::None).unwrap();
+    editor.copy().expect("a selection exists to copy");
+
+    let snapshot = frame(&mut editor);
+    assert_eq!(snapshot.selections.len(), 1);
+    let span = &snapshot.selections[0];
+    assert_eq!(span.start_column_chars, 0);
+    assert_eq!(span.end_column_chars, "second line".chars().count());
 }

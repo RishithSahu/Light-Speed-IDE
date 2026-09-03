@@ -112,6 +112,14 @@ pub struct Theme {
     pub cursor: Color,
     pub current_line: Color,
     pub selection: Color,
+    /// Every find match, dimmer than the selection so the current one (drawn
+    /// as a normal selection on top of this) still reads as "the one you're
+    /// on".
+    pub search_match: Color,
+    pub syntax_keyword: Color,
+    pub syntax_string: Color,
+    pub syntax_comment: Color,
+    pub syntax_number: Color,
     pub tab_bar: Color,
     pub tab_inactive: Color,
     pub tab_active: Color,
@@ -121,6 +129,12 @@ pub struct Theme {
     pub status_text: Color,
     pub overlay_background: Color,
     pub overlay_border: Color,
+    /// The explorer / search / git-status sidebar. A real docked panel, so
+    /// it gets its own opaque surface rather than borrowing the overlay's
+    /// translucent one.
+    pub sidebar_background: Color,
+    pub sidebar_border: Color,
+    pub sidebar_selected: Color,
     /// Menu surfaces. Fully opaque on purpose: a dropdown that lets the
     /// document show through is unreadable, and translucency here would also
     /// mean the text underneath is still being drawn and paid for.
@@ -134,6 +148,15 @@ pub struct Theme {
 }
 
 impl Theme {
+    pub fn syntax_color(&self, kind: ls_core::TokenKind) -> Color {
+        match kind {
+            ls_core::TokenKind::Keyword => self.syntax_keyword,
+            ls_core::TokenKind::String => self.syntax_string,
+            ls_core::TokenKind::Comment => self.syntax_comment,
+            ls_core::TokenKind::Number => self.syntax_number,
+        }
+    }
+
     pub const fn dark() -> Self {
         Theme {
             background: Color::rgb(0x14, 0x16, 0x1A),
@@ -144,6 +167,11 @@ impl Theme {
             cursor: Color::rgb(0x5A, 0xC8, 0xFA),
             current_line: Color::rgb(0x1B, 0x1E, 0x25),
             selection: Color::rgba(0x2C, 0x5A, 0x8C, 0xB0),
+            search_match: Color::rgba(0xE0, 0xA0, 0x3C, 0x60),
+            syntax_keyword: Color::rgb(0xC5, 0x86, 0xE8),
+            syntax_string: Color::rgb(0x9E, 0xC9, 0x6A),
+            syntax_comment: Color::rgb(0x6A, 0x73, 0x80),
+            syntax_number: Color::rgb(0xD1, 0x9A, 0x66),
             tab_bar: Color::rgb(0x0F, 0x11, 0x15),
             tab_inactive: Color::rgb(0x0F, 0x11, 0x15),
             tab_active: Color::rgb(0x14, 0x16, 0x1A),
@@ -153,6 +181,9 @@ impl Theme {
             status_text: Color::rgb(0xC4, 0xCE, 0xDA),
             overlay_background: Color::rgba(0x0A, 0x0C, 0x10, 0xE8),
             overlay_border: Color::rgb(0x2A, 0x30, 0x3A),
+            sidebar_background: Color::rgb(0x18, 0x1A, 0x1F),
+            sidebar_border: Color::rgb(0x2A, 0x30, 0x3A),
+            sidebar_selected: Color::rgb(0x2C, 0x5A, 0x8C),
             menu_background: Color::rgb(0x1E, 0x22, 0x2A),
             menu_highlight: Color::rgb(0x2C, 0x5A, 0x8C),
             menu_border: Color::rgb(0x3A, 0x42, 0x50),

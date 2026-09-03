@@ -27,6 +27,8 @@ pub enum CommandArgs {
     Path(PathBuf),
     /// Target of a "go to line".
     Position { line: usize, column: usize },
+    /// A 1-based position: a tab number (Ctrl+1..9) or a recent-files slot.
+    Index(usize),
 }
 
 impl CommandArgs {
@@ -84,6 +86,10 @@ fn can_redo(core: &EditorCore) -> bool {
 
 fn is_dirty_or_untitled(core: &EditorCore) -> bool {
     core.active_document().is_some_and(|document| document.is_dirty() || document.path().is_none())
+}
+
+fn has_find_matches(core: &EditorCore) -> bool {
+    core.find_state().is_some_and(|find| !find.matches().is_empty())
 }
 
 /// Defines the move/select pair for one cursor movement.
@@ -149,6 +155,11 @@ fn file_close_tab(core: &mut EditorCore, _args: CommandArgs) -> Result<(), Edito
     Ok(())
 }
 
+fn file_close_all_clean_tabs(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.close_all_clean_tabs();
+    Ok(())
+}
+
 fn edit_undo(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
     core.undo_active();
     Ok(())
@@ -199,6 +210,11 @@ fn edit_insert_tab(core: &mut EditorCore, _args: CommandArgs) -> Result<(), Edit
     Ok(())
 }
 
+fn edit_dedent(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.dedent();
+    Ok(())
+}
+
 fn edit_delete_backward(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
     core.delete_backward();
     Ok(())
@@ -226,6 +242,21 @@ fn go_to_position(core: &mut EditorCore, args: CommandArgs) -> Result<(), Editor
     Ok(())
 }
 
+fn edit_find(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.open_find();
+    Ok(())
+}
+
+fn edit_find_next(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.find_next();
+    Ok(())
+}
+
+fn edit_find_previous(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.find_previous();
+    Ok(())
+}
+
 fn view_next_tab(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
     core.cycle_tab(1);
     Ok(())
@@ -236,6 +267,13 @@ fn view_previous_tab(core: &mut EditorCore, _args: CommandArgs) -> Result<(), Ed
     Ok(())
 }
 
+fn view_go_to_tab(core: &mut EditorCore, args: CommandArgs) -> Result<(), EditorError> {
+    if let CommandArgs::Index(number) = args {
+        core.go_to_tab(number);
+    }
+    Ok(())
+}
+
 fn view_toggle_status_bar(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
     core.request_shell(ShellRequest::ToggleStatusBar);
     Ok(())
@@ -243,6 +281,39 @@ fn view_toggle_status_bar(core: &mut EditorCore, _args: CommandArgs) -> Result<(
 
 fn view_toggle_dev_panel(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
     core.request_shell(ShellRequest::ToggleDevPanel);
+    Ok(())
+}
+
+fn view_toggle_resource_center(
+    core: &mut EditorCore,
+    _args: CommandArgs,
+) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ToggleResourceCenter);
+    Ok(())
+}
+
+fn view_toggle_file_tree(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ToggleFileTree);
+    Ok(())
+}
+
+fn file_open_folder(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::OpenFolderDialog);
+    Ok(())
+}
+
+fn view_workspace_search(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::WorkspaceSearch);
+    Ok(())
+}
+
+fn view_toggle_git_status(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ToggleGitStatus);
+    Ok(())
+}
+
+fn view_toggle_terminal(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ToggleTerminal);
     Ok(())
 }
 
@@ -300,6 +371,18 @@ pub enum ShellRequest {
     TogglePerformanceOverlay,
     /// Show or hide the asynchronous-loading development panel.
     ToggleDevPanel,
+    /// Show or hide the Resource Center (admission, accounting, pressure).
+    ToggleResourceCenter,
+    /// Show or hide the file tree (item 6).
+    ToggleFileTree,
+    /// Open a folder as the workspace root (item 6).
+    OpenFolderDialog,
+    /// Open the workspace-search query bar (item 7).
+    WorkspaceSearch,
+    /// Show or hide the git status panel (item 11).
+    ToggleGitStatus,
+    /// Show or hide the command runner (item 10).
+    ToggleTerminal,
     /// Show or hide the status bar.
     ToggleStatusBar,
     /// Diagnostics: issue several requests for one path at once, so the join
@@ -343,6 +426,12 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         display_name: "Close Tab",
         enabled: has_document,
         execute: file_close_tab,
+    },
+    CommandDescriptor {
+        id: "file.close_all_clean_tabs",
+        display_name: "Close All Clean Tabs",
+        enabled: has_document,
+        execute: file_close_all_clean_tabs,
     },
     CommandDescriptor {
         id: "edit.undo",
@@ -397,6 +486,12 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         display_name: "Insert Tab",
         enabled: has_document,
         execute: edit_insert_tab,
+    },
+    CommandDescriptor {
+        id: "edit.dedent",
+        display_name: "Dedent",
+        enabled: has_document,
+        execute: edit_dedent,
     },
     CommandDescriptor {
         id: "edit.delete_backward",
@@ -573,6 +668,24 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         execute: go_to_position,
     },
     CommandDescriptor {
+        id: "edit.find",
+        display_name: "Find...",
+        enabled: has_document,
+        execute: edit_find,
+    },
+    CommandDescriptor {
+        id: "edit.find_next",
+        display_name: "Find Next",
+        enabled: has_find_matches,
+        execute: edit_find_next,
+    },
+    CommandDescriptor {
+        id: "edit.find_previous",
+        display_name: "Find Previous",
+        enabled: has_find_matches,
+        execute: edit_find_previous,
+    },
+    CommandDescriptor {
         id: "view.next_tab",
         display_name: "Next Tab",
         enabled: has_document,
@@ -583,6 +696,12 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         display_name: "Previous Tab",
         enabled: has_document,
         execute: view_previous_tab,
+    },
+    CommandDescriptor {
+        id: "view.go_to_tab",
+        display_name: "Go to Tab",
+        enabled: has_document,
+        execute: view_go_to_tab,
     },
     CommandDescriptor {
         id: "view.toggle_performance_overlay",
@@ -601,6 +720,42 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         display_name: "Toggle Loading Panel",
         enabled: always,
         execute: view_toggle_dev_panel,
+    },
+    CommandDescriptor {
+        id: "view.toggle_resource_center",
+        display_name: "Toggle Resource Center",
+        enabled: always,
+        execute: view_toggle_resource_center,
+    },
+    CommandDescriptor {
+        id: "view.toggle_file_tree",
+        display_name: "Toggle File Tree",
+        enabled: always,
+        execute: view_toggle_file_tree,
+    },
+    CommandDescriptor {
+        id: "file.open_folder",
+        display_name: "Open Folder",
+        enabled: always,
+        execute: file_open_folder,
+    },
+    CommandDescriptor {
+        id: "view.workspace_search",
+        display_name: "Search in Files...",
+        enabled: always,
+        execute: view_workspace_search,
+    },
+    CommandDescriptor {
+        id: "view.toggle_git_status",
+        display_name: "Toggle Git Status",
+        enabled: always,
+        execute: view_toggle_git_status,
+    },
+    CommandDescriptor {
+        id: "view.toggle_terminal",
+        display_name: "Toggle Terminal",
+        enabled: always,
+        execute: view_toggle_terminal,
     },
     CommandDescriptor {
         id: "document.cancel_load",

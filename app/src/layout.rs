@@ -5,12 +5,17 @@
 //! | menu bar     File  Edit  View                    |
 //! +--------------------------------------------------+
 //! | tab bar                                          |
-//! +--------+-----------------------------------------+
-//! | gutter | text                                    |
-//! +--------+-----------------------------------------+
-//! | status bar                                       |
+//! +---------+------------------------------------------+
+//! | sidebar | gutter | text                            |
+//! +---------+------------------------------------------+
+//! | status bar                                        |
 //! +--------------------------------------------------+
 //! ```
+//!
+//! The sidebar (the explorer / search / git-status panel) is a real docked
+//! column, not a floating overlay: when it is visible, the gutter and text
+//! area shift right to make room for it, the way an actual IDE reserves space
+//! for its explorer rather than drawing one on top of the document.
 //!
 //! All rectangles are in physical pixels: layout happens once per frame from
 //! the window size and the measured font metrics, and nothing downstream has to
@@ -51,12 +56,18 @@ pub struct FontMetrics {
     pub digit_width: f32,
 }
 
+/// The explorer sidebar's width at typical scale, before clamping to the
+/// window (specification-free: chosen to match VS Code's default explorer
+/// width closely enough to feel familiar).
+pub const SIDEBAR_WIDTH: f32 = 260.0;
+
 #[derive(Copy, Clone, Debug)]
 pub struct Layout {
     pub scale: f32,
     pub window: Rect,
     pub menu_bar: Rect,
     pub tab_bar: Rect,
+    pub sidebar: Rect,
     pub gutter: Rect,
     pub text: Rect,
     pub status_bar: Rect,
@@ -64,6 +75,7 @@ pub struct Layout {
     pub metrics: FontMetrics,
     pub show_line_numbers: bool,
     pub show_status_bar: bool,
+    pub sidebar_visible: bool,
 }
 
 impl Layout {
@@ -78,6 +90,7 @@ impl Layout {
         line_number_digits: usize,
         show_line_numbers: bool,
         show_status_bar: bool,
+        sidebar_visible: bool,
     ) -> Self {
         let menu_height = (metrics.line_height + 8.0 * scale).round();
         let tab_bar_height = (metrics.line_height + 10.0 * scale).round();
@@ -89,16 +102,21 @@ impl Layout {
             6.0 * scale
         };
         let scrollbar_width = 8.0 * scale;
+        // Never let the sidebar crowd the editor out entirely on a narrow
+        // window: cap it at 60% of the width rather than the fixed default.
+        let sidebar_width =
+            if sidebar_visible { (SIDEBAR_WIDTH * scale).min(width * 0.6).max(0.0) } else { 0.0 };
 
         let menu_bar = Rect::new(0.0, 0.0, width, menu_height);
         let tab_bar = Rect::new(0.0, menu_bar.bottom(), width, tab_bar_height);
         let body_top = tab_bar.bottom();
         let body_height = (height - menu_height - tab_bar_height - status_height).max(0.0);
-        let gutter = Rect::new(0.0, body_top, gutter_width, body_height);
+        let sidebar = Rect::new(0.0, body_top, sidebar_width, body_height);
+        let gutter = Rect::new(sidebar_width, body_top, gutter_width, body_height);
         let text = Rect::new(
-            gutter_width,
+            gutter.right(),
             body_top,
-            (width - gutter_width - scrollbar_width).max(0.0),
+            (width - sidebar_width - gutter_width - scrollbar_width).max(0.0),
             body_height,
         );
         let scrollbar = Rect::new(text.right(), body_top, scrollbar_width, body_height);
@@ -109,6 +127,7 @@ impl Layout {
             window: Rect::new(0.0, 0.0, width, height),
             menu_bar,
             tab_bar,
+            sidebar,
             gutter,
             text,
             status_bar,
@@ -116,6 +135,7 @@ impl Layout {
             metrics,
             show_line_numbers,
             show_status_bar,
+            sidebar_visible,
         }
     }
 
@@ -163,7 +183,7 @@ mod tests {
         digits: usize,
         show_line_numbers: bool,
     ) -> Layout {
-        Layout::with_chrome(width, height, scale, metrics, digits, show_line_numbers, true)
+        Layout::with_chrome(width, height, scale, metrics, digits, show_line_numbers, true, false)
     }
 
     fn metrics() -> FontMetrics {
@@ -209,7 +229,7 @@ mod tests {
     #[test]
     fn hiding_the_status_bar_gives_its_height_to_the_editor() {
         let with = compute(1000.0, 700.0, 1.0, metrics(), 4, true);
-        let without = Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, false);
+        let without = Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, false, false);
         assert_eq!(without.status_bar.height, 0.0);
         assert!(without.text.height > with.text.height);
         assert!((without.text.bottom() - 700.0).abs() < 0.5, "the editor reaches the bottom");
@@ -228,6 +248,27 @@ mod tests {
         let scaled = compute(2000.0, 1400.0, 2.0, metrics(), 4, true);
         let unscaled = compute(1000.0, 700.0, 1.0, metrics(), 4, true);
         assert!(scaled.tab_bar.height > unscaled.tab_bar.height);
+    }
+
+    #[test]
+    fn the_sidebar_is_absent_by_default_and_pushes_the_editor_right_when_shown() {
+        let hidden = compute(1000.0, 700.0, 1.0, metrics(), 4, true);
+        assert_eq!(hidden.sidebar.width, 0.0);
+
+        let shown = Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, true, true);
+        assert!(shown.sidebar.width > 0.0);
+        assert_eq!(shown.sidebar.x, 0.0);
+        assert_eq!(shown.gutter.x, shown.sidebar.right());
+        assert!(shown.text.width < hidden.text.width, "the editor gives up room to the sidebar");
+        assert_eq!(shown.sidebar.y, shown.gutter.y);
+        assert_eq!(shown.sidebar.height, shown.gutter.height);
+    }
+
+    #[test]
+    fn the_sidebar_never_crowds_out_the_editor_on_a_narrow_window() {
+        let layout = Layout::with_chrome(200.0, 700.0, 1.0, metrics(), 4, true, true, true);
+        assert!(layout.sidebar.width <= 200.0 * 0.6 + 0.001);
+        assert!(layout.text.width >= 0.0);
     }
 
     #[test]

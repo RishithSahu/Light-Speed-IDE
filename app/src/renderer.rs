@@ -15,7 +15,7 @@ use crate::quads::{Quad, QuadRenderer};
 use crate::tabs::TabGeometry;
 use crate::text::{Region, TextEngine, TextRegionPlacement};
 use crate::theme::{Color, Theme};
-use ls_core::RenderSnapshot;
+use ls_core::{DecorationKind, RenderSnapshot};
 use std::sync::Arc;
 use winit::window::Window;
 
@@ -83,10 +83,18 @@ pub struct Frame<'a> {
     /// Per-item enablement for the open menu, straight from the command
     /// registry. Empty when no menu is open.
     pub menu_enabled: &'a [bool],
+    /// Recently opened files, appended below File's static items. Empty when
+    /// nothing has been opened yet.
+    pub recent_files: &'a [menu::RecentRow],
     /// Whether the caret is in its visible half of the blink cycle.
     pub caret_visible: bool,
     /// A confirmation strip, when the editor is waiting on an answer.
     pub prompt: Option<&'a str>,
+    /// The docked sidebar's rows (header included), when it is shown.
+    pub sidebar: Option<&'a [String]>,
+    /// Which sidebar row (by index into `sidebar`, header included) is
+    /// selected, for the highlight quad.
+    pub sidebar_selected_row: Option<usize>,
 }
 
 pub struct Renderer {
@@ -103,6 +111,7 @@ pub struct Renderer {
     gutter_text: String,
     tab_text: String,
     overlay_text: String,
+    sidebar_text: String,
     menu_text: String,
     dropdown_text: String,
     dropdown_disabled_text: String,
@@ -230,6 +239,7 @@ impl Renderer {
             gutter_text: String::new(),
             tab_text: String::new(),
             overlay_text: String::new(),
+            sidebar_text: String::new(),
             menu_text: String::new(),
             dropdown_text: String::new(),
             dropdown_disabled_text: String::new(),
@@ -300,6 +310,8 @@ impl Renderer {
             status_color: frame.status_color,
             prompt: frame.prompt,
             overlay_panel: self.overlay_panel(frame),
+            sidebar_panel: layout.sidebar_visible.then_some(layout.sidebar),
+            sidebar_selected_row: frame.sidebar_selected_row,
         });
         self.add_editor_layer(frame, &mut draw);
 
@@ -391,6 +403,10 @@ impl Renderer {
 
         self.editor_text.clear();
         self.gutter_text.clear();
+        // Byte ranges within `editor_text`, for syntax highlighting: one
+        // shaped buffer holds the whole visible slice, so a token's position
+        // has to be tracked as the lines that come before it are appended.
+        let mut syntax_spans: Vec<(usize, usize, Color)> = Vec::new();
 
         match frame.snapshot {
             Some(snapshot) => {
@@ -399,7 +415,21 @@ impl Renderer {
                         self.editor_text.push('\n');
                         self.gutter_text.push('\n');
                     }
+                    let line_start = self.editor_text.len();
                     self.editor_text.push_str(&line.text);
+                    for decoration in &snapshot.decorations {
+                        if decoration.line != line.index {
+                            continue;
+                        }
+                        let DecorationKind::SyntaxToken(kind) = decoration.kind else {
+                            continue;
+                        };
+                        let start = line_start
+                            + Self::byte_for_column(&line.text, decoration.start_column_chars);
+                        let end = line_start
+                            + Self::byte_for_column(&line.text, decoration.end_column_chars);
+                        syntax_spans.push((start, end, frame.theme.syntax_color(kind)));
+                    }
                     if layout.show_line_numbers {
                         use std::fmt::Write;
                         let _ = write!(self.gutter_text, "{:>1$}", line.index.get() + 1, 3);
@@ -412,12 +442,25 @@ impl Renderer {
         // A shaped buffer must be at least as wide as the longest line, or
         // cosmic-text will report clipped runs and the caret will land wrong.
         let text_width = layout.text.width.max(1.0) + frame.horizontal_offset + 4096.0;
-        self.text.set_text(
-            Region::Editor,
-            &self.editor_text,
-            text_width,
-            layout.text.height.max(layout.metrics.line_height),
-        );
+        if syntax_spans.is_empty() {
+            self.text.set_text(
+                Region::Editor,
+                &self.editor_text,
+                text_width,
+                layout.text.height.max(layout.metrics.line_height),
+            );
+        } else {
+            let default_color =
+                if frame.snapshot.is_some() { frame.theme.text } else { frame.theme.dim_text };
+            self.text.set_rich_text(
+                Region::Editor,
+                &self.editor_text,
+                text_width,
+                layout.text.height.max(layout.metrics.line_height),
+                default_color,
+                &syntax_spans,
+            );
+        }
         if layout.show_line_numbers {
             self.text.set_text(
                 Region::Gutter,
@@ -441,15 +484,13 @@ impl Renderer {
             layout.tab_bar.height,
         );
 
-        // Menu titles are drawn as one row; their rectangles come from the
-        // same geometry the click handler uses, so text and hit boxes cannot
-        // disagree.
+        // Menu titles are drawn as one row. Each label is padded to exactly
+        // the width of its own rectangle (`menu::title_label`), so the
+        // highlight for one title cannot bleed into the glyphs of the next --
+        // that mismatch is what made the File highlight overlap into Edit.
         self.menu_text.clear();
-        for (index, entry) in menu::MENUS.iter().enumerate() {
-            if index > 0 {
-                self.menu_text.push_str("  ");
-            }
-            self.menu_text.push_str(entry.title);
+        for entry in menu::MENUS {
+            self.menu_text.push_str(&menu::title_label(entry));
         }
         self.text.set_text(
             Region::Menu,
@@ -462,6 +503,7 @@ impl Renderer {
         self.dropdown_disabled_text.clear();
         if let Some(open) = frame.menu.open {
             let items = menu::MENUS[open].items;
+            let recent = if open == menu::FILE_MENU_INDEX { frame.recent_files } else { &[] };
             let columns = frame
                 .menu_geometry
                 .dropdown
@@ -469,15 +511,21 @@ impl Renderer {
                     ((panel.width / layout.metrics.digit_width.max(1.0)) as usize).saturating_sub(2)
                 })
                 .unwrap_or(24);
-            for (index, item) in items.iter().enumerate() {
-                if index > 0 {
+            let total = items.len() + recent.len();
+            for row in 0..total {
+                if row > 0 {
                     self.dropdown_text.push('\n');
                     self.dropdown_disabled_text.push('\n');
                 }
-                let rendered = menu::item_text(item, columns.max(8));
+                let rendered = if row < items.len() {
+                    menu::item_text(&items[row], columns.max(8))
+                } else {
+                    menu::recent_item_text(&recent[row - items.len()], columns.max(8))
+                };
                 // An item the registry would refuse is drawn dim, so the menu
-                // never offers an action the editor cannot perform.
-                if frame.menu_enabled.get(index).copied().unwrap_or(true) {
+                // never offers an action the editor cannot perform. Recent
+                // files are never refused (see `Frame::menu_enabled`).
+                if frame.menu_enabled.get(row).copied().unwrap_or(true) {
                     self.dropdown_text.push_str(&rendered);
                 } else {
                     self.dropdown_disabled_text.push_str(&rendered);
@@ -538,6 +586,22 @@ impl Renderer {
             &self.overlay_text,
             self.overlay_width(frame),
             overlay_height.max(layout.metrics.line_height),
+        );
+
+        self.sidebar_text.clear();
+        if let Some(lines) = frame.sidebar {
+            for (index, line) in lines.iter().enumerate() {
+                if index > 0 {
+                    self.sidebar_text.push('\n');
+                }
+                self.sidebar_text.push_str(line);
+            }
+        }
+        self.text.set_text(
+            Region::Sidebar,
+            &self.sidebar_text,
+            layout.sidebar.width.max(1.0),
+            layout.sidebar.height.max(layout.metrics.line_height),
         );
     }
 
@@ -651,6 +715,32 @@ impl Renderer {
                         );
                     }
                 }
+            }
+        }
+
+        // Find matches. Drawn before the selection loop below, so the current
+        // match's ordinary selection highlight composites on top of it and
+        // reads as "the one you're on" without a second highlight mechanism.
+        for decoration in &snapshot.decorations {
+            if decoration.kind != DecorationKind::SearchMatch {
+                continue;
+            }
+            let Some(row) = decoration.line.get().checked_sub(first_line) else { continue };
+            let Some(line) = snapshot.lines.get(row) else { continue };
+            let top = layout.row_top(row, frame.scroll_fraction);
+            if top + line_height <= layout.text.y || top >= layout.text.bottom() {
+                continue;
+            }
+            let start_byte = Self::byte_for_column(&line.text, decoration.start_column_chars);
+            let end_byte = Self::byte_for_column(&line.text, decoration.end_column_chars);
+            for (x, width) in self.text.highlight_spans(Region::Editor, row, start_byte, end_byte) {
+                if width <= 0.0 {
+                    continue;
+                }
+                draw.push_quad(
+                    Layer::Base,
+                    Quad::new(Rect::new(origin_x + x, top, width, line_height), theme.search_match),
+                );
             }
         }
 

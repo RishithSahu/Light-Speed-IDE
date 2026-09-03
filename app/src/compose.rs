@@ -117,6 +117,13 @@ pub struct Chrome<'a> {
     pub prompt: Option<&'a str>,
     /// The performance / loading panel, when it is shown.
     pub overlay_panel: Option<Rect>,
+    /// The docked explorer / search / git-status sidebar, when it is shown.
+    /// `None` here (rather than an empty row list) is what keeps a hidden
+    /// sidebar from drawing so much as an empty panel.
+    pub sidebar_panel: Option<Rect>,
+    /// Which row of the sidebar (if any, and including its header) sits
+    /// under the current selection, for the highlight quad.
+    pub sidebar_selected_row: Option<usize>,
 }
 
 /// Builds the chrome for one frame.
@@ -136,6 +143,36 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
     list.push_quad(Layer::Base, Quad::new(layout.gutter, theme.gutter_background));
     if layout.show_status_bar {
         list.push_quad(Layer::Base, Quad::new(layout.status_bar, theme.status_bar));
+    }
+
+    // The sidebar is docked chrome beside the editor, not a surface floating
+    // over it, so it belongs in the base layer with the gutter and status
+    // bar rather than the overlay layer.
+    if let Some(panel) = input.sidebar_panel {
+        list.push_quad(Layer::Base, Quad::new(panel, theme.sidebar_background));
+        list.push_quad(
+            Layer::Base,
+            Quad::new(Rect::new(panel.right(), panel.y, scale, panel.height), theme.sidebar_border),
+        );
+        if let Some(row) = input.sidebar_selected_row {
+            let row_rect = Rect::new(
+                panel.x,
+                panel.y + row as f32 * layout.metrics.line_height,
+                panel.width,
+                layout.metrics.line_height,
+            );
+            list.push_quad(Layer::Base, Quad::new(row_rect, theme.sidebar_selected));
+        }
+        list.push_text(
+            Layer::Base,
+            TextRegionPlacement {
+                region: Region::Sidebar,
+                origin_x: panel.x + 8.0 * scale,
+                origin_y: panel.y,
+                clip: panel,
+                color: theme.text,
+            },
+        );
     }
 
     // Tab plates, from the same rectangles the click handler tests against.
@@ -338,7 +375,7 @@ mod tests {
     }
 
     fn layout() -> Layout {
-        Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, true)
+        Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, true, false)
     }
 
     fn presentations() -> Vec<TabPresentation> {
@@ -373,7 +410,7 @@ mod tests {
         let layout = layout();
         let tabs = tabs::geometry(layout.tab_bar, &presentations(), 8.0, 1.0);
         let menu_geometry =
-            menu::geometry(layout.menu_bar, menu, 8.0, layout.metrics.line_height, 1.0);
+            menu::geometry(layout.menu_bar, menu, 8.0, layout.metrics.line_height, 1.0, &[]);
         let enabled =
             menu.open.map(|open| vec![true; menu::MENUS[open].items.len()]).unwrap_or_default();
         Fixture { theme: Theme::dark(), tabs, menu_geometry, enabled }
@@ -390,6 +427,8 @@ mod tests {
             status_color: fixture.theme.status_text,
             prompt,
             overlay_panel: None,
+            sidebar_panel: None,
+            sidebar_selected_row: None,
         })
     }
 
@@ -506,6 +545,52 @@ mod tests {
     }
 
     #[test]
+    fn the_sidebar_is_a_base_surface_not_an_overlay() {
+        // The defect this guards against: the file tree used to be drawn as
+        // a floating debug-style overlay box. A docked explorer belongs to
+        // the same layer as the gutter and status bar, since it never has to
+        // hide anything drawn under it -- the editor's own layout already
+        // makes room for it.
+        let menu = MenuState::default();
+        let fixture = fixture(menu);
+        let panel = Rect::new(0.0, 30.0, 260.0, 600.0);
+        let list = chrome(&Chrome {
+            layout: layout(),
+            theme: &fixture.theme,
+            tabs: &fixture.tabs,
+            menu,
+            menu_geometry: &fixture.menu_geometry,
+            menu_enabled: &fixture.enabled,
+            status_color: fixture.theme.status_text,
+            prompt: None,
+            overlay_panel: None,
+            sidebar_panel: Some(panel),
+            sidebar_selected_row: Some(1),
+        });
+        assert_eq!(list.layer_of(Region::Sidebar), Some(Layer::Base));
+        let fill = list
+            .covering_quad(Layer::Base, panel)
+            .expect("the sidebar's background must be an opaque base surface");
+        assert_eq!(fill.color.srgb[3], 255);
+
+        // The selected row's highlight sits one line down, inside the panel.
+        let line_height = layout().metrics.line_height;
+        let highlighted = list.base_quads.iter().any(|quad| {
+            (quad.rect.y - (panel.y + line_height)).abs() < 0.5
+                && quad.color == fixture.theme.sidebar_selected
+        });
+        assert!(highlighted, "the selected row must be highlighted");
+    }
+
+    #[test]
+    fn a_hidden_sidebar_draws_nothing() {
+        let menu = MenuState::default();
+        let fixture = fixture(menu);
+        let list = compose(menu, &fixture, None);
+        assert_eq!(list.layer_of(Region::Sidebar), None);
+    }
+
+    #[test]
     fn tab_plates_come_from_the_hit_test_geometry() {
         // The rule from section 8 of the fix list: one computation, two
         // consumers. If a plate were drawn anywhere other than its own
@@ -526,7 +611,7 @@ mod tests {
     fn hiding_the_status_bar_removes_its_surface_and_its_text() {
         let menu = MenuState::default();
         let fixture = fixture(menu);
-        let layout = Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, false);
+        let layout = Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, false, false);
         let list = chrome(&Chrome {
             layout,
             theme: &fixture.theme,
@@ -537,6 +622,8 @@ mod tests {
             status_color: fixture.theme.status_text,
             prompt: None,
             overlay_panel: None,
+            sidebar_panel: None,
+            sidebar_selected_row: None,
         });
         assert_eq!(list.layer_of(Region::Status), None);
         assert_eq!(list.layer_of(Region::StatusRight), None);

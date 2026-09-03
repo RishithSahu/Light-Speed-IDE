@@ -250,7 +250,7 @@ pub struct Decoration {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum DecorationKind {
-    SyntaxToken,
+    SyntaxToken(crate::highlight::TokenKind),
     GitChange,
     SearchMatch,
 }
@@ -354,6 +354,35 @@ pub fn build_snapshot(document: &mut Document, viewport: Viewport) -> RenderSnap
     let document_id = document.id();
     let invalidation = document.take_invalidation();
 
+    // Only the visible slice: an off-screen match or token needs no
+    // decoration, the same reasoning that already limits `lines` to the
+    // viewport. Syntax tokens are scanned from `lines`, which is already the
+    // exact visible text -- reusing it rather than re-slicing the buffer.
+    let mut syntax_decorations = Vec::new();
+    for line in &lines {
+        for token in document.tokenize_visible_line(line.index.get()) {
+            syntax_decorations.push(Decoration {
+                line: line.index,
+                start_column_chars: token.start_column_chars,
+                end_column_chars: token.end_column_chars,
+                kind: DecorationKind::SyntaxToken(token.kind),
+            });
+        }
+    }
+
+    let search_decorations =
+        document.find().matches().iter().filter(|found| range.contains(&found.line.get())).map(
+            |found| Decoration {
+                line: found.line,
+                start_column_chars: found.start_column_chars,
+                end_column_chars: found.end_column_chars,
+                kind: DecorationKind::SearchMatch,
+            },
+        );
+
+    let decorations: Vec<Decoration> =
+        syntax_decorations.into_iter().chain(search_decorations).collect();
+
     RenderSnapshot {
         document_id,
         content_revision,
@@ -363,8 +392,8 @@ pub fn build_snapshot(document: &mut Document, viewport: Viewport) -> RenderSnap
         lines,
         cursors,
         selections,
-        diagnostics: Vec::new(),
-        decorations: Vec::new(),
+        diagnostics: document.diagnostics().to_vec(),
+        decorations,
         invalidation,
         document: document_presentation,
     }
@@ -383,6 +412,26 @@ mod tests {
             Document::untitled(DocumentId::new(1), "untitled-1", DocumentSettings::default());
         let _: EditResult = document.insert(text, EditKind::Paste);
         document.set_selection(Selection::caret(CharOffset::ZERO));
+        document.take_invalidation();
+        document
+    }
+
+    /// A document whose language is detected as Rust, for syntax-highlighting
+    /// tests -- an untitled document is always `PlainText`, so those need a
+    /// path (never touching the filesystem: `unverified` just normalizes it).
+    fn rust_document(text: &str) -> Document {
+        let path = ls_platform::CanonicalPath::unverified("scratch.rs").unwrap();
+        let stamp = crate::document::DiskStamp { modified: None, len_bytes: 0 };
+        let mut document = Document::from_buffer(
+            DocumentId::new(1),
+            path,
+            ls_buffer::TextBuffer::from_str(text),
+            crate::encoding::Encoding::Utf8,
+            ls_buffer::LineEnding::Lf,
+            false,
+            stamp,
+            DocumentSettings::default(),
+        );
         document.take_invalidation();
         document
     }
@@ -560,5 +609,48 @@ mod tests {
         let snapshot = build_snapshot(&mut document, viewport(0, 10));
         // One tab (4 columns) plus "longer line with a tab" (22 characters).
         assert_eq!(snapshot.longest_visible_columns, 4 + 22);
+    }
+
+    // --- syntax highlighting (item 8): the incremental case end to end -------
+
+    #[test]
+    fn a_block_comment_spanning_lines_highlights_as_one_comment_through_the_snapshot() {
+        let mut document = rust_document("/*\ninside\n*/\nlet x = 10;");
+        let snapshot = build_snapshot(&mut document, viewport(0, 10));
+
+        let is_comment = |line: usize| {
+            snapshot.decorations.iter().any(|d| {
+                d.line == LineIndex::new(line) && matches!(d.kind, DecorationKind::SyntaxToken(_))
+            })
+        };
+        assert!(is_comment(0), "the opening line is inside the comment");
+        assert!(is_comment(1), "a line with no markers at all is still inside it");
+        assert!(is_comment(2), "the closing line is inside the comment");
+
+        // Line 3 is real code again: "let" is a keyword, not a comment.
+        let keyword_on_line_3 = snapshot.decorations.iter().any(|d| {
+            d.line == LineIndex::new(3)
+                && d.kind == DecorationKind::SyntaxToken(crate::highlight::TokenKind::Keyword)
+        });
+        assert!(keyword_on_line_3, "code after the comment closes is tokenized normally");
+    }
+
+    #[test]
+    fn editing_before_a_block_comment_reopens_it_for_relexing() {
+        // The regression this guards: once line 0's exit state is cached as
+        // BlockComment, an edit at line 0 must invalidate that cached state --
+        // otherwise closing the comment would never be noticed.
+        let mut document = rust_document("/* still open\nsecond line");
+        let _ = build_snapshot(&mut document, viewport(0, 10));
+
+        // Close the comment by editing the first line.
+        document.set_selection(Selection::caret(CharOffset::new(2)));
+        let _: EditResult = document.insert(" */ int x =", EditKind::Paste);
+        let snapshot = build_snapshot(&mut document, viewport(0, 10));
+
+        let comment_on_line_1 = snapshot.decorations.iter().any(|d| {
+            d.line == LineIndex::new(1) && matches!(d.kind, DecorationKind::SyntaxToken(_))
+        });
+        assert!(!comment_on_line_1, "the comment closed on line 0, so line 1 must be code again");
     }
 }

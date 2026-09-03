@@ -142,6 +142,16 @@ pub struct Document {
     disk_stamp: Option<DiskStamp>,
     settings: DocumentSettings,
     pending_invalidation: Invalidation,
+    find: crate::search::FindState,
+    /// From an external tool (item 9: LSP diagnostics). Empty unless
+    /// something outside the editor -- currently only the LSP client --
+    /// reported something about this document.
+    diagnostics: Vec<crate::render::Diagnostic>,
+    /// Incremental syntax-lexing state (item 8): `lex_states[i]` is the state
+    /// line `i` *exits* with, computed lazily up to however far rendering has
+    /// asked. Truncated from the edited line forward on every edit, so a
+    /// keystroke invalidates what follows it, never the whole document.
+    lex_states: Vec<crate::highlight::LexState>,
 }
 
 impl Document {
@@ -166,6 +176,9 @@ impl Document {
             disk_stamp: None,
             settings,
             pending_invalidation: Invalidation::everything(),
+            find: crate::search::FindState::default(),
+            diagnostics: Vec::new(),
+            lex_states: Vec::new(),
         }
     }
 
@@ -230,6 +243,9 @@ impl Document {
             disk_stamp: Some(stamp),
             settings,
             pending_invalidation: Invalidation::everything(),
+            find: crate::search::FindState::default(),
+            diagnostics: Vec::new(),
+            lex_states: Vec::new(),
         }
     }
 
@@ -275,6 +291,86 @@ impl Document {
 
     pub fn selections(&self) -> &SelectionSet {
         &self.selections
+    }
+
+    pub fn find(&self) -> &crate::search::FindState {
+        &self.find
+    }
+
+    /// Drops cached lex states from the first changed line onward, so the
+    /// next render re-lexes only what could actually have changed -- a block
+    /// comment's extent can only be affected by edits at or after where it
+    /// starts.
+    fn invalidate_lex_states(&mut self, invalidation: &Invalidation) {
+        if let Some(range) = &invalidation.text_lines {
+            self.lex_states.truncate(range.start.min(self.lex_states.len()));
+        }
+    }
+
+    /// Tokens for one line, extending the incremental lex-state cache
+    /// forward as needed.
+    ///
+    /// Bounded by how far down the document rendering has ever needed to
+    /// look, not by the document's length: the first time a viewport reaches
+    /// a given line, every line above it that is not already cached gets
+    /// lexed once to learn whether it leaves a block comment open; after
+    /// that, every subsequent frame reuses the cached exit states and
+    /// re-lexes only the lines actually on screen.
+    pub fn tokenize_visible_line(&mut self, line_index: usize) -> Vec<crate::highlight::Token> {
+        use crate::highlight::{tokenize_line, LexState};
+        while self.lex_states.len() < line_index {
+            let index = self.lex_states.len();
+            let entering = self.lex_states.last().copied().unwrap_or_default();
+            let text = self.buffer.line_text(LineIndex::new(index));
+            let (_, exiting) = tokenize_line(&text, self.language, entering);
+            self.lex_states.push(exiting);
+        }
+        let entering =
+            if line_index == 0 { LexState::default() } else { self.lex_states[line_index - 1] };
+        let text = self.buffer.line_text(LineIndex::new(line_index));
+        let (tokens, exiting) = tokenize_line(&text, self.language, entering);
+        if self.lex_states.len() == line_index {
+            self.lex_states.push(exiting);
+        } else {
+            self.lex_states[line_index] = exiting;
+        }
+        tokens
+    }
+
+    pub fn diagnostics(&self) -> &[crate::render::Diagnostic] {
+        &self.diagnostics
+    }
+
+    /// Replaces this document's diagnostics wholesale -- an LSP server always
+    /// reports the complete current set for a file, never a delta, so there
+    /// is nothing to merge.
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<crate::render::Diagnostic>) {
+        self.diagnostics = diagnostics;
+    }
+
+    /// Replaces the find query and recomputes matches, jumping to the nearest
+    /// one at or after the primary cursor.
+    pub fn set_find_query(&mut self, query: String) {
+        let from = self.buffer.char_to_line(self.selections.primary().head);
+        self.find.set_query(query, &self.buffer, from);
+    }
+
+    pub fn clear_find(&mut self) {
+        self.find.clear();
+    }
+
+    pub fn advance_find(&mut self, delta: isize) {
+        self.find.advance(delta);
+    }
+
+    /// Selects the find state's current match, so it is drawn with the
+    /// ordinary selection highlight and the caret lands on it -- one
+    /// mechanism for "here is the match you're on", reusing what already
+    /// exists rather than adding a second kind of highlight.
+    pub fn select_current_find_match(&mut self) {
+        let Some(found) = self.find.current_match() else { return };
+        self.move_to(found.line, found.start_column_chars, false);
+        self.move_to(found.line, found.end_column_chars, true);
     }
 
     pub fn content_state(&self) -> ContentState {
@@ -392,6 +488,7 @@ impl Document {
         self.selections = selection_after;
         self.revision = self.revision.next();
         self.refresh_content_state();
+        self.invalidate_lex_states(&invalidation);
         self.pending_invalidation.merge(invalidation.clone());
         EditResult { revision: self.revision, invalidation }
     }
@@ -406,6 +503,68 @@ impl Document {
         let edit = Edit { at: range.start, removed: removed.into(), inserted: text.into() };
         let caret = edit.end_after_apply();
         self.apply_edit(edit, kind, SelectionSet::new(Selection::caret(caret)))
+    }
+
+    /// Removes up to one indent step from every line the selection touches
+    /// (or just the caret's line, for a plain caret) -- Shift+Tab.
+    ///
+    /// A line indented with a tab loses that one tab; a line indented with
+    /// spaces loses up to `tab_width` of them; a line with no leading
+    /// whitespace is left alone. Edits are built from the last touched line
+    /// to the first, which is what lets them apply directly to the
+    /// pre-edit buffer without adjusting offsets for edits already made on
+    /// earlier lines (the requirement `apply_edits` already documents).
+    pub fn dedent(&mut self) -> Option<EditResult> {
+        let selection = self.selections.primary();
+        let start_line = self.buffer.char_to_line(selection.start()).get();
+        let end_line = self.buffer.char_to_line(selection.end()).get();
+        let tab_width = self.settings.tab_width;
+
+        let mut edits = Vec::new();
+        let mut removed_from_anchor_line = 0usize;
+        let mut removed_from_head_line = 0usize;
+        for line_number in (start_line..=end_line).rev() {
+            let line = LineIndex::new(line_number);
+            let line_start = self.buffer.line_range(line).start;
+            let text = self.buffer.line_text(line);
+
+            let removed = if text.starts_with('\t') {
+                1
+            } else {
+                text.chars().take(tab_width).take_while(|&c| c == ' ').count()
+            };
+            if removed == 0 {
+                continue;
+            }
+            let removed_text: String = text.chars().take(removed).collect();
+            edits.push(Edit::delete(line_start, removed_text));
+
+            if line_number == self.buffer.char_to_line(selection.anchor).get() {
+                removed_from_anchor_line = removed;
+            }
+            if line_number == self.buffer.char_to_line(selection.head).get() {
+                removed_from_head_line = removed;
+            }
+        }
+        if edits.is_empty() {
+            return None;
+        }
+
+        let anchor_line_start =
+            self.buffer.line_range(self.buffer.char_to_line(selection.anchor)).start;
+        let head_line_start =
+            self.buffer.line_range(self.buffer.char_to_line(selection.head)).start;
+        let anchor_column = selection.anchor.get().saturating_sub(anchor_line_start.get());
+        let head_column = selection.head.get().saturating_sub(head_line_start.get());
+        let new_anchor =
+            selection.anchor.saturating_sub(removed_from_anchor_line.min(anchor_column));
+        let new_head = selection.head.saturating_sub(removed_from_head_line.min(head_column));
+
+        Some(self.apply_edits(
+            edits,
+            EditKind::Programmatic,
+            SelectionSet::new(Selection { anchor: new_anchor, head: new_head, goal_column: None }),
+        ))
     }
 
     /// Deletes the selection, or the grapheme before the caret.
@@ -514,6 +673,7 @@ impl Document {
         // Undo is a mutation like any other: the revision moves forward.
         self.revision = self.revision.next();
         self.refresh_content_state();
+        self.invalidate_lex_states(&invalidation);
         self.pending_invalidation.merge(invalidation.clone());
         Some(EditResult { revision: self.revision, invalidation })
     }
@@ -530,6 +690,7 @@ impl Document {
         self.history.push_undo(transaction);
         self.revision = self.revision.next();
         self.refresh_content_state();
+        self.invalidate_lex_states(&invalidation);
         self.pending_invalidation.merge(invalidation.clone());
         Some(EditResult { revision: self.revision, invalidation })
     }

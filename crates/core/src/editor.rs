@@ -13,6 +13,7 @@ use crate::commands::{self, CommandArgs, ShellRequest};
 use crate::document::{ContentRevision, Document, DocumentId, EditResult, ExternalState};
 use crate::error::{EditorError, OpenDocumentError, PersistenceError, WorkspaceError};
 use crate::events::{Event, EventPayload, EventQueue};
+use crate::git::{self, GitStatus};
 use crate::history::{Edit, EditKind};
 use crate::loading::{
     self, LoadActivity, LoadInjection, LoadRecord, LoadResult, LoadState, PendingLoad,
@@ -24,6 +25,7 @@ use crate::persistence::{
 use crate::render::{self, RenderSnapshot, Viewport};
 use crate::selection::{Movement, Selection};
 use crate::workspace::{Workspace, WorkspaceId};
+use crate::workspace_search::{self, WorkspaceSearchResult};
 use crate::EffectiveConfig;
 use ls_buffer::{line_ending, CharOffset, LineIndex};
 use ls_log::diag::LsError;
@@ -165,7 +167,28 @@ pub struct EditorCore {
     save_activity: SaveActivity,
     /// The most recent save failure, so the synchronous helper can report it.
     last_failed_save: Option<(DocumentId, PersistenceError)>,
+    /// Paths successfully resolved for opening, most-recent first. A shell
+    /// preference, not document content -- persisted by the shell through
+    /// `ls_platform::recents`, the same way it already persists nothing else
+    /// about a document (specification section 12: the core holds state, the
+    /// shell decides how to show it).
+    recent_files: Vec<PathBuf>,
+    /// Whether the find bar is shown. Independent of the query being empty:
+    /// the bar can be open with nothing typed into it yet.
+    find_open: bool,
+    /// The one outstanding `git status` task, if a request is in flight.
+    pending_git_status: Option<TaskId>,
+    /// The last status this workspace reported.
+    git_status: Option<GitStatus>,
+    /// The one outstanding workspace search, if a request is in flight. A new
+    /// search cancels and replaces it rather than letting two walks race.
+    pending_search: Option<TaskId>,
+    workspace_search_result: Option<WorkspaceSearchResult>,
 }
+
+/// Files opened recently, most-recent first (capped at
+/// [`ls_platform::recents::MAX_RECENT`]).
+pub const MAX_RECENT_FILES: usize = ls_platform::recents::MAX_RECENT;
 
 /// What a request to open a document produced.
 ///
@@ -231,6 +254,12 @@ impl EditorCore {
             queued_saves: HashMap::new(),
             save_activity: SaveActivity::default(),
             last_failed_save: None,
+            recent_files: Vec::new(),
+            find_open: false,
+            pending_git_status: None,
+            git_status: None,
+            pending_search: None,
+            workspace_search_result: None,
         }
     }
 
@@ -271,6 +300,118 @@ impl EditorCore {
         ls_log::info!(SUBSYSTEM, "workspace_opened", "workspace opened {display}");
         self.events.emit(SUBSYSTEM, EventPayload::WorkspaceOpened { root: display });
         Ok(id)
+    }
+
+    // --- git status (item 11: read-only status, no graph, no staging) --------
+
+    /// Requests a `git status` for the current workspace root. A bounded,
+    /// one-shot subprocess, so it runs as an ordinary `SubsystemId::GIT` task
+    /// rather than needing a dedicated thread.
+    pub fn request_git_status(&mut self) -> Result<TaskId, ls_scheduler::SubmitError> {
+        let Some(root) = self.workspace.root().map(|c| c.as_path().to_path_buf()) else {
+            return Err(ls_scheduler::SubmitError::ShuttingDown);
+        };
+        let spec = TaskSpec::new(
+            SubsystemId::GIT,
+            self.scheduler.base_priority(SubsystemId::GIT),
+            ResourceClass::Process,
+        )
+        .with_workspace(WorkspaceRef(self.workspace.id().get()));
+
+        let task = self.scheduler.submit(
+            spec,
+            Box::new(move |_cancellation| {
+                let output = std::process::Command::new("git")
+                    .args(["status", "--porcelain=v1", "-b"])
+                    .current_dir(&root)
+                    .output();
+                match output {
+                    Ok(output) if output.status.success() => {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        TaskOutcome::Completed(TaskProduct::new(git::parse_porcelain(&text)))
+                    }
+                    // Not a repository, git not installed, or the command
+                    // failed: reported as "no status" rather than an error the
+                    // user has to dismiss. A read-only status panel that
+                    // cannot always produce a status is not a failure.
+                    _ => TaskOutcome::Completed(TaskProduct::new(GitStatus::default())),
+                }
+            }),
+        )?;
+        self.pending_git_status = Some(task);
+        Ok(task)
+    }
+
+    // --- diagnostics (item 9: LSP) --------------------------------------------
+
+    /// Replaces the diagnostics for whichever open document has this path,
+    /// if any is open. Diagnostics for a document that is not open (or has
+    /// since been closed) are simply dropped -- there is nowhere to show
+    /// them and no `RenderSnapshot` will ever be built for them.
+    pub fn apply_diagnostics(&mut self, path: &Path, diagnostics: Vec<crate::render::Diagnostic>) {
+        let Ok(canonical) = CanonicalPath::new(path) else { return };
+        let Some(&id) = self.by_path.get(canonical.key()) else { return };
+        if let Some(document) = self.documents.get_mut(&id) {
+            document.set_diagnostics(diagnostics);
+        }
+    }
+
+    pub fn git_status(&self) -> Option<&GitStatus> {
+        self.git_status.as_ref()
+    }
+
+    pub fn is_git_status_pending(&self) -> bool {
+        self.pending_git_status.is_some()
+    }
+
+    // --- workspace search (item 7: recursive text search) --------------------
+
+    /// Requests a recursive search under the workspace root. A newer request
+    /// cancels the one before it, so a fast typist searching incrementally
+    /// never has two walks racing to publish a result.
+    pub fn request_workspace_search(
+        &mut self,
+        query: String,
+    ) -> Result<TaskId, ls_scheduler::SubmitError> {
+        if let Some(previous) = self.pending_search.take() {
+            self.scheduler.cancel(previous);
+        }
+        let Some(root) = self.workspace.root().map(|c| c.as_path().to_path_buf()) else {
+            return Err(ls_scheduler::SubmitError::ShuttingDown);
+        };
+        let cancellation = CancellationToken::new();
+        let spec = TaskSpec::new(
+            SubsystemId::SEARCH,
+            self.scheduler.base_priority(SubsystemId::SEARCH),
+            ResourceClass::Cpu,
+        )
+        .with_cancellation(cancellation.clone())
+        .with_workspace(WorkspaceRef(self.workspace.id().get()));
+
+        let task = self.scheduler.submit(
+            spec,
+            Box::new(move |cancellation| {
+                if cancellation.is_cancelled() {
+                    return TaskOutcome::Cancelled;
+                }
+                let result = workspace_search::search(&root, &query);
+                if cancellation.is_cancelled() {
+                    TaskOutcome::Cancelled
+                } else {
+                    TaskOutcome::Completed(TaskProduct::new(result))
+                }
+            }),
+        )?;
+        self.pending_search = Some(task);
+        Ok(task)
+    }
+
+    pub fn workspace_search_result(&self) -> Option<&WorkspaceSearchResult> {
+        self.workspace_search_result.as_ref()
+    }
+
+    pub fn is_workspace_search_pending(&self) -> bool {
+        self.pending_search.is_some()
     }
 
     // --- documents ------------------------------------------------------------
@@ -315,6 +456,8 @@ impl EditorCore {
         if canonical.as_path().is_dir() {
             return Err(OpenDocumentError::IsDirectory(canonical.into_path_buf()));
         }
+
+        self.note_recent_file(canonical.as_path());
 
         // One document per file, however the path was spelled - including
         // while the file is still being read.
@@ -448,9 +591,18 @@ impl EditorCore {
         let mut applied = 0;
 
         for completion in completions {
+            if completion.subsystem == SubsystemId::GIT {
+                applied += self.apply_git_completion(completion);
+                continue;
+            }
+            if completion.subsystem == SubsystemId::SEARCH {
+                applied += self.apply_search_completion(completion);
+                continue;
+            }
             if completion.subsystem != SubsystemId::DOCUMENT_IO {
-                // Stage 1.1 has one background subsystem; anything else is a
-                // caller mistake worth seeing rather than silently dropping.
+                // Every subsystem that can complete work has a handler above
+                // or here; anything else is a caller mistake worth seeing
+                // rather than silently dropping.
                 ls_log::warn!(
                     SUBSYSTEM,
                     "unexpected_completion",
@@ -509,6 +661,34 @@ impl EditorCore {
         }
 
         applied
+    }
+
+    fn apply_git_completion(&mut self, completion: ls_scheduler::TaskCompletion) -> usize {
+        if self.pending_git_status != Some(completion.task) {
+            return 0;
+        }
+        self.pending_git_status = None;
+        if let CompletionOutcome::Completed(product) = completion.outcome {
+            if let Ok(status) = product.downcast::<GitStatus>() {
+                self.git_status = Some(*status);
+                return 1;
+            }
+        }
+        0
+    }
+
+    fn apply_search_completion(&mut self, completion: ls_scheduler::TaskCompletion) -> usize {
+        if self.pending_search != Some(completion.task) {
+            return 0;
+        }
+        self.pending_search = None;
+        if let CompletionOutcome::Completed(product) = completion.outcome {
+            if let Ok(result) = product.downcast::<WorkspaceSearchResult>() {
+                self.workspace_search_result = Some(*result);
+                return 1;
+            }
+        }
+        0
     }
 
     fn document_for_task(&self, task: TaskId) -> Option<DocumentId> {
@@ -783,6 +963,27 @@ impl EditorCore {
         Ok(())
     }
 
+    /// Moves `path` to the front of the recent list, de-duplicating and
+    /// capping it. Pure in-memory bookkeeping; persisting it to disk is the
+    /// shell's job, the same way persisting window position would be.
+    fn note_recent_file(&mut self, path: &Path) {
+        self.recent_files.retain(|existing| existing != path);
+        self.recent_files.insert(0, path.to_path_buf());
+        self.recent_files.truncate(MAX_RECENT_FILES);
+    }
+
+    /// Files opened recently, most-recent first.
+    pub fn recent_files(&self) -> &[PathBuf] {
+        &self.recent_files
+    }
+
+    /// Replaces the recent list wholesale, for seeding it from disk at
+    /// startup.
+    pub fn set_recent_files(&mut self, files: Vec<PathBuf>) {
+        self.recent_files = files;
+        self.recent_files.truncate(MAX_RECENT_FILES);
+    }
+
     fn allocate_id(&mut self) -> DocumentId {
         let id = DocumentId::new(self.next_document_id);
         self.next_document_id += 1;
@@ -846,8 +1047,33 @@ impl EditorCore {
         self.set_active(id).ok();
     }
 
+    /// Activates the `number`th tab (1-based, matching Ctrl+1..9), doing
+    /// nothing if there is no such tab.
+    pub fn go_to_tab(&mut self, number: usize) {
+        let Some(index) = number.checked_sub(1) else { return };
+        if let Some(&id) = self.order.get(index) {
+            self.set_active(id).ok();
+        }
+    }
+
     pub fn tabs(&self) -> &[DocumentId] {
         &self.order
+    }
+
+    /// Closes every tab that is not dirty (and cancels every one still
+    /// loading). A dirty tab is left open rather than silently discarded --
+    /// "close all" is not license to lose work a plain "close" would refuse.
+    /// Returns `(closed, left_open)`.
+    pub fn close_all_clean_tabs(&mut self) -> (usize, usize) {
+        let mut closed = 0;
+        let mut left_open = 0;
+        for id in self.order.clone() {
+            match self.close_document(id) {
+                Ok(()) => closed += 1,
+                Err(_) => left_open += 1,
+            }
+        }
+        (closed, left_open)
     }
 
     pub fn tab_presentations(&self) -> Vec<TabPresentation> {
@@ -1004,6 +1230,22 @@ impl EditorCore {
         }
     }
 
+    /// Removes one indent step from the lines the selection touches --
+    /// Shift+Tab.
+    pub fn dedent(&mut self) {
+        let timer = self.metrics.edit.timer();
+        let Some(id) = self.active else { return };
+        let Some(document) = self.documents.get_mut(&id) else { return };
+        let result = document.dedent();
+        timer.stop();
+        if let Some(result) = result {
+            self.events.emit(
+                SUBSYSTEM,
+                EventPayload::DocumentEdited { document: id, revision: result.revision },
+            );
+        }
+    }
+
     pub fn delete_backward(&mut self) {
         let timer = self.metrics.edit.timer();
         let Some(id) = self.active else { return };
@@ -1111,6 +1353,52 @@ impl EditorCore {
         let Some(id) = self.active else { return };
         let Some(document) = self.documents.get_mut(&id) else { return };
         document.move_to(LineIndex::new(line), column, false);
+    }
+
+    // --- find (in-document search) --------------------------------------------
+
+    /// The active document's find state, if there is one to search.
+    pub fn find_state(&self) -> Option<&crate::search::FindState> {
+        self.active_document().map(|document| document.find())
+    }
+
+    pub fn is_find_open(&self) -> bool {
+        self.find_open
+    }
+
+    pub fn open_find(&mut self) {
+        self.find_open = true;
+    }
+
+    /// Sets the query and jumps to the nearest match, reusing the existing
+    /// selection highlight for "here is the one you're on" (specification
+    /// section 12: one mechanism per concern, not a parallel one for find).
+    pub fn set_find_query(&mut self, query: String) {
+        let Some(document) = self.active_document_mut() else { return };
+        document.set_find_query(query);
+        document.select_current_find_match();
+    }
+
+    pub fn find_next(&mut self) {
+        let Some(document) = self.active_document_mut() else { return };
+        document.advance_find(1);
+        document.select_current_find_match();
+    }
+
+    pub fn find_previous(&mut self) {
+        let Some(document) = self.active_document_mut() else { return };
+        document.advance_find(-1);
+        document.select_current_find_match();
+    }
+
+    /// Ends the search, clearing its highlights. The selection it left behind
+    /// is left alone -- closing find should not also discard where the user
+    /// ended up.
+    pub fn close_find(&mut self) {
+        self.find_open = false;
+        if let Some(document) = self.active_document_mut() {
+            document.clear_find();
+        }
     }
 
     // --- clipboard ------------------------------------------------------------
