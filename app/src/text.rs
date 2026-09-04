@@ -66,6 +66,17 @@ struct ShapedRegion {
     text: String,
     width: f32,
     height: f32,
+    /// The color spans last shaped via `set_rich_text`, so an unchanged rich
+    /// region also costs nothing -- without this, a region with no text to
+    /// compare (unlike `set_text`'s fast path) would reshape every single
+    /// frame even while showing exactly the same thing. Always empty for a
+    /// region only ever drawn with `set_text`.
+    spans: Vec<(usize, usize, Color)>,
+    /// The default color last used by `set_rich_text`, compared alongside
+    /// `spans` -- there is no live theme switch today, so this never
+    /// actually changes frame to frame, but the fast path would be wrong to
+    /// assume that rather than check it.
+    default_color: Color,
 }
 
 /// Owns the font system and every shaped buffer.
@@ -114,7 +125,14 @@ impl TextEngine {
             // The editor lays out its own lines; wrapping would break the
             // one-row-per-document-line mapping that hit testing relies on.
             buffer.set_wrap(Wrap::None);
-            regions.push(ShapedRegion { buffer, text: String::new(), width: 0.0, height: 0.0 });
+            regions.push(ShapedRegion {
+                buffer,
+                text: String::new(),
+                width: 0.0,
+                height: 0.0,
+                spans: Vec::new(),
+                default_color: Color::rgb(0, 0, 0),
+            });
         }
 
         let mut engine = TextEngine {
@@ -164,7 +182,12 @@ impl TextEngine {
         let index = region_index(region);
         let unchanged = self.regions[index].text == text
             && (self.regions[index].width - width).abs() < 0.5
-            && (self.regions[index].height - height).abs() < 0.5;
+            && (self.regions[index].height - height).abs() < 0.5
+            // A region last drawn with `set_rich_text` must not short-circuit
+            // here just because the text and size happen to match -- it is
+            // still carrying colored spans that plain `set_text` needs to
+            // clear away.
+            && self.regions[index].spans.is_empty();
         if unchanged {
             return;
         }
@@ -178,6 +201,7 @@ impl TextEngine {
         entry.text.push_str(text);
         entry.width = width;
         entry.height = height;
+        entry.spans.clear();
         self.reshaped += 1;
     }
 
@@ -197,10 +221,22 @@ impl TextEngine {
         spans: &[(usize, usize, Color)],
     ) {
         let index = region_index(region);
-        // Rich text has no single string to compare against for the "nothing
-        // changed" fast path `set_text` uses, so it always reshapes. That is
-        // fine: it is only used for the editor region, and only while a
-        // recognized language's document is visible.
+        // Unlike `set_text`, this used to always reshape -- there was no
+        // "nothing changed" fast path at all, so even a region showing
+        // exactly the same colored text every frame (a hidden or idle
+        // sidebar, say) paid a full reshape every frame. Measured
+        // regression: render.frame p95 blew past its 16ms budget from an
+        // empty sidebar alone. Comparing the cached spans alongside the text
+        // closes that gap the same way `set_text` already does for plain
+        // regions.
+        let unchanged = self.regions[index].text == text
+            && (self.regions[index].width - width).abs() < 0.5
+            && (self.regions[index].height - height).abs() < 0.5
+            && self.regions[index].spans == spans
+            && self.regions[index].default_color == default_color;
+        if unchanged {
+            return;
+        }
         let base = Attrs::new().family(Family::Name(&self.family));
         let mut runs: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
         let mut cursor = 0usize;
@@ -231,6 +267,9 @@ impl TextEngine {
         entry.text.push_str(text);
         entry.width = width;
         entry.height = height;
+        entry.spans.clear();
+        entry.spans.extend_from_slice(spans);
+        entry.default_color = default_color;
         self.reshaped += 1;
     }
 

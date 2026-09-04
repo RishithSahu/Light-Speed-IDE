@@ -92,9 +92,14 @@ pub struct Frame<'a> {
     pub prompt: Option<&'a str>,
     /// The docked sidebar's rows (header included), when it is shown.
     pub sidebar: Option<&'a [String]>,
+    /// Each row's kind, parallel to `sidebar`, for per-row coloring (folders,
+    /// files, the header, and plain messages each read differently).
+    pub sidebar_kinds: Option<&'a [crate::theme::SidebarRowKind]>,
     /// Which sidebar row (by index into `sidebar`, header included) is
     /// selected, for the highlight quad.
     pub sidebar_selected_row: Option<usize>,
+    /// Which sidebar row the pointer is over, for a lighter hover highlight.
+    pub sidebar_hovered_row: Option<usize>,
 }
 
 pub struct Renderer {
@@ -312,6 +317,7 @@ impl Renderer {
             overlay_panel: self.overlay_panel(frame),
             sidebar_panel: layout.sidebar_visible.then_some(layout.sidebar),
             sidebar_selected_row: frame.sidebar_selected_row,
+            sidebar_hovered_row: frame.sidebar_hovered_row,
         });
         self.add_editor_layer(frame, &mut draw);
 
@@ -589,19 +595,31 @@ impl Renderer {
         );
 
         self.sidebar_text.clear();
+        let mut sidebar_spans: Vec<(usize, usize, Color)> = Vec::new();
         if let Some(lines) = frame.sidebar {
+            let kinds = frame.sidebar_kinds;
             for (index, line) in lines.iter().enumerate() {
                 if index > 0 {
                     self.sidebar_text.push('\n');
                 }
+                let start = self.sidebar_text.len();
                 self.sidebar_text.push_str(line);
+                if let Some(kind) = kinds.and_then(|kinds| kinds.get(index)) {
+                    sidebar_spans.push((
+                        start,
+                        self.sidebar_text.len(),
+                        frame.theme.sidebar_row_color(*kind),
+                    ));
+                }
             }
         }
-        self.text.set_text(
+        self.text.set_rich_text(
             Region::Sidebar,
             &self.sidebar_text,
             layout.sidebar.width.max(1.0),
             layout.sidebar.height.max(layout.metrics.line_height),
+            frame.theme.text,
+            &sidebar_spans,
         );
     }
 

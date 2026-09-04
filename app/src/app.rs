@@ -200,6 +200,18 @@ pub fn should_apply_lsp_diagnostics(latest_applied: Option<u64>, incoming: Optio
     }
 }
 
+/// Whether `(x, y)` is on the sidebar's resize grip: a strip straddling its
+/// right edge, wide enough to grab without pixel-perfect aim but narrow
+/// enough not to steal clicks meant for the last column of list rows.
+pub fn sidebar_grip_hit(layout: &Layout, x: f32, y: f32) -> bool {
+    if !layout.sidebar_visible {
+        return false;
+    }
+    let half = (crate::layout::SIDEBAR_GRIP_WIDTH * layout.scale) / 2.0;
+    let border = layout.sidebar.right();
+    x >= border - half && x <= border + half && y >= layout.sidebar.y && y < layout.sidebar.bottom()
+}
+
 /// How the user answered a confirmation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PromptAnswer {
@@ -370,6 +382,19 @@ pub struct LightSpeed {
     /// the workspace.
     expanded_dirs: std::collections::HashSet<PathBuf>,
     list_selected: usize,
+    /// The sidebar's width in logical pixels, dragged by the user via the
+    /// grip on its right edge. Persists across toggling the sidebar off and
+    /// on, the way VS Code remembers explorer width.
+    sidebar_width: f32,
+    /// Set while the user is dragging the sidebar's resize grip.
+    dragging_sidebar: bool,
+    /// Whether the resize cursor is currently shown for the sidebar's grip,
+    /// so it is only changed (a real OS call) on an actual transition.
+    sidebar_grip_hovered: bool,
+    /// Which sidebar row (by the same numbering as `list_selected` plus the
+    /// header, see `sidebar_selected_row`) the pointer is currently over, for
+    /// a hover highlight distinct from the selection.
+    sidebar_hovered_row: Option<usize>,
     /// The workspace-search query as it is being typed, before Enter submits
     /// it. `None` when the search bar is not open.
     search_query_input: Option<String>,
@@ -485,6 +510,10 @@ impl LightSpeed {
             file_tree_root: None,
             expanded_dirs: std::collections::HashSet::new(),
             list_selected: 0,
+            sidebar_width: crate::layout::SIDEBAR_WIDTH,
+            dragging_sidebar: false,
+            sidebar_grip_hovered: false,
+            sidebar_hovered_row: None,
             search_query_input: None,
             pending_jump: None,
             terminal: None,
@@ -1054,6 +1083,11 @@ impl LightSpeed {
         };
         self.last_click = Some((Instant::now(), x, y, click_count));
 
+        if sidebar_grip_hit(&layout, x, y) {
+            self.dragging_sidebar = true;
+            return;
+        }
+
         if layout.tab_bar.contains(x, y) {
             // The close control is its own region, resolved before the body, so
             // closing a tab never activates it on the way past.
@@ -1093,6 +1127,40 @@ impl LightSpeed {
                 _ => self.dragging_selection = true,
             }
             self.wake_caret();
+        }
+    }
+
+    /// Tracks the two things the sidebar cares about on plain pointer
+    /// movement (no button down): the resize cursor over its grip, and which
+    /// row -- if any -- is under the pointer, for a hover highlight.
+    fn update_sidebar_interaction(&mut self, layout: &Layout) {
+        let grip_hovered = sidebar_grip_hit(layout, self.pointer.0, self.pointer.1);
+        if grip_hovered != self.sidebar_grip_hovered {
+            self.sidebar_grip_hovered = grip_hovered;
+            if let Some(window) = self.window.as_ref() {
+                let icon = if grip_hovered {
+                    winit::window::CursorIcon::ColResize
+                } else {
+                    winit::window::CursorIcon::Default
+                };
+                window.set_cursor(icon);
+            }
+        }
+
+        let (x, y) = self.pointer;
+        let hovered_row = if layout.sidebar_visible
+            && layout.sidebar.contains(x, y)
+            && !grip_hovered
+            && self.active_list.is_some()
+        {
+            let row = ((y - layout.sidebar.y) / layout.metrics.line_height) as usize;
+            (row >= 1 && row - 1 < self.list_rows().len()).then_some(row)
+        } else {
+            None
+        };
+        if hovered_row != self.sidebar_hovered_row {
+            self.sidebar_hovered_row = hovered_row;
+            self.request_redraw();
         }
     }
 
@@ -1828,15 +1896,39 @@ impl LightSpeed {
         self.active_list.is_some() || self.search_query_input.is_some()
     }
 
-    /// Rows for the docked sidebar: a header (row 0, never itself
-    /// selectable) followed by the active list's rows, or -- while the user
-    /// is typing a workspace-search query -- the live query as an editable
-    /// line.
-    fn sidebar_rows(&self) -> Vec<String> {
+    /// Rows for the docked sidebar, each tagged with what kind of row it is
+    /// (`theme::SidebarRowKind`) so the renderer can color folders, files,
+    /// the header, and plain messages differently -- the nearest this
+    /// text-only renderer gets to icons. Row 0 is the header, drawn but
+    /// never itself a list entry; while the user is typing a workspace-search
+    /// query, row 1 is the live, editable query line instead of a list row.
+    ///
+    /// Labels are truncated with an ellipsis to `layout.sidebar`'s actual
+    /// width, using its own font metrics -- so a name that fits a wide,
+    /// user-dragged panel is never clipped mid-character the way a
+    /// fixed-width assumption would.
+    fn sidebar_rows(&self, layout: &Layout) -> Vec<(String, crate::theme::SidebarRowKind)> {
+        use crate::theme::SidebarRowKind;
+        let padding = 16.0 * layout.scale;
+        let max_chars = (((layout.sidebar.width - padding) / layout.metrics.digit_width.max(1.0))
+            as usize)
+            .max(4);
+        let truncate = |label: String| -> String {
+            if label.chars().count() <= max_chars {
+                return label;
+            }
+            let mut truncated: String = label.chars().take(max_chars.saturating_sub(1)).collect();
+            truncated.push('\u{2026}');
+            truncated
+        };
+
         if let Some(query) = &self.search_query_input {
             return vec![
-                "Search  (Enter to run, Esc to cancel)".to_string(),
-                format!("  {query}\u{2588}"),
+                (
+                    truncate("Search  (Enter to run, Esc to cancel)".to_string()),
+                    SidebarRowKind::Header,
+                ),
+                (truncate(format!("  {query}\u{2588}")), SidebarRowKind::Info),
             ];
         }
         let Some(kind) = self.active_list else { return Vec::new() };
@@ -1845,9 +1937,17 @@ impl LightSpeed {
             ListKind::SearchResults => "Search Results",
             ListKind::GitStatus => "Source Control",
         };
-        let mut rows = vec![format!("{title}  (Up/Down, Enter, Esc)")];
+        let mut rows =
+            vec![(truncate(format!("{title}  (Up/Down, Enter, Esc)")), SidebarRowKind::Header)];
         for row in self.list_rows() {
-            rows.push(row.label);
+            let row_kind = match row.action {
+                Some(ListAction::ToggleDirectory(_)) => SidebarRowKind::Directory,
+                Some(ListAction::OpenFile(_)) | Some(ListAction::OpenFileAt(_, _)) => {
+                    SidebarRowKind::File
+                }
+                None => SidebarRowKind::Info,
+            };
+            rows.push((truncate(row.label), row_kind));
         }
         rows
     }
@@ -1964,6 +2064,7 @@ impl LightSpeed {
             self.core.config().appearance.show_line_numbers,
             self.show_status_bar,
             self.sidebar_visible(),
+            self.sidebar_width,
         );
         self.last_layout = Some(layout);
         self.core.set_page_lines(layout.visible_lines());
@@ -2030,7 +2131,9 @@ impl LightSpeed {
         }
 
         let panel_rows = self.panel_rows();
-        let sidebar_rows = self.sidebar_rows();
+        let sidebar_rows = self.sidebar_rows(&layout);
+        let (sidebar_labels, sidebar_kinds): (Vec<String>, Vec<crate::theme::SidebarRowKind>) =
+            sidebar_rows.into_iter().unzip();
         let sidebar_selected_row = self.sidebar_selected_row();
         let status_left = self.status_left();
         let status_right = self.status_right();
@@ -2091,8 +2194,10 @@ impl LightSpeed {
             caret_visible,
             prompt: prompt_text.as_deref(),
             placeholder: "  LightSpeed IDE\n\n  Ctrl+O  open a file\n  Ctrl+N  new file\n  F12     performance overlay",
-            sidebar: (!sidebar_rows.is_empty()).then_some(sidebar_rows.as_slice()),
+            sidebar: (!sidebar_labels.is_empty()).then_some(sidebar_labels.as_slice()),
+            sidebar_kinds: (!sidebar_kinds.is_empty()).then_some(sidebar_kinds.as_slice()),
             sidebar_selected_row,
+            sidebar_hovered_row: self.sidebar_hovered_row,
         };
 
         match renderer.render(&frame) {
@@ -2496,6 +2601,14 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                         let y = self.pointer.1;
                         self.scroll_to_scrollbar_position(y, &layout);
                     }
+                } else if self.dragging_sidebar {
+                    if let Some(layout) = self.last_layout {
+                        let requested = (self.pointer.0 - layout.sidebar.x) / layout.scale;
+                        self.sidebar_width = crate::layout::clamp_sidebar_width(requested);
+                        self.request_redraw();
+                    }
+                } else if let Some(layout) = self.last_layout {
+                    self.update_sidebar_interaction(&layout);
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
@@ -2508,6 +2621,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                     ElementState::Released => {
                         self.dragging_selection = false;
                         self.dragging_scrollbar = false;
+                        self.dragging_sidebar = false;
                     }
                 }
             }
@@ -2535,6 +2649,7 @@ mod tests {
             true,
             true,
             false,
+            crate::layout::SIDEBAR_WIDTH,
         )
     }
 

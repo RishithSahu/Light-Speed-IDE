@@ -124,6 +124,10 @@ pub struct Chrome<'a> {
     /// Which row of the sidebar (if any, and including its header) sits
     /// under the current selection, for the highlight quad.
     pub sidebar_selected_row: Option<usize>,
+    /// Which row the pointer is over, for a lighter hover highlight. Never
+    /// drawn on top of the selection highlight -- the selected row already
+    /// reads as "the current one".
+    pub sidebar_hovered_row: Option<usize>,
 }
 
 /// Builds the chrome for one frame.
@@ -154,6 +158,26 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
             Layer::Base,
             Quad::new(Rect::new(panel.right(), panel.y, scale, panel.height), theme.sidebar_border),
         );
+        // A thin rule under the header (row 0) separates the panel's title
+        // from its rows, the way a real title bar would.
+        list.push_quad(
+            Layer::Base,
+            Quad::new(
+                Rect::new(panel.x, panel.y + layout.metrics.line_height, panel.width, scale),
+                theme.sidebar_border,
+            ),
+        );
+        if let Some(row) = input.sidebar_hovered_row {
+            if input.sidebar_selected_row != Some(row) {
+                let row_rect = Rect::new(
+                    panel.x,
+                    panel.y + row as f32 * layout.metrics.line_height,
+                    panel.width,
+                    layout.metrics.line_height,
+                );
+                list.push_quad(Layer::Base, Quad::new(row_rect, theme.sidebar_hover));
+            }
+        }
         if let Some(row) = input.sidebar_selected_row {
             let row_rect = Rect::new(
                 panel.x,
@@ -162,6 +186,16 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
                 layout.metrics.line_height,
             );
             list.push_quad(Layer::Base, Quad::new(row_rect, theme.sidebar_selected));
+            // A left accent bar on the selection, echoing the active-tab
+            // indicator elsewhere in the chrome -- the same visual language
+            // for "this is the current one".
+            list.push_quad(
+                Layer::Base,
+                Quad::new(
+                    Rect::new(panel.x, row_rect.y, 2.0 * scale, row_rect.height),
+                    theme.cursor,
+                ),
+            );
         }
         list.push_text(
             Layer::Base,
@@ -375,7 +409,17 @@ mod tests {
     }
 
     fn layout() -> Layout {
-        Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, true, false)
+        Layout::with_chrome(
+            1000.0,
+            700.0,
+            1.0,
+            metrics(),
+            4,
+            true,
+            true,
+            false,
+            crate::layout::SIDEBAR_WIDTH,
+        )
     }
 
     fn presentations() -> Vec<TabPresentation> {
@@ -429,6 +473,7 @@ mod tests {
             overlay_panel: None,
             sidebar_panel: None,
             sidebar_selected_row: None,
+            sidebar_hovered_row: None,
         })
     }
 
@@ -566,6 +611,7 @@ mod tests {
             overlay_panel: None,
             sidebar_panel: Some(panel),
             sidebar_selected_row: Some(1),
+            sidebar_hovered_row: None,
         });
         assert_eq!(list.layer_of(Region::Sidebar), Some(Layer::Base));
         let fill = list
@@ -611,7 +657,17 @@ mod tests {
     fn hiding_the_status_bar_removes_its_surface_and_its_text() {
         let menu = MenuState::default();
         let fixture = fixture(menu);
-        let layout = Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, false, false);
+        let layout = Layout::with_chrome(
+            1000.0,
+            700.0,
+            1.0,
+            metrics(),
+            4,
+            true,
+            false,
+            false,
+            crate::layout::SIDEBAR_WIDTH,
+        );
         let list = chrome(&Chrome {
             layout,
             theme: &fixture.theme,
@@ -624,6 +680,7 @@ mod tests {
             overlay_panel: None,
             sidebar_panel: None,
             sidebar_selected_row: None,
+            sidebar_hovered_row: None,
         });
         assert_eq!(list.layer_of(Region::Status), None);
         assert_eq!(list.layer_of(Region::StatusRight), None);

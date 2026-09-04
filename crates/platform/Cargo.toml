@@ -26,3 +26,15 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Com",
     "Win32_Globalization",
 ] }
+# The modern Explorer-style folder picker (`IFileOpenDialog`) is a COM
+# interface `windows-sys` does not expose (it only ships the flat C ABI);
+# `windows` builds on the same win32metadata but generates safe, ergonomic
+# wrappers for interfaces like this one. It is already in the dependency
+# tree transitively (via wgpu/winit), so this adds no new crate, just a
+# direct edge to one that was already being built.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }

@@ -931,6 +931,7 @@ name = "ls-platform"
 version = "0.1.0"
 dependencies = [
  "ls-log",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

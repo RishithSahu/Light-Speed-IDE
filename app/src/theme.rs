@@ -135,6 +135,12 @@ pub struct Theme {
     pub sidebar_background: Color,
     pub sidebar_border: Color,
     pub sidebar_selected: Color,
+    /// A lighter touch than `sidebar_selected`, for the row under the
+    /// pointer that is not (yet) the selection.
+    pub sidebar_hover: Color,
+    /// Directory rows in the explorer -- a distinct tint standing in for the
+    /// folder icon VS Code draws, since this renderer has no icons.
+    pub sidebar_folder: Color,
     /// Menu surfaces. Fully opaque on purpose: a dropdown that lets the
     /// document show through is unreadable, and translucency here would also
     /// mean the text underneath is still being drawn and paid for.
@@ -147,6 +153,19 @@ pub struct Theme {
     pub scrollbar: Color,
 }
 
+/// What kind of row a sidebar line is, for coloring it -- the closest this
+/// text-only renderer gets to VS Code's folder/file icons.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SidebarRowKind {
+    /// The panel's title row (e.g. "Explorer", "Search Results").
+    Header,
+    Directory,
+    File,
+    /// A message with no action of its own: "(empty)", "Searching...", "No
+    /// matches for...", and so on.
+    Info,
+}
+
 impl Theme {
     pub fn syntax_color(&self, kind: ls_core::TokenKind) -> Color {
         match kind {
@@ -154,6 +173,15 @@ impl Theme {
             ls_core::TokenKind::String => self.syntax_string,
             ls_core::TokenKind::Comment => self.syntax_comment,
             ls_core::TokenKind::Number => self.syntax_number,
+        }
+    }
+
+    pub fn sidebar_row_color(&self, kind: SidebarRowKind) -> Color {
+        match kind {
+            SidebarRowKind::Header => self.dim_text,
+            SidebarRowKind::Directory => self.sidebar_folder,
+            SidebarRowKind::File => self.text,
+            SidebarRowKind::Info => self.dim_text,
         }
     }
 
@@ -184,6 +212,8 @@ impl Theme {
             sidebar_background: Color::rgb(0x18, 0x1A, 0x1F),
             sidebar_border: Color::rgb(0x2A, 0x30, 0x3A),
             sidebar_selected: Color::rgb(0x2C, 0x5A, 0x8C),
+            sidebar_hover: Color::rgb(0x22, 0x26, 0x2E),
+            sidebar_folder: Color::rgb(0x5A, 0xC8, 0xFA),
             menu_background: Color::rgb(0x1E, 0x22, 0x2A),
             menu_highlight: Color::rgb(0x2C, 0x5A, 0x8C),
             menu_border: Color::rgb(0x3A, 0x42, 0x50),

@@ -56,10 +56,23 @@ pub struct FontMetrics {
     pub digit_width: f32,
 }
 
-/// The explorer sidebar's width at typical scale, before clamping to the
-/// window (specification-free: chosen to match VS Code's default explorer
-/// width closely enough to feel familiar).
+/// The explorer sidebar's default width in logical pixels, before scaling or
+/// clamping to the window (chosen to match VS Code's default explorer width
+/// closely enough to feel familiar). The user can drag it wider or narrower;
+/// see [`SIDEBAR_MIN_WIDTH`] and [`SIDEBAR_MAX_WIDTH`] for the drag range.
 pub const SIDEBAR_WIDTH: f32 = 260.0;
+
+/// How narrow the user can drag the sidebar -- below this, folder names
+/// truncate into illegibility and the panel stops earning its keep.
+pub const SIDEBAR_MIN_WIDTH: f32 = 140.0;
+
+/// How wide the user can drag the sidebar, independent of the window (the
+/// window-relative 60% cap in [`Layout::with_chrome`] applies on top of this).
+pub const SIDEBAR_MAX_WIDTH: f32 = 640.0;
+
+/// The strip around the sidebar's right edge that grabs the resize cursor
+/// and starts a drag, in logical pixels.
+pub const SIDEBAR_GRIP_WIDTH: f32 = 6.0;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Layout {
@@ -91,6 +104,7 @@ impl Layout {
         show_line_numbers: bool,
         show_status_bar: bool,
         sidebar_visible: bool,
+        sidebar_width_request: f32,
     ) -> Self {
         let menu_height = (metrics.line_height + 8.0 * scale).round();
         let tab_bar_height = (metrics.line_height + 10.0 * scale).round();
@@ -103,9 +117,13 @@ impl Layout {
         };
         let scrollbar_width = 8.0 * scale;
         // Never let the sidebar crowd the editor out entirely on a narrow
-        // window: cap it at 60% of the width rather than the fixed default.
-        let sidebar_width =
-            if sidebar_visible { (SIDEBAR_WIDTH * scale).min(width * 0.6).max(0.0) } else { 0.0 };
+        // window: cap it at 60% of the width regardless of what the user
+        // dragged it to.
+        let sidebar_width = if sidebar_visible {
+            (sidebar_width_request * scale).min(width * 0.6).max(0.0)
+        } else {
+            0.0
+        };
 
         let menu_bar = Rect::new(0.0, 0.0, width, menu_height);
         let tab_bar = Rect::new(0.0, menu_bar.bottom(), width, tab_bar_height);
@@ -170,6 +188,14 @@ impl Layout {
     }
 }
 
+/// Clamps a user-dragged sidebar width to the range the drag handle allows.
+/// The window-relative 60% cap in [`Layout::with_chrome`] applies on top of
+/// this, so a small window can still end up narrower than `SIDEBAR_MIN_WIDTH`
+/// -- this only bounds what dragging itself can request.
+pub fn clamp_sidebar_width(requested: f32) -> f32 {
+    requested.clamp(SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,7 +209,17 @@ mod tests {
         digits: usize,
         show_line_numbers: bool,
     ) -> Layout {
-        Layout::with_chrome(width, height, scale, metrics, digits, show_line_numbers, true, false)
+        Layout::with_chrome(
+            width,
+            height,
+            scale,
+            metrics,
+            digits,
+            show_line_numbers,
+            true,
+            false,
+            SIDEBAR_WIDTH,
+        )
     }
 
     fn metrics() -> FontMetrics {
@@ -229,7 +265,17 @@ mod tests {
     #[test]
     fn hiding_the_status_bar_gives_its_height_to_the_editor() {
         let with = compute(1000.0, 700.0, 1.0, metrics(), 4, true);
-        let without = Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, false, false);
+        let without = Layout::with_chrome(
+            1000.0,
+            700.0,
+            1.0,
+            metrics(),
+            4,
+            true,
+            false,
+            false,
+            SIDEBAR_WIDTH,
+        );
         assert_eq!(without.status_bar.height, 0.0);
         assert!(without.text.height > with.text.height);
         assert!((without.text.bottom() - 700.0).abs() < 0.5, "the editor reaches the bottom");
@@ -255,7 +301,8 @@ mod tests {
         let hidden = compute(1000.0, 700.0, 1.0, metrics(), 4, true);
         assert_eq!(hidden.sidebar.width, 0.0);
 
-        let shown = Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, true, true);
+        let shown =
+            Layout::with_chrome(1000.0, 700.0, 1.0, metrics(), 4, true, true, true, SIDEBAR_WIDTH);
         assert!(shown.sidebar.width > 0.0);
         assert_eq!(shown.sidebar.x, 0.0);
         assert_eq!(shown.gutter.x, shown.sidebar.right());
@@ -266,9 +313,26 @@ mod tests {
 
     #[test]
     fn the_sidebar_never_crowds_out_the_editor_on_a_narrow_window() {
-        let layout = Layout::with_chrome(200.0, 700.0, 1.0, metrics(), 4, true, true, true);
+        let layout =
+            Layout::with_chrome(200.0, 700.0, 1.0, metrics(), 4, true, true, true, SIDEBAR_WIDTH);
         assert!(layout.sidebar.width <= 200.0 * 0.6 + 0.001);
         assert!(layout.text.width >= 0.0);
+    }
+
+    #[test]
+    fn dragging_the_sidebar_wider_or_narrower_is_reflected_in_its_width() {
+        let narrow = Layout::with_chrome(1400.0, 700.0, 1.0, metrics(), 4, true, true, true, 180.0);
+        let wide = Layout::with_chrome(1400.0, 700.0, 1.0, metrics(), 4, true, true, true, 400.0);
+        assert!((narrow.sidebar.width - 180.0).abs() < 0.5);
+        assert!((wide.sidebar.width - 400.0).abs() < 0.5);
+        assert!(wide.text.width < narrow.text.width, "a wider sidebar leaves less room for text");
+    }
+
+    #[test]
+    fn sidebar_width_clamps_to_the_drag_range() {
+        assert_eq!(clamp_sidebar_width(10.0), SIDEBAR_MIN_WIDTH);
+        assert_eq!(clamp_sidebar_width(10_000.0), SIDEBAR_MAX_WIDTH);
+        assert_eq!(clamp_sidebar_width(300.0), 300.0);
     }
 
     #[test]
