@@ -34,6 +34,18 @@ const SUBSYSTEM: &str = "shell";
 /// How long a transient status message stays on screen.
 const STATUS_MESSAGE_TIME: Duration = Duration::from_secs(6);
 
+/// How long a load has to still be running before its tab is actually shown.
+///
+/// Without this, opening a file that fails almost instantly -- a binary file
+/// being rejected, say, which typically fails within the first few KB --
+/// makes a tab flash into existence and vanish again within milliseconds.
+/// That reads as a glitch, not as "the file was checked and rejected," even
+/// though the real error is reported correctly (see `status_left`). A load
+/// that finishes well inside this window, success or failure, never shows a
+/// loading tab at all; one that is still running past it shows the normal
+/// "Loading..." tab exactly as before.
+const LOADING_TAB_GRACE: Duration = Duration::from_millis(120);
+
 /// Lines scrolled per wheel notch.
 const WHEEL_LINES: f32 = 3.0;
 
@@ -183,6 +195,15 @@ fn append_tree_level(
             rows.push(ListRow { label: format!("{indent}{error}"), action: None });
         }
     }
+}
+
+/// Whether a still-loading tab has been running long enough to actually show,
+/// rather than flash and vanish for a load that fails (or succeeds) almost
+/// instantly. A pure function for the same reason `wheel_target` is: the
+/// debounce rule is worth asserting on directly rather than only observing it
+/// through a flickering window.
+pub fn should_show_loading_tab(started: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(started) >= LOADING_TAB_GRACE
 }
 
 /// Whether an incoming diagnostics version should replace what is applied.
@@ -363,6 +384,10 @@ pub struct LightSpeed {
     /// External state as of the last check, so a transition (not just "still
     /// changed") is what triggers a status message.
     last_external_state: HashMap<DocumentId, ls_core::ExternalState>,
+    /// When each in-flight load was requested, so its tab can stay hidden
+    /// until `LOADING_TAB_GRACE` has passed (see `should_show_loading_tab`).
+    /// Pruned once a document is no longer loading.
+    loading_tab_started: HashMap<DocumentId, Instant>,
     /// Where the recent-files list is persisted, if the platform gives us
     /// somewhere standard to put it. `None` just means the feature is
     /// in-memory only for this run -- never a reason to fail startup.
@@ -506,6 +531,7 @@ impl LightSpeed {
             recent_files_path,
             next_watch_check: Instant::now() + EXTERNAL_WATCH_INTERVAL,
             last_external_state: HashMap::new(),
+            loading_tab_started: HashMap::new(),
             active_list: None,
             file_tree_root: None,
             expanded_dirs: std::collections::HashSet::new(),
@@ -630,6 +656,11 @@ impl LightSpeed {
                 }
             }
         }
+
+        // Once a load is no longer in flight (loaded, failed, or cancelled)
+        // its grace-period clock has done its job.
+        let core = &self.core;
+        self.loading_tab_started.retain(|id, _| core.is_loading(*id));
 
         self.after_state_change();
     }
@@ -833,6 +864,10 @@ impl LightSpeed {
     fn open_path_with(&mut self, path: PathBuf, injection: LoadInjection) {
         match self.core.request_open_document_with(&path, injection) {
             Ok(request) => {
+                // A joined request reuses a document already loading, whose
+                // start time is already tracked; only a genuinely new load
+                // starts the grace-period clock.
+                self.loading_tab_started.entry(request.document).or_insert_with(Instant::now);
                 self.adopt_new_document(request.document);
                 self.diagnostics_path = Some(path.clone());
                 self.save_recent_files();
@@ -2141,7 +2176,15 @@ impl LightSpeed {
         // One tab computation per frame, shared by drawing and hit testing.
         // Storing it here is what keeps a click resolving against the same
         // rectangles the user is looking at.
-        let presentations = self.core.tab_presentations();
+        let now = Instant::now();
+        let mut presentations = self.core.tab_presentations();
+        presentations.retain(|tab| {
+            !tab.loading
+                || self
+                    .loading_tab_started
+                    .get(&tab.id)
+                    .is_none_or(|started| should_show_loading_tab(*started, now))
+        });
         self.tab_geometry = tabs::geometry(
             layout.tab_bar,
             &presentations,
@@ -2655,6 +2698,32 @@ mod tests {
 
     fn centre(rect: crate::layout::Rect) -> (f32, f32) {
         (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+    }
+
+    #[test]
+    fn a_load_that_finishes_inside_the_grace_period_never_shows_a_tab() {
+        // Regression test for the "the file just opens and then closes" bug:
+        // rejecting a binary file happens fast enough that the loading tab
+        // used to flash into existence and vanish within milliseconds. A
+        // load still running once the grace period has elapsed should show
+        // normally -- this only suppresses the flash, not the tab itself.
+        let started = Instant::now();
+        assert!(
+            !should_show_loading_tab(started, started),
+            "a load that hasn't been running at all must not show a tab yet"
+        );
+        assert!(
+            !should_show_loading_tab(started, started + Duration::from_millis(50)),
+            "well inside the grace period"
+        );
+        assert!(
+            should_show_loading_tab(started, started + LOADING_TAB_GRACE),
+            "exactly at the grace period boundary, the tab should show"
+        );
+        assert!(
+            should_show_loading_tab(started, started + Duration::from_secs(2)),
+            "a genuinely slow load must still show its tab"
+        );
     }
 
     #[test]
