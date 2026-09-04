@@ -128,6 +128,16 @@ pub struct Chrome<'a> {
     /// drawn on top of the selection highlight -- the selected row already
     /// reads as "the current one".
     pub sidebar_hovered_row: Option<usize>,
+    /// Which activity item is the current panel, if any -- drawn "cut into"
+    /// the editor rather than highlighted on top of it, matching Lapce.
+    pub activity_active: Option<usize>,
+    /// Which activity item the pointer is over, for hover feedback distinct
+    /// from the active one.
+    pub activity_hovered: Option<usize>,
+    /// The docked bottom panel's content area, when it is shown.
+    pub bottom_panel: Option<Rect>,
+    /// The bottom panel's own icon rail, to the left of its content.
+    pub bottom_panel_rail: Option<Rect>,
 }
 
 /// Builds the chrome for one frame.
@@ -142,11 +152,179 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
     let scale = layout.scale;
 
     // --- base: the window's own furniture ------------------------------------
-    list.push_quad(Layer::Base, Quad::new(layout.menu_bar, theme.menu_background));
+    list.push_quad(Layer::Base, Quad::new(layout.menu_bar, theme.activity_background));
     list.push_quad(Layer::Base, Quad::new(layout.tab_bar, theme.tab_bar));
+    list.push_quad(Layer::Base, Quad::new(layout.breadcrumb, theme.background));
     list.push_quad(Layer::Base, Quad::new(layout.gutter, theme.gutter_background));
     if layout.show_status_bar {
         list.push_quad(Layer::Base, Quad::new(layout.status_bar, theme.status_bar));
+    }
+
+    // The header, Lapce-style: a menu button hard left, a command field in
+    // the middle, action buttons hard right. No File/Edit/View strip -- that
+    // whole row collapsed into the one button (see `menu::all_items`).
+    if input.menu.is_open() {
+        list.push_quad(Layer::Base, Quad::new(layout.title_menu_button, theme.panel_hovered));
+    }
+    list.push_text(
+        Layer::Base,
+        TextRegionPlacement {
+            region: Region::TitleLeft,
+            origin_x: layout.title_menu_button.x,
+            origin_y: layout.title_menu_button.y,
+            clip: layout.menu_bar,
+            color: theme.activity_icon_active,
+        },
+    );
+
+    // The command field reads as an inset control: the editor's own darker
+    // background inside the header's lighter one, with a hairline border.
+    // Drawn in the base layer, unlike `push_panel`'s overlay surfaces -- this
+    // is furniture, not something floating over the document.
+    let field = layout.title_search;
+    list.push_quad(
+        Layer::Base,
+        Quad::new(
+            Rect::new(
+                field.x - scale,
+                field.y - scale,
+                field.width + scale * 2.0,
+                field.height + scale * 2.0,
+            ),
+            theme.sidebar_border,
+        ),
+    );
+    list.push_quad(Layer::Base, Quad::new(field, theme.background));
+    list.push_text(
+        Layer::Base,
+        TextRegionPlacement {
+            region: Region::TitleCenter,
+            origin_x: layout.title_search.x + 10.0 * scale,
+            origin_y: layout.title_search.y
+                + (layout.title_search.height - layout.metrics.line_height) / 2.0,
+            clip: layout.title_search,
+            color: theme.dim_text,
+        },
+    );
+    list.push_text(
+        Layer::Base,
+        TextRegionPlacement {
+            region: Region::TitleRight,
+            origin_x: layout.title_actions.x,
+            origin_y: layout.title_actions.y,
+            clip: layout.title_actions,
+            color: theme.activity_icon_active,
+        },
+    );
+
+    // The breadcrumb trail, on the editor's own background so it reads as
+    // part of the document view rather than as more toolbar.
+    list.push_text(
+        Layer::Base,
+        TextRegionPlacement {
+            region: Region::Breadcrumb,
+            origin_x: layout.breadcrumb.x + layout.activity_bar.width + 12.0 * scale,
+            origin_y: layout.breadcrumb.y
+                + (layout.breadcrumb.height - layout.metrics.line_height) / 2.0,
+            clip: layout.breadcrumb,
+            color: theme.dim_text,
+        },
+    );
+
+    // The activity bar: a persistent icon rail at the far left. Always
+    // present when there is chrome at all, so it is drawn unconditionally
+    // rather than behind an `Option`.
+    list.push_quad(Layer::Base, Quad::new(layout.activity_bar, theme.activity_background));
+    list.push_quad(
+        Layer::Base,
+        Quad::new(
+            Rect::new(
+                layout.activity_bar.right(),
+                layout.activity_bar.y,
+                scale,
+                layout.activity_bar.height,
+            ),
+            theme.sidebar_border,
+        ),
+    );
+    if let Some(index) = input.activity_hovered {
+        if input.activity_active != Some(index) {
+            list.push_quad(
+                Layer::Base,
+                Quad::new(
+                    crate::layout::icon_rail_row(layout.activity_bar, index),
+                    theme.panel_hovered,
+                ),
+            );
+        }
+    }
+    if let Some(index) = input.activity_active {
+        // The active item's cell reads as "cut into" the editor -- it shares
+        // the editor's own background rather than being highlighted on top
+        // of the activity bar's, matching Lapce's `activity.current`.
+        list.push_quad(
+            Layer::Base,
+            Quad::new(
+                crate::layout::icon_rail_row(layout.activity_bar, index),
+                theme.activity_current,
+            ),
+        );
+    }
+    {
+        // Each icon shapes at `cell_icon_font_size` of the square cell it sits
+        // in, on a per-icon line exactly one cell tall. `Align::Center` (set
+        // by `TextEngine::set_icon_cluster`) centers it horizontally, and
+        // cosmic-text's own layout already centers each line's glyphs
+        // vertically within its line box by measured ascent+descent -- no
+        // manual offset needed here.
+        list.push_text(
+            Layer::Base,
+            TextRegionPlacement {
+                region: Region::ActivityBar,
+                origin_x: layout.activity_bar.x,
+                origin_y: layout.activity_bar.y,
+                clip: layout.activity_bar,
+                color: theme.activity_icon_active,
+            },
+        );
+    }
+
+    // The bottom panel (currently just the terminal) docks the same way the
+    // sidebar does: a real base-layer surface with its own icon rail, not an
+    // overlay drawn on top of the editor.
+    if let Some(panel) = input.bottom_panel {
+        list.push_quad(
+            Layer::Base,
+            Quad::new(Rect::new(panel.x, panel.y, panel.width, scale), theme.sidebar_border),
+        );
+        list.push_quad(Layer::Base, Quad::new(panel, theme.sidebar_background));
+        list.push_text(
+            Layer::Base,
+            TextRegionPlacement {
+                region: Region::BottomPanel,
+                origin_x: panel.x + 8.0 * scale,
+                origin_y: panel.y,
+                clip: panel,
+                color: theme.text,
+            },
+        );
+    }
+    if let Some(rail) = input.bottom_panel_rail {
+        list.push_quad(Layer::Base, Quad::new(rail, theme.activity_background));
+        list.push_quad(
+            Layer::Base,
+            Quad::new(crate::layout::icon_rail_row(rail, 0), theme.activity_current),
+        );
+        list.push_text(
+            Layer::Base,
+            TextRegionPlacement {
+                region: Region::BottomPanelRail,
+                origin_x: rail.x,
+                origin_y: rail.y,
+                clip: rail,
+                color: theme.activity_icon_active,
+            },
+        );
     }
 
     // The sidebar is docked chrome beside the editor, not a surface floating
@@ -213,20 +391,19 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
     for tab in &input.tabs.tabs {
         let color = if tab.active { theme.tab_active } else { theme.tab_inactive };
         list.push_quad(Layer::Base, Quad::new(tab.full, color));
-        if tab.active {
-            list.push_quad(
-                Layer::Base,
-                Quad::new(
-                    Rect::new(
-                        tab.full.x,
-                        tab.full.bottom() - 2.0 * scale,
-                        tab.full.width,
-                        2.0 * scale,
-                    ),
-                    theme.cursor,
-                ),
-            );
-        }
+        // Lapce draws every tab flat and marks the active one with a thin
+        // underline rather than a filled block -- every tab gets one, just
+        // dimmer when inactive, instead of only the active tab having any
+        // marker at all.
+        let underline_color =
+            if tab.active { theme.tab_underline_active } else { theme.tab_underline_inactive };
+        list.push_quad(
+            Layer::Base,
+            Quad::new(
+                Rect::new(tab.full.x, tab.full.bottom() - 2.0 * scale, tab.full.width, 2.0 * scale),
+                underline_color,
+            ),
+        );
         if tab.dirty {
             list.push_quad(
                 Layer::Base,
@@ -249,28 +426,31 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
         },
     );
 
-    // The menu bar itself is chrome, not an overlay: it is always there.
-    if let Some(open) = input.menu.open {
-        if let Some(title) = input.menu_geometry.titles.get(open) {
-            list.push_quad(Layer::Base, Quad::new(*title, theme.menu_highlight));
-        }
-    }
+    // The tab row's own controls: navigation at its head, split and close at
+    // its end, the way Lapce frames its editor tabs.
     list.push_text(
         Layer::Base,
         TextRegionPlacement {
-            region: Region::Menu,
-            origin_x: input
-                .menu_geometry
-                .titles
-                .first()
-                .map(|rect| rect.x)
-                .unwrap_or(layout.menu_bar.x),
-            origin_y: layout.menu_bar.y
-                + (layout.menu_bar.height - layout.metrics.line_height) / 2.0,
-            clip: layout.menu_bar,
-            color: theme.status_text,
+            region: Region::TabNav,
+            origin_x: layout.tab_nav.x,
+            origin_y: layout.tab_nav.y,
+            clip: layout.tab_nav,
+            color: theme.activity_icon_inactive,
         },
     );
+    list.push_text(
+        Layer::Base,
+        TextRegionPlacement {
+            region: Region::TabActions,
+            origin_x: layout.tab_actions.x,
+            origin_y: layout.tab_actions.y,
+            clip: layout.tab_actions,
+            color: theme.activity_icon_inactive,
+        },
+    );
+
+    // No menu-title row: the header's own button (drawn above) is the only
+    // trigger, and `Region::Menu` no longer has anything to draw.
 
     if layout.show_status_bar {
         let status_y =
@@ -405,7 +585,13 @@ mod tests {
     use ls_core::{DocumentId, TabPresentation};
 
     fn metrics() -> FontMetrics {
-        FontMetrics { font_size: 14.0, line_height: 20.0, digit_width: 8.0 }
+        FontMetrics {
+            font_size: 14.0,
+            line_height: 20.0,
+            digit_width: 8.0,
+            icon_width: 14.0,
+            material_icon_width: 14.0,
+        }
     }
 
     fn layout() -> Layout {
@@ -419,6 +605,8 @@ mod tests {
             true,
             false,
             crate::layout::SIDEBAR_WIDTH,
+            false,
+            crate::layout::BOTTOM_PANEL_HEIGHT,
         )
     }
 
@@ -452,7 +640,7 @@ mod tests {
 
     fn fixture(menu: MenuState) -> Fixture {
         let layout = layout();
-        let tabs = tabs::geometry(layout.tab_bar, &presentations(), 8.0, 1.0);
+        let tabs = tabs::geometry(layout.tab_bar, &presentations(), 8.0, 14.0, 1.0);
         let menu_geometry =
             menu::geometry(layout.menu_bar, menu, 8.0, layout.metrics.line_height, 1.0, &[]);
         let enabled =
@@ -474,6 +662,11 @@ mod tests {
             sidebar_panel: None,
             sidebar_selected_row: None,
             sidebar_hovered_row: None,
+
+            activity_active: None,
+            activity_hovered: None,
+            bottom_panel: None,
+            bottom_panel_rail: None,
         })
     }
 
@@ -612,6 +805,11 @@ mod tests {
             sidebar_panel: Some(panel),
             sidebar_selected_row: Some(1),
             sidebar_hovered_row: None,
+
+            activity_active: None,
+            activity_hovered: None,
+            bottom_panel: None,
+            bottom_panel_rail: None,
         });
         assert_eq!(list.layer_of(Region::Sidebar), Some(Layer::Base));
         let fill = list
@@ -667,6 +865,8 @@ mod tests {
             false,
             false,
             crate::layout::SIDEBAR_WIDTH,
+            false,
+            crate::layout::BOTTOM_PANEL_HEIGHT,
         );
         let list = chrome(&Chrome {
             layout,
@@ -681,6 +881,11 @@ mod tests {
             sidebar_panel: None,
             sidebar_selected_row: None,
             sidebar_hovered_row: None,
+
+            activity_active: None,
+            activity_hovered: None,
+            bottom_panel: None,
+            bottom_panel_rail: None,
         });
         assert_eq!(list.layer_of(Region::Status), None);
         assert_eq!(list.layer_of(Region::StatusRight), None);

@@ -14,6 +14,7 @@
 mod app;
 mod compose;
 mod devpanel;
+mod icons;
 mod json;
 mod keymap;
 mod layout;

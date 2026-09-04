@@ -2,6 +2,12 @@
 //!
 //! Deliberately boring: one dark theme, no theming system. The editor has to
 //! feel fast before it needs to look configurable.
+//!
+//! The palette itself is not invented here: it is Lapce's own `Dark` theme,
+//! pulled from `defaults/dark-theme.toml` in the Lapce repository (One Dark's
+//! base sixteen colors, in Lapce's own `[color-theme.ui]` role assignments).
+//! LightSpeed's UI layout is a deliberate copy of Lapce's, and a copied
+//! layout in a different palette would still look like a different program.
 
 /// A color in linear space, ready for a linear-to-sRGB render target.
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -151,6 +157,22 @@ pub struct Theme {
     pub error: Color,
     pub ok: Color,
     pub scrollbar: Color,
+    /// The activity bar: the narrow icon rail (Explorer / Search / Source
+    /// Control / ...) at the very left edge, Lapce's `activity.*`.
+    pub activity_background: Color,
+    /// The active item's column reads as "cut into" the editor rather than
+    /// highlighted on top of it -- it shares the editor's own background.
+    pub activity_current: Color,
+    pub activity_icon_active: Color,
+    pub activity_icon_inactive: Color,
+    /// Lapce draws tabs flat, with a thin colored underline marking the
+    /// active one, rather than filling the whole tab with a different
+    /// background the way the previous VS-Code-ish style did.
+    pub tab_underline_active: Color,
+    pub tab_underline_inactive: Color,
+    /// Hover feedback shared by the activity bar and any docked panel's own
+    /// icon rail (the bottom panel's terminal/search/problems switcher).
+    pub panel_hovered: Color,
 }
 
 /// What kind of row a sidebar line is, for coloring it -- the closest this
@@ -186,41 +208,73 @@ impl Theme {
     }
 
     pub const fn dark() -> Self {
+        // Lapce's `[color-theme.base]` sixteen colors (One Dark), named here
+        // the way the TOML names them so the mapping below is checkable
+        // against the source at a glance.
+        const BLACK: Color = Color::rgb(0x28, 0x2C, 0x34); // primary-background
+        const SECONDARY_BACKGROUND: Color = Color::rgb(0x21, 0x25, 0x2B);
+        const CURRENT_BACKGROUND: Color = Color::rgb(0x2C, 0x31, 0x3A);
+        const WHITE: Color = Color::rgb(0xAB, 0xB2, 0xBF); // text
+        const DIM_TEXT: Color = Color::rgb(0x5C, 0x63, 0x70);
+        const GREEN: Color = Color::rgb(0x98, 0xC3, 0x79);
+        const GREY: Color = Color::rgb(0x3E, 0x44, 0x51);
+        const PURPLE: Color = Color::rgb(0xC6, 0x78, 0xDD);
+        const ORANGE: Color = Color::rgb(0xD1, 0x9A, 0x66);
+        const RED: Color = Color::rgb(0xE0, 0x6C, 0x75);
+        const YELLOW: Color = Color::rgb(0xE5, 0xC0, 0x7B);
+        const CARET: Color = Color::rgb(0x52, 0x8B, 0xFF); // editor.caret
+
         Theme {
-            background: Color::rgb(0x14, 0x16, 0x1A),
-            gutter_background: Color::rgb(0x14, 0x16, 0x1A),
-            gutter_text: Color::rgb(0x4A, 0x51, 0x5C),
-            text: Color::rgb(0xD6, 0xDC, 0xE4),
-            dim_text: Color::rgb(0x76, 0x7F, 0x8C),
-            cursor: Color::rgb(0x5A, 0xC8, 0xFA),
-            current_line: Color::rgb(0x1B, 0x1E, 0x25),
-            selection: Color::rgba(0x2C, 0x5A, 0x8C, 0xB0),
-            search_match: Color::rgba(0xE0, 0xA0, 0x3C, 0x60),
-            syntax_keyword: Color::rgb(0xC5, 0x86, 0xE8),
-            syntax_string: Color::rgb(0x9E, 0xC9, 0x6A),
-            syntax_comment: Color::rgb(0x6A, 0x73, 0x80),
-            syntax_number: Color::rgb(0xD1, 0x9A, 0x66),
-            tab_bar: Color::rgb(0x0F, 0x11, 0x15),
-            tab_inactive: Color::rgb(0x0F, 0x11, 0x15),
-            tab_active: Color::rgb(0x14, 0x16, 0x1A),
-            tab_text: Color::rgb(0x8A, 0x93, 0xA0),
-            dirty_marker: Color::rgb(0xE0, 0xA0, 0x3C),
-            status_bar: Color::rgb(0x18, 0x2A, 0x3E),
-            status_text: Color::rgb(0xC4, 0xCE, 0xDA),
-            overlay_background: Color::rgba(0x0A, 0x0C, 0x10, 0xE8),
-            overlay_border: Color::rgb(0x2A, 0x30, 0x3A),
-            sidebar_background: Color::rgb(0x18, 0x1A, 0x1F),
-            sidebar_border: Color::rgb(0x2A, 0x30, 0x3A),
-            sidebar_selected: Color::rgb(0x2C, 0x5A, 0x8C),
-            sidebar_hover: Color::rgb(0x22, 0x26, 0x2E),
-            sidebar_folder: Color::rgb(0x5A, 0xC8, 0xFA),
-            menu_background: Color::rgb(0x1E, 0x22, 0x2A),
-            menu_highlight: Color::rgb(0x2C, 0x5A, 0x8C),
-            menu_border: Color::rgb(0x3A, 0x42, 0x50),
-            warning: Color::rgb(0xE0, 0xA0, 0x3C),
-            error: Color::rgb(0xE0, 0x5C, 0x5C),
-            ok: Color::rgb(0x6C, 0xC0, 0x7C),
-            scrollbar: Color::rgb(0x33, 0x39, 0x44),
+            background: BLACK, // editor.background
+            gutter_background: BLACK,
+            gutter_text: DIM_TEXT,
+            text: WHITE,        // editor.foreground
+            dim_text: DIM_TEXT, // editor.dim
+            cursor: CARET,
+            current_line: Color::rgb(0x2C, 0x31, 0x3C), // editor.current_line
+            selection: GREY,                            // editor.selection
+            search_match: Color::rgba(0xE5, 0xC0, 0x7B, 0x60),
+            // Syntax roles from `[color-theme.syntax]`.
+            syntax_keyword: PURPLE,
+            syntax_string: GREEN,
+            syntax_comment: DIM_TEXT,
+            syntax_number: YELLOW,
+            // Lapce draws tabs flat with an underline, not a filled block;
+            // both tab states share one background and differ only by the
+            // underline color (see `tab_underline_*` below).
+            tab_bar: SECONDARY_BACKGROUND,
+            tab_inactive: SECONDARY_BACKGROUND, // lapce.tab.inactive.background
+            tab_active: BLACK,                  // lapce.tab.active.background
+            tab_text: WHITE,
+            dirty_marker: ORANGE,
+            status_bar: SECONDARY_BACKGROUND, // status.background
+            status_text: WHITE,               // status.foreground
+            overlay_background: Color::rgba(0x21, 0x25, 0x2B, 0xE8),
+            overlay_border: Color::rgb(0x00, 0x00, 0x00), // lapce.border
+            sidebar_background: SECONDARY_BACKGROUND,     // panel.background
+            sidebar_border: Color::rgb(0x00, 0x00, 0x00),
+            sidebar_selected: CURRENT_BACKGROUND, // panel.current.background
+            sidebar_hover: Color::rgb(0x34, 0x3A, 0x45), // panel.hovered.background
+            sidebar_folder: ORANGE,
+            // Bound as literal `Color::rgb(...)` rather than the named
+            // constants above (even though the values are the same ones):
+            // an architecture test greps this file's source for exactly
+            // that pattern on these three fields, so a translucent
+            // `Color::rgba` can never sneak into a dropdown surface.
+            menu_background: Color::rgb(0x21, 0x25, 0x2B), // palette.background
+            menu_highlight: Color::rgb(0x2C, 0x31, 0x3A),  // palette.current.background
+            menu_border: Color::rgb(0x00, 0x00, 0x00),
+            warning: YELLOW, // lapce.warn
+            error: RED,      // lapce.error
+            ok: GREEN,
+            scrollbar: Color::rgba(0x3E, 0x44, 0x51, 0xBB), // lapce.scroll_bar
+            activity_background: SECONDARY_BACKGROUND,      // activity.background
+            activity_current: BLACK,                        // activity.current
+            activity_icon_active: WHITE,                    // lapce.icon.active
+            activity_icon_inactive: DIM_TEXT,               // lapce.icon.inactive
+            tab_underline_active: CARET,                    // lapce.tab.active.underline
+            tab_underline_inactive: Color::rgba(0x52, 0x8B, 0xFF, 0x77),
+            panel_hovered: Color::rgb(0x34, 0x3A, 0x45),
         }
     }
 }

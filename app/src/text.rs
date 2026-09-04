@@ -32,17 +32,33 @@ pub enum Region {
     Overlay,
     /// The docked explorer / search / git-status sidebar.
     Sidebar,
-    /// Menu bar titles.
-    Menu,
     /// The open dropdown's items that can be run now.
     MenuDropdown,
     /// The open dropdown's items that cannot apply right now.
     MenuDropdownDisabled,
     /// A confirmation strip.
     Prompt,
+    /// The persistent icon-only activity bar at the far left.
+    ActivityBar,
+    /// The docked bottom panel (currently: the terminal).
+    BottomPanel,
+    /// The bottom panel's own icon rail, to the left of its content.
+    BottomPanelRail,
+    /// The title bar's left cluster: logo and the menu button.
+    TitleLeft,
+    /// The title bar's centered command/search field.
+    TitleCenter,
+    /// The title bar's right cluster: run and settings.
+    TitleRight,
+    /// The breadcrumb trail under the tab bar.
+    Breadcrumb,
+    /// The tab row's leading navigation cluster.
+    TabNav,
+    /// The tab row's trailing split/close cluster.
+    TabActions,
 }
 
-const REGION_COUNT: usize = 11;
+const REGION_COUNT: usize = 19;
 
 fn region_index(region: Region) -> usize {
     match region {
@@ -52,11 +68,123 @@ fn region_index(region: Region) -> usize {
         Region::Status => 3,
         Region::StatusRight => 4,
         Region::Overlay => 5,
-        Region::Menu => 6,
-        Region::MenuDropdown => 7,
-        Region::MenuDropdownDisabled => 8,
-        Region::Prompt => 9,
-        Region::Sidebar => 10,
+        Region::MenuDropdown => 6,
+        Region::MenuDropdownDisabled => 7,
+        Region::Prompt => 8,
+        Region::Sidebar => 9,
+        Region::ActivityBar => 10,
+        Region::BottomPanel => 11,
+        Region::BottomPanelRail => 12,
+        Region::TitleLeft => 13,
+        Region::TitleCenter => 14,
+        Region::TitleRight => 15,
+        Region::Breadcrumb => 16,
+        Region::TabNav => 17,
+        Region::TabActions => 18,
+    }
+}
+
+/// One styled run inside a rich-text region: a byte range, the color it is
+/// drawn in, and which font it is shaped with.
+///
+/// The font matters because the chrome mixes the two: a tab is an icon glyph
+/// and then a filename, a status bar is a branch icon and then a branch name.
+/// Both have to shape into one buffer to line up on one baseline, so the
+/// choice of font belongs to the run, not to the region.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub color: Color,
+    /// Shape this run with a bundled icon font (which one) rather than the UI
+    /// font. There are two icon fonts in play -- Codicons for chrome, Material
+    /// Design Icons for file types -- so this carries the family name rather
+    /// than a bare bool.
+    pub icon_family: Option<&'static str>,
+}
+
+impl Span {
+    pub fn text(start: usize, end: usize, color: Color) -> Self {
+        Span { start, end, color, icon_family: None }
+    }
+
+    pub fn icon(start: usize, end: usize, color: Color, family: &'static str) -> Self {
+        Span { start, end, color, icon_family: Some(family) }
+    }
+}
+
+/// A string being built alongside the spans that style it.
+///
+/// Every piece of Lapce-style chrome is a mix of icon glyphs and text on one
+/// baseline -- a tab is an icon then a filename, a status bar is a branch icon
+/// then a branch name then an error icon then a count. Tracking byte offsets
+/// for that by hand at each call site is exactly the kind of thing that is
+/// wrong once and then wrong everywhere, so it is done here instead.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RichText {
+    pub text: String,
+    pub spans: Vec<Span>,
+}
+
+impl RichText {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        self.text.clear();
+        self.spans.clear();
+    }
+
+    /// Appends an icon glyph, shaped with whichever bundled icon font it
+    /// belongs to. Accepts anything that converts to [`crate::icons::Glyph`]
+    /// -- a chrome [`crate::icons::Icon`] or a file-type
+    /// [`crate::icons::FileIcon`] -- so call sites never need to know which
+    /// font a particular glyph actually lives in.
+    pub fn icon(&mut self, icon: impl Into<crate::icons::Glyph>, color: Color) -> &mut Self {
+        let glyph = icon.into();
+        let start = self.text.len();
+        self.text.push(glyph.ch);
+        self.spans.push(Span::icon(start, self.text.len(), color, glyph.family));
+        self
+    }
+
+    /// Appends an icon-width blank: an icon glyph drawn fully transparent.
+    ///
+    /// Icons and monospace characters have different advances, so a row that
+    /// omits its icon cannot pad with spaces and stay aligned with the rows
+    /// that have one -- a file's name would sit at a different column than a
+    /// folder's. An invisible glyph from the same font advances by exactly
+    /// the same amount as a visible one, which is the only padding that keeps
+    /// a tree's names in a straight line.
+    pub fn icon_space(&mut self) -> &mut Self {
+        self.icon(crate::icons::Icon::CircleFilled, Color::rgba(0, 0, 0, 0))
+    }
+
+    /// Appends text in a specific color.
+    pub fn colored(&mut self, text: &str, color: Color) -> &mut Self {
+        if text.is_empty() {
+            return self;
+        }
+        let start = self.text.len();
+        self.text.push_str(text);
+        self.spans.push(Span::text(start, self.text.len(), color));
+        self
+    }
+
+    /// Appends text in the region's default color, with no span of its own.
+    pub fn plain(&mut self, text: &str) -> &mut Self {
+        self.text.push_str(text);
+        self
+    }
+
+    pub fn newline(&mut self) -> &mut Self {
+        self.text.push('\n');
+        self
     }
 }
 
@@ -66,12 +194,12 @@ struct ShapedRegion {
     text: String,
     width: f32,
     height: f32,
-    /// The color spans last shaped via `set_rich_text`, so an unchanged rich
+    /// The spans last shaped via `set_rich_text`, so an unchanged rich
     /// region also costs nothing -- without this, a region with no text to
     /// compare (unlike `set_text`'s fast path) would reshape every single
     /// frame even while showing exactly the same thing. Always empty for a
     /// region only ever drawn with `set_text`.
-    spans: Vec<(usize, usize, Color)>,
+    spans: Vec<Span>,
     /// The default color last used by `set_rich_text`, compared alongside
     /// `spans` -- there is no live theme switch today, so this never
     /// actually changes frame to frame, but the fast path would be wrong to
@@ -107,6 +235,12 @@ impl TextEngine {
         line_height_ratio: f32,
     ) -> Self {
         let mut font_system = FontSystem::new();
+        // The icon font is bundled into the binary rather than looked up by
+        // name: the chrome's icons are not optional decoration, and a shell
+        // whose activity bar silently renders as blank boxes because a font
+        // is not installed is not a shell that shipped.
+        font_system.db_mut().load_font_data(crate::icons::ICON_FONT.to_vec());
+        font_system.db_mut().load_font_data(crate::icons::MATERIAL_ICON_FONT.to_vec());
         let swash = SwashCache::new();
         let cache = Cache::new(device);
         let viewport = Viewport::new(device, &cache);
@@ -143,11 +277,19 @@ impl TextEngine {
             overlay_renderer,
             viewport,
             regions,
-            metrics: FontMetrics { font_size, line_height, digit_width: font_size * 0.6 },
+            metrics: FontMetrics {
+                font_size,
+                line_height,
+                digit_width: font_size * 0.6,
+                icon_width: font_size,
+                material_icon_width: font_size,
+            },
             family: font_family.to_string(),
             reshaped: 0,
         };
         engine.metrics.digit_width = engine.measure_digit_width();
+        engine.metrics.icon_width = engine.measure_icon_width();
+        engine.metrics.material_icon_width = engine.measure_material_icon_width();
         engine
     }
 
@@ -173,6 +315,48 @@ impl TextEngine {
             .map(|run| run.line_w / SAMPLE.chars().count() as f32)
             .unwrap_or(self.metrics.font_size * 0.6);
         // Leave the region dirty so the real status text is shaped next frame.
+        region.text.clear();
+        width.max(1.0)
+    }
+
+    /// Advance width of one chrome icon glyph, measured the same way as the
+    /// digit.
+    ///
+    /// Icons are square-ish and do not share the UI font's monospace advance,
+    /// so anything that mixes the two in one run -- a tree row's chevron then
+    /// a filename -- has to know this to compute a rectangle that matches
+    /// what actually gets shaped. Guessing it is how a click lands on the
+    /// wrong row.
+    fn measure_icon_width(&mut self) -> f32 {
+        self.measure_family_icon_width(crate::icons::Icon::Files.glyph(), crate::icons::ICON_FAMILY)
+    }
+
+    /// Advance width of one Material Design Icons file-type glyph, measured
+    /// separately from [`Self::measure_icon_width`] since the two icon fonts
+    /// do not share an advance -- a tab is a file-type glyph then its name,
+    /// and a rectangle computed from the chrome font's width would drift from
+    /// what actually gets shaped there.
+    fn measure_material_icon_width(&mut self) -> f32 {
+        self.measure_family_icon_width(
+            crate::icons::FileIcon::Generic.glyph(),
+            crate::icons::MATERIAL_ICON_FAMILY,
+        )
+    }
+
+    fn measure_family_icon_width(&mut self, sample: char, family_name: &str) -> f32 {
+        let sample = sample.to_string();
+        let index = region_index(Region::Status);
+        let attrs = Attrs::new().family(Family::Name(family_name));
+        let region = &mut self.regions[index];
+        region.buffer.set_size(Some(4096.0), Some(64.0));
+        region.buffer.set_text(&sample, &attrs, Shaping::Advanced, None);
+        region.buffer.shape_until_scroll(&mut self.font_system, false);
+        let width = region
+            .buffer
+            .layout_runs()
+            .next()
+            .map(|run| run.line_w)
+            .unwrap_or(self.metrics.font_size);
         region.text.clear();
         width.max(1.0)
     }
@@ -218,7 +402,7 @@ impl TextEngine {
         width: f32,
         height: f32,
         default_color: Color,
-        spans: &[(usize, usize, Color)],
+        spans: &[Span],
     ) {
         let index = region_index(region);
         // Unlike `set_text`, this used to always reshape -- there was no
@@ -240,14 +424,19 @@ impl TextEngine {
         let base = Attrs::new().family(Family::Name(&self.family));
         let mut runs: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
         let mut cursor = 0usize;
-        for &(start, end, color) in spans {
+        for span in spans {
+            let Span { start, end, color, icon_family } = *span;
             if start < cursor || end <= start || end > text.len() {
                 continue;
             }
             if start > cursor {
                 runs.push((&text[cursor..start], base.clone()));
             }
-            runs.push((&text[start..end], base.clone().color(color.to_glyphon())));
+            let attrs = match icon_family {
+                Some(family) => Attrs::new().family(Family::Name(family)),
+                None => base.clone(),
+            };
+            runs.push((&text[start..end], attrs.color(color.to_glyphon())));
             cursor = end;
         }
         if cursor < text.len() {
@@ -262,6 +451,102 @@ impl TextEngine {
             Shaping::Advanced,
             None,
         );
+        entry.buffer.shape_until_scroll(&mut self.font_system, false);
+        entry.text.clear();
+        entry.text.push_str(text);
+        entry.width = width;
+        entry.height = height;
+        entry.spans.clear();
+        entry.spans.extend_from_slice(spans);
+        entry.default_color = default_color;
+        self.reshaped += 1;
+    }
+
+    /// Like [`Self::set_rich_text`], but for a region that is *only* icons
+    /// filling a button- or cell-shaped space (the activity bar, a panel's
+    /// icon rail, the title bar's buttons) rather than a left-aligned list.
+    ///
+    /// Two things `set_rich_text` does not do, both needed for an icon to
+    /// actually read as an icon instead of a stray character in the corner
+    /// of its box:
+    /// - Shapes at `font_size`/`line_height` the caller chooses, rather than
+    ///   the shared UI text size every other region uses. An icon sized like
+    ///   a lowercase letter in a 50px activity-bar cell is the "too small"
+    ///   half of the bug this fixes.
+    /// - Centers every line horizontally within `width`, using cosmic-text's
+    ///   own line alignment rather than a hand-measured offset that only
+    ///   worked if the measurement matched what actually got shaped.
+    ///
+    /// Vertical centering needs no help from the caller: cosmic-text's own
+    /// `LayoutRunIter` already centers each line's glyphs within its
+    /// `line_height` using their measured ascent/descent (see
+    /// `cosmic_text::buffer::LayoutRunIter::next`), so placing the region's
+    /// `origin_y` at the cell's own top edge is enough -- an earlier version
+    /// of this method's caller applied a second, hand-rolled centering
+    /// nudge on top of that, which double-shifted every icon down.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_icon_cluster(
+        &mut self,
+        region: Region,
+        text: &str,
+        width: f32,
+        height: f32,
+        default_color: Color,
+        spans: &[Span],
+        font_size: f32,
+        line_height: f32,
+    ) {
+        let index = region_index(region);
+        let metrics = Metrics::new(font_size.max(1.0), line_height.max(1.0));
+        let metrics_changed = self.regions[index].buffer.metrics() != metrics;
+        let unchanged = !metrics_changed
+            && self.regions[index].text == text
+            && (self.regions[index].width - width).abs() < 0.5
+            && (self.regions[index].height - height).abs() < 0.5
+            && self.regions[index].spans == spans
+            && self.regions[index].default_color == default_color;
+        if unchanged {
+            return;
+        }
+
+        let base = Attrs::new().family(Family::Name(&self.family));
+        let mut runs: Vec<(&str, Attrs)> = Vec::with_capacity(spans.len() * 2 + 1);
+        let mut cursor = 0usize;
+        for span in spans {
+            let Span { start, end, color, icon_family } = *span;
+            if start < cursor || end <= start || end > text.len() {
+                continue;
+            }
+            if start > cursor {
+                runs.push((&text[cursor..start], base.clone()));
+            }
+            let attrs = match icon_family {
+                Some(family) => Attrs::new().family(Family::Name(family)),
+                None => base.clone(),
+            };
+            runs.push((&text[start..end], attrs.color(color.to_glyphon())));
+            cursor = end;
+        }
+        if cursor < text.len() {
+            runs.push((&text[cursor..], base.clone()));
+        }
+
+        let entry = &mut self.regions[index];
+        entry.buffer.set_metrics(metrics);
+        entry.buffer.set_size(Some(width.max(1.0)), Some(height.max(1.0)));
+        entry.buffer.set_rich_text(
+            runs,
+            &base.color(default_color.to_glyphon()),
+            Shaping::Advanced,
+            None,
+        );
+        entry.buffer.shape_until_scroll(&mut self.font_system, false);
+        // Centering a line is a layout-only change (it does not reshape any
+        // glyph), but it still needs a second pass over `shape_until_scroll`
+        // for cosmic-text to actually recompute glyph positions from it.
+        for line in entry.buffer.lines.iter_mut() {
+            line.set_align(Some(glyphon::cosmic_text::Align::Center));
+        }
         entry.buffer.shape_until_scroll(&mut self.font_system, false);
         entry.text.clear();
         entry.text.push_str(text);

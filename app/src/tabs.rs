@@ -3,7 +3,7 @@
 //! One computation feeds both drawing and hit testing:
 //!
 //! ```text
-//!            tabs::geometry(bar, presentations, char_width, scale)
+//!       tabs::geometry(bar, presentations, char_width, icon_width, scale)
 //!                                  |
 //!                    +-------------+-------------+
 //!                    v                           v
@@ -52,9 +52,14 @@ pub fn marker(tab: &TabPresentation) -> char {
 
 /// The label drawn for one tab, padded so every cell is a whole number of
 /// monospace advances.
+///
+/// The file-type icon is *not* part of this string: it is shaped from the
+/// icon font, whose advance differs from the monospace one, so it is
+/// composed in front of this by the renderer and accounted for separately in
+/// [`geometry`].
 pub fn label(tab: &TabPresentation) -> String {
     let mut text = String::with_capacity(tab.title.len() + LEAD + MARKER_SLOT + GAP + TRAIL + 1);
-    text.push_str("  ");
+    text.push(' ');
     text.push_str(&tab.title);
     text.push(marker(tab));
     text.push_str("  ");
@@ -63,14 +68,21 @@ pub fn label(tab: &TabPresentation) -> String {
     text
 }
 
-/// Characters in one tab's cell.
-fn cell_chars(tab: &TabPresentation) -> usize {
-    LEAD + tab.title.chars().count() + MARKER_SLOT + GAP + 1 + TRAIL
+/// The file-type icon drawn at the head of one tab: a modified document
+/// keeps the dirty dot in its marker slot, so this is purely about file type.
+pub fn icon(tab: &TabPresentation) -> crate::icons::FileIcon {
+    crate::icons::icon_for_file(&tab.title)
 }
 
-/// Character offset of the close glyph within a tab's cell.
+/// Monospace characters in one tab's cell, excluding its icon.
+fn cell_chars(tab: &TabPresentation) -> usize {
+    1 + tab.title.chars().count() + MARKER_SLOT + GAP + 1 + TRAIL
+}
+
+/// Character offset of the close glyph within a tab's cell, measured from
+/// after the icon.
 fn close_offset(tab: &TabPresentation) -> usize {
-    LEAD + tab.title.chars().count() + MARKER_SLOT + GAP
+    1 + tab.title.chars().count() + MARKER_SLOT + GAP
 }
 
 /// Where one tab sits, and which document it belongs to.
@@ -88,6 +100,12 @@ pub struct TabRects {
     pub active: bool,
     pub dirty: bool,
     pub label: String,
+    /// The file-type glyph drawn at the head of the cell, before `label`.
+    pub icon: crate::icons::Glyph,
+    /// The icon's own characteristic color -- unlike `label`, which dims when
+    /// the tab is inactive, the icon keeps its color regardless, the same way
+    /// `material-icon-theme` colors a tab in VS Code or Lapce.
+    pub icon_color: crate::theme::Color,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -96,16 +114,31 @@ pub struct TabGeometry {
 }
 
 /// Lays out the tab bar.
-pub fn geometry(bar: Rect, tabs: &[TabPresentation], char_width: f32, scale: f32) -> TabGeometry {
+///
+/// `icon_width` is the icon font's advance, which differs from the monospace
+/// `char_width`: every cell leads with a file-type glyph, and a rectangle
+/// computed as though it did not would drift further from the drawn text with
+/// every tab along the row.
+pub fn geometry(
+    bar: Rect,
+    tabs: &[TabPresentation],
+    char_width: f32,
+    icon_width: f32,
+    scale: f32,
+) -> TabGeometry {
     let mut rects = Vec::with_capacity(tabs.len());
     let mut x = bar.x;
     for tab in tabs {
-        let width = cell_chars(tab) as f32 * char_width;
+        // Lapce gives every tab a minimum width regardless of how short its
+        // title is, so a one-character filename doesn't produce a sliver of
+        // a tab.
+        let natural = icon_width + cell_chars(tab) as f32 * char_width;
+        let width = natural.max(crate::layout::TAB_MIN_WIDTH * scale);
         let full = Rect::new(x, bar.y, width, bar.height);
 
         // The close control is a square around its glyph, inset so it does not
         // swallow clicks meant for the last character of the title.
-        let glyph_x = x + close_offset(tab) as f32 * char_width;
+        let glyph_x = x + icon_width + close_offset(tab) as f32 * char_width;
         let side = bar.height.min(char_width * 2.0).max(char_width);
         let close = Rect::new(
             glyph_x - (side - char_width) / 2.0,
@@ -115,6 +148,7 @@ pub fn geometry(bar: Rect, tabs: &[TabPresentation], char_width: f32, scale: f32
         );
         let body = Rect::new(x, bar.y, (close.x - x).max(0.0), bar.height);
 
+        let file_icon = icon(tab);
         rects.push(TabRects {
             id: tab.id,
             full,
@@ -123,6 +157,8 @@ pub fn geometry(bar: Rect, tabs: &[TabPresentation], char_width: f32, scale: f32
             active: tab.active,
             dirty: tab.dirty,
             label: label(tab),
+            icon: file_icon.into(),
+            icon_color: file_icon.color(),
         });
         x += width + scale;
     }
@@ -185,7 +221,7 @@ mod tests {
 
     #[test]
     fn tabs_are_laid_out_left_to_right_without_overlapping() {
-        let geometry = geometry(bar(), &three(), 8.0, 1.0);
+        let geometry = geometry(bar(), &three(), 8.0, 14.0, 1.0);
         assert_eq!(geometry.tabs.len(), 3);
         for pair in geometry.tabs.windows(2) {
             assert!(pair[0].full.right() <= pair[1].full.x + 0.01, "tabs must not overlap");
@@ -198,7 +234,7 @@ mod tests {
 
     #[test]
     fn a_wider_title_gets_a_wider_tab() {
-        let geometry = geometry(bar(), &three(), 8.0, 1.0);
+        let geometry = geometry(bar(), &three(), 8.0, 14.0, 1.0);
         assert!(
             geometry.tabs[2].full.width > geometry.tabs[0].full.width,
             "the long name needs more room"
@@ -207,7 +243,7 @@ mod tests {
 
     #[test]
     fn the_close_control_sits_inside_its_own_tab_and_not_over_the_body() {
-        let geometry = geometry(bar(), &three(), 8.0, 1.0);
+        let geometry = geometry(bar(), &three(), 8.0, 14.0, 1.0);
         for tab in &geometry.tabs {
             assert!(tab.close.x >= tab.full.x, "the close control stays inside its tab");
             assert!(tab.close.right() <= tab.full.right() + 0.01);
@@ -221,7 +257,7 @@ mod tests {
 
     #[test]
     fn clicking_a_tab_body_reports_that_document() {
-        let geometry = geometry(bar(), &three(), 8.0, 1.0);
+        let geometry = geometry(bar(), &three(), 8.0, 14.0, 1.0);
         for tab in &geometry.tabs {
             let point = (tab.body.x + tab.body.width / 2.0, tab.body.y + tab.body.height / 2.0);
             assert_eq!(hit(&geometry, point.0, point.1), TabHit::Body(tab.id));
@@ -230,7 +266,7 @@ mod tests {
 
     #[test]
     fn clicking_the_close_control_closes_that_document_rather_than_activating_it() {
-        let geometry = geometry(bar(), &three(), 8.0, 1.0);
+        let geometry = geometry(bar(), &three(), 8.0, 14.0, 1.0);
         for tab in &geometry.tabs {
             let point = (tab.close.x + tab.close.width / 2.0, tab.close.y + tab.close.height / 2.0);
             assert_eq!(
@@ -248,7 +284,7 @@ mod tests {
         let mut tabs = three();
         let third = tabs[2].id;
         tabs.remove(1);
-        let geometry = geometry(bar(), &tabs, 8.0, 1.0);
+        let geometry = geometry(bar(), &tabs, 8.0, 14.0, 1.0);
         let moved = &geometry.tabs[1];
         assert_eq!(moved.id, third);
         assert_eq!(hit(&geometry, moved.body.x + 4.0, moved.body.y + 4.0), TabHit::Body(third));
@@ -256,17 +292,22 @@ mod tests {
 
     #[test]
     fn a_click_on_empty_tab_bar_space_hits_nothing() {
-        let geometry = geometry(bar(), &three(), 8.0, 1.0);
+        let geometry = geometry(bar(), &three(), 8.0, 14.0, 1.0);
         let past_the_end = geometry.tabs.last().unwrap().full.right() + 20.0;
         assert_eq!(hit(&geometry, past_the_end, bar().y + 4.0), TabHit::None);
     }
 
     #[test]
-    fn the_label_is_exactly_as_wide_as_the_cell() {
+    fn the_label_and_its_icon_are_exactly_as_wide_as_the_cell() {
+        // The cell is an icon glyph plus a monospace label. Measuring it as
+        // though it were only one or the other is how the drawn text and the
+        // rectangle a click lands in drift apart along the row.
         for tab in three() {
-            let width = geometry(bar(), std::slice::from_ref(&tab), 8.0, 1.0).tabs[0].full.width;
+            let width =
+                geometry(bar(), std::slice::from_ref(&tab), 8.0, 14.0, 1.0).tabs[0].full.width;
+            let natural = 14.0 + label(&tab).chars().count() as f32 * 8.0;
             assert_eq!(
-                label(&tab).chars().count() as f32 * 8.0,
+                natural.max(crate::layout::TAB_MIN_WIDTH),
                 width,
                 "drawn text and hit geometry must be the same width"
             );
@@ -275,12 +316,16 @@ mod tests {
 
     #[test]
     fn the_close_glyph_lands_where_the_close_rect_is() {
-        let tab = presentation(1, "main.rs", true, false);
-        let geometry = geometry(bar(), std::slice::from_ref(&tab), 8.0, 1.0);
+        // A long enough title that the cell is its natural width rather than
+        // the minimum, so the glyph's own position is what is being checked.
+        let tab = presentation(1, "a-much-longer-name.txt", true, false);
+        let geometry = geometry(bar(), std::slice::from_ref(&tab), 8.0, 14.0, 1.0);
         let rects = &geometry.tabs[0];
         let glyph_index =
             rects.label.chars().position(|character| character == CLOSE_GLYPH).expect("drawn");
-        let glyph_x = rects.full.x + glyph_index as f32 * 8.0;
+        // The icon is shaped before the label, so the glyph's x starts one
+        // icon advance in.
+        let glyph_x = rects.full.x + 14.0 + glyph_index as f32 * 8.0;
         assert!(
             rects.close.contains(glyph_x + 1.0, rects.close.y + 1.0),
             "the close rectangle must cover the glyph the user is aiming at"
@@ -304,8 +349,8 @@ mod tests {
     fn scaling_the_font_moves_the_visual_and_the_hit_region_together() {
         // The rule that makes a future font-size change safe: both rectangles
         // come from the same computation, so neither can be updated alone.
-        let small = geometry(bar(), &three(), 8.0, 1.0);
-        let large = geometry(bar(), &three(), 16.0, 1.0);
+        let small = geometry(bar(), &three(), 8.0, 14.0, 1.0);
+        let large = geometry(bar(), &three(), 16.0, 28.0, 1.0);
         for (small, large) in small.tabs.iter().zip(large.tabs.iter()) {
             assert!(large.full.width > small.full.width);
             assert!(large.close.x > small.close.x);

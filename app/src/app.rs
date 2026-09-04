@@ -166,33 +166,52 @@ fn append_tree_level(
     depth: usize,
     rows: &mut Vec<ListRow>,
 ) {
-    let indent = "  ".repeat(depth);
+    use crate::icons::Icon;
+    use crate::theme::SidebarRowKind;
     match core.workspace().enumerate_children(dir) {
         Ok(entries) => {
             for entry in entries {
                 match entry.kind {
                     ls_core::EntryKind::Directory => {
                         let is_expanded = expanded.contains(&entry.path);
-                        let glyph = if is_expanded { '\u{25be}' } else { '\u{25b8}' };
                         rows.push(ListRow {
-                            label: format!("{indent}{glyph} {}", entry.name),
+                            label: entry.name.clone(),
                             action: Some(ListAction::ToggleDirectory(entry.path.clone())),
+                            depth,
+                            chevron: Some(if is_expanded {
+                                Icon::ChevronDown
+                            } else {
+                                Icon::ChevronRight
+                            }),
+                            icon: Some(
+                                if is_expanded { Icon::FolderOpened } else { Icon::Folder }.into(),
+                            ),
+                            icon_color: None,
+                            kind: SidebarRowKind::Directory,
                         });
                         if is_expanded {
                             append_tree_level(core, expanded, &entry.path, depth + 1, rows);
                         }
                     }
                     _ => {
+                        let file_icon = crate::icons::icon_for_file(&entry.name);
                         rows.push(ListRow {
-                            label: format!("{indent}  {}", entry.name),
+                            label: entry.name.clone(),
                             action: Some(ListAction::OpenFile(entry.path.clone())),
+                            depth,
+                            chevron: None,
+                            icon: Some(file_icon.into()),
+                            icon_color: Some(file_icon.color()),
+                            kind: SidebarRowKind::File,
                         });
                     }
                 }
             }
         }
         Err(error) => {
-            rows.push(ListRow { label: format!("{indent}{error}"), action: None });
+            let mut row = ListRow::message(error.to_string());
+            row.depth = depth;
+            rows.push(row);
         }
     }
 }
@@ -204,6 +223,47 @@ fn append_tree_level(
 /// through a flickering window.
 pub fn should_show_loading_tab(started: Instant, now: Instant) -> bool {
     now.saturating_duration_since(started) >= LOADING_TAB_GRACE
+}
+
+/// Derives the next input focus from what is currently focused and which
+/// surfaces are up. A pure function for the same reason `wheel_target` is:
+/// this is the exact rule behind a real bug (opening a file from the
+/// explorer was typeable for exactly one keystroke -- see `refresh_focus`'s
+/// doc comment for the full story), so it deserves a name and a direct test
+/// rather than being something only observed through a flickering window.
+///
+/// Prompt, Menu, SearchQuery and Find are exclusive: any one of them open
+/// wins outright. Editor, List and Terminal are "resting" focuses that can
+/// coexist with their panel being visible or not -- `current` is only kept
+/// at List or Terminal if it was *already* there and that panel is still up;
+/// entering one of them for the first time is always an explicit choice a
+/// caller makes (`focus_list`/`focus_terminal`), never something derived
+/// here from visibility alone.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_focus(
+    current: InputFocus,
+    prompt_open: bool,
+    menu_open: bool,
+    search_query_open: bool,
+    find_open: bool,
+    list_open: bool,
+    terminal_visible: bool,
+) -> InputFocus {
+    if prompt_open {
+        InputFocus::Prompt
+    } else if menu_open {
+        InputFocus::Menu
+    } else if search_query_open {
+        InputFocus::SearchQuery
+    } else if find_open {
+        InputFocus::Find
+    } else if current == InputFocus::List && list_open {
+        InputFocus::List
+    } else if current == InputFocus::Terminal && terminal_visible {
+        InputFocus::Terminal
+    } else {
+        InputFocus::Editor
+    }
 }
 
 /// Whether an incoming diagnostics version should replace what is applied.
@@ -233,6 +293,20 @@ pub fn sidebar_grip_hit(layout: &Layout, x: f32, y: f32) -> bool {
     x >= border - half && x <= border + half && y >= layout.sidebar.y && y < layout.sidebar.bottom()
 }
 
+/// Whether `(x, y)` is on the bottom panel's resize grip: a strip straddling
+/// its top edge. Same shape as [`sidebar_grip_hit`], on the vertical axis.
+pub fn bottom_panel_grip_hit(layout: &Layout, x: f32, y: f32) -> bool {
+    if !layout.bottom_panel_visible {
+        return false;
+    }
+    let half = (crate::layout::BOTTOM_PANEL_GRIP_HEIGHT * layout.scale) / 2.0;
+    let border = layout.bottom_panel.y;
+    y >= border - half
+        && y <= border + half
+        && x >= layout.activity_bar.right()
+        && x < layout.window.right()
+}
+
 /// How the user answered a confirmation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PromptAnswer {
@@ -247,6 +321,8 @@ enum ListAction {
     OpenFile(PathBuf),
     /// Opens the file and moves the caret to this 1-based line.
     OpenFileAt(PathBuf, usize),
+    /// Switches to an already-open document, from the Open Editors section.
+    ActivateTab(DocumentId),
     /// Expands this directory if it was collapsed, or collapses it if it was
     /// open -- a real tree, where several branches can be open across the
     /// whole workspace at once, not a single-directory drill-down.
@@ -259,6 +335,48 @@ enum ListAction {
 struct ListRow {
     label: String,
     action: Option<ListAction>,
+    /// Nesting depth, in tree levels. Indentation is applied when the row is
+    /// composed for drawing, not baked into `label`, so hit testing and the
+    /// text stay independent of each other.
+    depth: usize,
+    /// The expand/collapse chevron, for rows that have children.
+    chevron: Option<crate::icons::Icon>,
+    /// The row's own icon: a folder (chrome glyph) or a file (Material
+    /// Design Icons glyph, by extension) -- either converts to a `Glyph`, so
+    /// this field does not need to know which.
+    icon: Option<crate::icons::Glyph>,
+    /// Overrides the row-kind-based default icon color set in
+    /// `sidebar_rows` -- used for file icons, which each carry their own
+    /// characteristic color the way `material-icon-theme` colors them,
+    /// unlike the folder glyph or header chevron, which follow the row's
+    /// kind instead.
+    icon_color: Option<crate::theme::Color>,
+    kind: crate::theme::SidebarRowKind,
+}
+
+impl ListRow {
+    /// A row with no icons and no action: a message, or a section header.
+    fn message(label: impl Into<String>) -> Self {
+        ListRow {
+            label: label.into(),
+            action: None,
+            depth: 0,
+            chevron: None,
+            icon: None,
+            icon_color: None,
+            kind: crate::theme::SidebarRowKind::Info,
+        }
+    }
+
+    fn with_kind(mut self, kind: crate::theme::SidebarRowKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
+    fn with_icon(mut self, icon: impl Into<crate::icons::Glyph>) -> Self {
+        self.icon = Some(icon.into());
+        self
+    }
 }
 
 /// Which navigable list is on screen. Items 6, 7 and 11 (file tree, workspace
@@ -271,6 +389,24 @@ enum ListKind {
     SearchResults,
     GitStatus,
 }
+
+/// The persistent activity bar's icons, top to bottom -- Explorer, Search,
+/// Source Control, Extensions, Debug, matching Lapce's own default order.
+const ACTIVITY_ICONS: [crate::icons::Icon; 5] = [
+    crate::icons::Icon::Files,
+    crate::icons::Icon::Search,
+    crate::icons::Icon::SourceControl,
+    crate::icons::Icon::Extensions,
+    crate::icons::Icon::Debug,
+];
+
+/// Which activity-bar row (by index into [`ACTIVITY_LABELS`]) is wired to a
+/// real action. `Extensions` and `Debug` have no subsystem behind them --
+/// they render dimmed and inert, present for layout fidelity rather than
+/// faking a feature that does not exist.
+const ACTIVITY_EXPLORER: usize = 0;
+const ACTIVITY_SEARCH: usize = 1;
+const ACTIVITY_SOURCE_CONTROL: usize = 2;
 
 /// What the editor is waiting for the user to decide.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,6 +556,13 @@ pub struct LightSpeed {
     /// header, see `sidebar_selected_row`) the pointer is currently over, for
     /// a hover highlight distinct from the selection.
     sidebar_hovered_row: Option<usize>,
+    /// The bottom panel's height in logical pixels, dragged via the grip on
+    /// its top edge. Same shape as `sidebar_width`, on the vertical axis.
+    bottom_panel_height: f32,
+    dragging_bottom_panel: bool,
+    bottom_panel_grip_hovered: bool,
+    /// Which activity-bar row the pointer is over, if any.
+    activity_hovered: Option<usize>,
     /// The workspace-search query as it is being typed, before Enter submits
     /// it. `None` when the search bar is not open.
     search_query_input: Option<String>,
@@ -540,6 +683,10 @@ impl LightSpeed {
             dragging_sidebar: false,
             sidebar_grip_hovered: false,
             sidebar_hovered_row: None,
+            bottom_panel_height: crate::layout::BOTTOM_PANEL_HEIGHT,
+            dragging_bottom_panel: false,
+            bottom_panel_grip_hovered: false,
+            activity_hovered: None,
             search_query_input: None,
             pending_jump: None,
             terminal: None,
@@ -1123,6 +1270,28 @@ impl LightSpeed {
             return;
         }
 
+        if bottom_panel_grip_hit(&layout, x, y) {
+            self.dragging_bottom_panel = true;
+            return;
+        }
+
+        if let Some(index) =
+            crate::layout::icon_rail_hit(layout.activity_bar, ACTIVITY_ICONS.len(), x, y)
+        {
+            self.activate_activity_item(index);
+            return;
+        }
+
+        if layout.bottom_panel_visible && layout.bottom_panel_rail.contains(x, y) {
+            self.toggle_terminal();
+            return;
+        }
+
+        if layout.bottom_panel_visible && layout.bottom_panel.contains(x, y) {
+            self.focus_terminal();
+            return;
+        }
+
         if layout.tab_bar.contains(x, y) {
             // The close control is its own region, resolved before the body, so
             // closing a tab never activates it on the way past.
@@ -1141,6 +1310,11 @@ impl LightSpeed {
         }
 
         if layout.sidebar_visible && layout.sidebar.contains(x, y) && self.active_list.is_some() {
+            // Clicking anywhere in the panel claims its focus outright, the
+            // same as clicking a tab claims the editor's -- otherwise a click
+            // on a row while the editor happened to have focus would select
+            // the row but leave the keyboard pointed at the document.
+            self.focus_list();
             // Row 0 is the header, drawn but not itself a list entry.
             let row = ((y - layout.sidebar.y) / layout.metrics.line_height) as usize;
             if row >= 1 {
@@ -1155,6 +1329,10 @@ impl LightSpeed {
         }
 
         if layout.text.contains(x, y) || layout.gutter.contains(x, y) {
+            // Claiming the editor's focus here, rather than leaving it to be
+            // derived later, is what lets a click reclaim the keyboard from
+            // the sidebar or terminal while either stays visibly open.
+            self.focus = InputFocus::Editor;
             self.place_cursor_at(x, y, self.modifiers.contains(ModifiersState::SHIFT));
             match click_count {
                 2 => self.select_word_at_cursor(),
@@ -1168,13 +1346,21 @@ impl LightSpeed {
     /// Tracks the two things the sidebar cares about on plain pointer
     /// movement (no button down): the resize cursor over its grip, and which
     /// row -- if any -- is under the pointer, for a hover highlight.
-    fn update_sidebar_interaction(&mut self, layout: &Layout) {
-        let grip_hovered = sidebar_grip_hit(layout, self.pointer.0, self.pointer.1);
-        if grip_hovered != self.sidebar_grip_hovered {
-            self.sidebar_grip_hovered = grip_hovered;
+    fn update_pointer_interaction(&mut self, layout: &Layout) {
+        let sidebar_grip_hovered = sidebar_grip_hit(layout, self.pointer.0, self.pointer.1);
+        let bottom_panel_grip_hovered =
+            bottom_panel_grip_hit(layout, self.pointer.0, self.pointer.1);
+
+        if sidebar_grip_hovered != self.sidebar_grip_hovered
+            || bottom_panel_grip_hovered != self.bottom_panel_grip_hovered
+        {
+            self.sidebar_grip_hovered = sidebar_grip_hovered;
+            self.bottom_panel_grip_hovered = bottom_panel_grip_hovered;
             if let Some(window) = self.window.as_ref() {
-                let icon = if grip_hovered {
+                let icon = if sidebar_grip_hovered {
                     winit::window::CursorIcon::ColResize
+                } else if bottom_panel_grip_hovered {
+                    winit::window::CursorIcon::RowResize
                 } else {
                     winit::window::CursorIcon::Default
                 };
@@ -1183,9 +1369,10 @@ impl LightSpeed {
         }
 
         let (x, y) = self.pointer;
+        let any_grip_hovered = sidebar_grip_hovered || bottom_panel_grip_hovered;
         let hovered_row = if layout.sidebar_visible
             && layout.sidebar.contains(x, y)
-            && !grip_hovered
+            && !any_grip_hovered
             && self.active_list.is_some()
         {
             let row = ((y - layout.sidebar.y) / layout.metrics.line_height) as usize;
@@ -1195,6 +1382,16 @@ impl LightSpeed {
         };
         if hovered_row != self.sidebar_hovered_row {
             self.sidebar_hovered_row = hovered_row;
+            self.request_redraw();
+        }
+
+        let activity_hovered = if any_grip_hovered {
+            None
+        } else {
+            crate::layout::icon_rail_hit(layout.activity_bar, ACTIVITY_ICONS.len(), x, y)
+        };
+        if activity_hovered != self.activity_hovered {
+            self.activity_hovered = activity_hovered;
             self.request_redraw();
         }
     }
@@ -1300,60 +1497,107 @@ impl LightSpeed {
     }
 
     /// Left half of the status bar.
-    fn status_left(&self) -> String {
+    /// Left half of the status bar, in Lapce's arrangement: the branch first,
+    /// then the diagnostic counts, then whatever transient message the shell
+    /// most recently had to say.
+    fn status_left(&self) -> crate::text::RichText {
+        use crate::icons::Icon;
+        let mut rich = crate::text::RichText::new();
+
+        if let Some(status) = self.core.git_status() {
+            if let Some(branch) = &status.branch {
+                rich.icon(Icon::GitBranch, self.theme.status_text);
+                rich.plain(" ");
+                // Lapce marks a dirty working tree with a trailing asterisk
+                // rather than a second glyph.
+                let dirty = if status.is_clean() { "" } else { "*" };
+                rich.colored(&format!("{branch}{dirty}"), self.theme.status_text);
+                rich.plain("   ");
+            }
+        }
+
+        let (errors, warnings) = self.diagnostic_counts();
+        rich.icon(Icon::Error, self.theme.status_text);
+        rich.colored(&format!(" {errors}  "), self.theme.status_text);
+        rich.icon(Icon::Warning, self.theme.status_text);
+        rich.colored(&format!(" {warnings}"), self.theme.status_text);
+
+        // A transient message (a save failure, a load rejection) outranks the
+        // steady-state readout for as long as it is live.
         if let Some((message, at, _)) = &self.status_message {
             if at.elapsed() < STATUS_MESSAGE_TIME {
-                return message.clone();
+                rich.plain("   ");
+                rich.colored(message, self.status_color());
+                return rich;
             }
         }
         if let Some(summary) = devpanel::status_summary(&self.core) {
-            return summary;
+            rich.plain("   ");
+            rich.colored(&summary, self.theme.status_text);
+        } else {
+            let state = self.document_state_label();
+            if !state.is_empty() {
+                rich.plain("   ");
+                rich.colored(state, self.theme.dim_text);
+            }
         }
-        // Everything here is read from core state; the status bar keeps none
-        // of its own.
-        match self.core.active_document() {
-            Some(document) => {
-                let (line, column) = self.cursor_line_column().unwrap_or((0, 0));
-                let mut line_ending = document.line_ending().label().to_string();
-                if document.has_mixed_line_endings() {
-                    line_ending.push_str(" (mixed)");
+        rich
+    }
+
+    /// Error and warning counts across every open document, the number Lapce
+    /// puts next to its two status-bar glyphs.
+    fn diagnostic_counts(&self) -> (usize, usize) {
+        let mut errors = 0;
+        let mut warnings = 0;
+        for tab in self.core.tabs() {
+            let Some(document) = self.core.document(*tab) else { continue };
+            for diagnostic in document.diagnostics() {
+                match diagnostic.severity {
+                    ls_core::DiagnosticSeverity::Error => errors += 1,
+                    ls_core::DiagnosticSeverity::Warning => warnings += 1,
+                    _ => {}
                 }
-                format!(
-                    "Ln {}, Col {}    {}    {}    {}    {}",
+            }
+        }
+        (errors, warnings)
+    }
+
+    /// Right half of the status bar.
+    /// Right half of the status bar: cursor position, encoding, line ending
+    /// and language -- Lapce's order, and the panel toggles it ends with.
+    ///
+    /// The process readouts (RAM, CPU, frame time) that used to live here are
+    /// still available in the performance overlay (F12); the status bar is
+    /// for the document, not for the profiler.
+    fn status_right(&self) -> crate::text::RichText {
+        use crate::icons::Icon;
+        let mut rich = crate::text::RichText::new();
+        rich.icon(Icon::LayoutSidebarLeft, self.theme.dim_text);
+        rich.plain("  ");
+        rich.icon(Icon::LayoutPanel, self.theme.dim_text);
+        rich.plain("   ");
+
+        if let Some(document) = self.core.active_document() {
+            let (line, column) = self.cursor_line_column().unwrap_or((0, 0));
+            let mut line_ending = document.line_ending().label().to_string();
+            if document.has_mixed_line_endings() {
+                line_ending.push_str(" (mixed)");
+            }
+            rich.colored(
+                &format!(
+                    "Ln {}, Col {}   {}   {}   {}",
                     line + 1,
                     column + 1,
                     document.encoding().label(),
                     line_ending,
                     document.language().name(),
-                    self.document_state_label(),
-                )
-            }
-            None => match self.core.active() {
-                Some(_) => format!("{}    {}", self.document_state_label(), keymap::HINTS),
-                None => format!("No document open.   {}", keymap::HINTS),
-            },
+                ),
+                self.theme.status_text,
+            );
+        } else {
+            rich.colored(keymap::HINTS, self.theme.dim_text);
         }
-    }
-
-    /// Right half of the status bar.
-    fn status_right(&self) -> String {
-        let frame = self.metrics.frame.stats();
-        let input = self.metrics.input_to_state.stats();
-        let mut parts: Vec<String> = Vec::with_capacity(6);
-        if let Some(document) = self.core.active_document() {
-            if let Some(path) = document.path() {
-                parts.push(path.display_string());
-            }
-        }
-        parts.push(format!("RAM {:.0} MB", self.process_stats.rss_mb()));
-        parts.push(format!("CPU {:.0}%", self.process_stats.cpu_percent));
-        if input.count > 0 {
-            parts.push(format!("input {}", ls_perf::format_duration(input.p95)));
-        }
-        if frame.count > 0 {
-            parts.push(format!("frame {}", ls_perf::format_duration(frame.p95)));
-        }
-        parts.join("   ")
+        rich
     }
 
     /// Gives the editor input focus and puts the caret back on screen.
@@ -1369,26 +1613,54 @@ impl LightSpeed {
         self.request_redraw();
     }
 
+    /// Gives the sidebar list (file tree / search results / git status)
+    /// input focus. An explicit action, the same as `focus_editor`, and for
+    /// the same reason: since the panel now stays open after the user opens
+    /// a file from it (a docked panel, not a modal picker), `refresh_focus`
+    /// can no longer treat "the panel is visible" as "the panel is focused"
+    /// -- entering List focus has to be something a caller asks for.
+    fn focus_list(&mut self) {
+        self.menu.close();
+        self.focus = InputFocus::List;
+        self.request_redraw();
+    }
+
+    /// Gives the terminal panel input focus. Same reasoning as `focus_list`:
+    /// the terminal stays visible after it loses focus (clicking back into
+    /// the editor does not close it), so entering its focus is explicit too.
+    fn focus_terminal(&mut self) {
+        self.menu.close();
+        self.focus = InputFocus::Terminal;
+        self.request_redraw();
+    }
+
     /// Recomputes the input target from the surfaces that are up.
     ///
-    /// Focus is derived, not accumulated: there is no way for it to be left
-    /// pointing at a menu that has since closed.
+    /// Prompt, Menu, SearchQuery and Find are genuinely exclusive: while any
+    /// of them is up, nothing else can reasonably hold the keyboard, so they
+    /// are derived fresh every time. Editor, List and Terminal are not --
+    /// the file tree and the terminal both stay visible after the user's
+    /// attention moves elsewhere (see `focus_list`/`focus_terminal`), so
+    /// visibility alone can no longer decide between them the way it used
+    /// to. This is the fix for a real bug: opening a file from the explorer
+    /// left it typeable for exactly one keystroke, because the very next
+    /// `refresh_focus` call -- triggered by the load simply finishing --
+    /// saw the still-open file tree and handed focus straight back to it.
+    /// A resting focus (Editor/List/Terminal) is now left alone unless its
+    /// own surface has closed out from under it, in which case it falls
+    /// back to the editor; entering List or Terminal in the first place is
+    /// always an explicit call to `focus_list`/`focus_terminal`, never
+    /// something this function decides on its own.
     fn refresh_focus(&mut self) {
-        self.focus = if self.prompt.is_some() {
-            InputFocus::Prompt
-        } else if self.menu.is_open() {
-            InputFocus::Menu
-        } else if self.terminal_visible {
-            InputFocus::Terminal
-        } else if self.search_query_input.is_some() {
-            InputFocus::SearchQuery
-        } else if self.active_list.is_some() {
-            InputFocus::List
-        } else if self.core.is_find_open() {
-            InputFocus::Find
-        } else {
-            InputFocus::Editor
-        };
+        self.focus = derive_focus(
+            self.focus,
+            self.prompt.is_some(),
+            self.menu.is_open(),
+            self.search_query_input.is_some(),
+            self.core.is_find_open(),
+            self.active_list.is_some(),
+            self.terminal_visible,
+        );
     }
 
     /// Activates a tab and moves editing focus to it.
@@ -1474,73 +1746,130 @@ impl LightSpeed {
     /// only reads directories the user actually expanded (never a recursive
     /// walk), so nothing here is worth caching and nothing can go stale.
     fn list_rows(&self) -> Vec<ListRow> {
+        use crate::icons::Icon;
+        use crate::theme::SidebarRowKind;
         let root = self.core.workspace().root().map(|c| c.as_path().to_path_buf());
         match self.active_list {
             None => Vec::new(),
-            Some(ListKind::FileTree) => match &self.file_tree_root {
-                Some(tree_root) => {
-                    let mut rows = Vec::new();
-                    self.append_tree_level(tree_root, 0, &mut rows);
-                    if rows.is_empty() {
-                        rows.push(ListRow { label: "(empty)".to_string(), action: None });
-                    }
-                    rows
+            // Lapce's explorer is two stacked, collapsible sections: the
+            // documents that are open, then the workspace tree.
+            Some(ListKind::FileTree) => {
+                let mut rows = Vec::new();
+                rows.push(
+                    ListRow::message("OPEN EDITORS")
+                        .with_kind(SidebarRowKind::Header)
+                        .with_icon(Icon::ChevronDown),
+                );
+                for tab in self.core.tab_presentations() {
+                    let file_icon = crate::icons::icon_for_file(&tab.title);
+                    rows.push(
+                        ListRow {
+                            label: tab.title.clone(),
+                            action: Some(ListAction::ActivateTab(tab.id)),
+                            depth: 1,
+                            chevron: None,
+                            icon: Some(file_icon.into()),
+                            icon_color: Some(file_icon.color()),
+                            kind: SidebarRowKind::File,
+                        }
+                        .with_kind(if tab.active {
+                            SidebarRowKind::Directory
+                        } else {
+                            SidebarRowKind::File
+                        }),
+                    );
                 }
-                None => Vec::new(),
-            },
+                rows.push(
+                    ListRow::message("FILE EXPLORER")
+                        .with_kind(SidebarRowKind::Header)
+                        .with_icon(Icon::ChevronDown),
+                );
+                if let Some(tree_root) = &self.file_tree_root {
+                    let before = rows.len();
+                    self.append_tree_level(tree_root, 0, &mut rows);
+                    if rows.len() == before {
+                        rows.push(ListRow::message("(empty)"));
+                    }
+                } else {
+                    rows.push(ListRow::message("No folder opened"));
+                }
+                rows
+            }
             Some(ListKind::GitStatus) => match self.core.git_status() {
                 Some(status) if status.is_clean() => {
-                    vec![ListRow { label: "Working tree clean".to_string(), action: None }]
+                    vec![ListRow::message("Working tree clean")]
                 }
                 Some(status) => status
                     .files
                     .iter()
                     .map(|file| {
-                        let flag = if file.staged { "staged  " } else { "        " };
                         let full = root.as_ref().map(|r| r.join(&file.path));
-                        ListRow {
-                            label: format!("{flag}{:?}  {}", file.state, file.path.display()),
-                            action: full.map(ListAction::OpenFile),
-                        }
+                        let file_icon =
+                            crate::icons::icon_for_file(&file.path.display().to_string());
+                        let mut row = ListRow {
+                            label: format!(
+                                "{}{}",
+                                file.path.display(),
+                                if file.staged { "  (staged)" } else { "" }
+                            ),
+                            action: None,
+                            depth: 0,
+                            chevron: None,
+                            icon: Some(file_icon.into()),
+                            icon_color: Some(file_icon.color()),
+                            kind: SidebarRowKind::File,
+                        };
+                        row.action = full.map(ListAction::OpenFile);
+                        row
                     })
                     .collect(),
                 None if self.core.is_git_status_pending() => {
-                    vec![ListRow { label: "Checking git status...".to_string(), action: None }]
+                    vec![ListRow::message("Checking git status...")]
                 }
-                None => vec![ListRow {
-                    label: "Not a git repository, or git is not installed".to_string(),
-                    action: None,
-                }],
+                None => {
+                    vec![ListRow::message("Not a git repository, or git is not installed")]
+                }
             },
             Some(ListKind::SearchResults) => match self.core.workspace_search_result() {
-                Some(result) if result.hits.is_empty() => vec![ListRow {
-                    label: format!("No matches for \"{}\"", result.query),
-                    action: None,
-                }],
+                Some(result) if result.hits.is_empty() => {
+                    vec![ListRow::message(format!("No matches for \"{}\"", result.query))]
+                }
                 Some(result) => {
                     let mut rows: Vec<ListRow> = result
                         .hits
                         .iter()
-                        .map(|hit| ListRow {
-                            label: format!(
-                                "{}:{}  {}",
-                                hit.path.display(),
-                                hit.line_number,
-                                hit.preview
-                            ),
-                            action: Some(ListAction::OpenFileAt(hit.path.clone(), hit.line_number)),
+                        .map(|hit| {
+                            let name = hit
+                                .path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().to_string())
+                                .unwrap_or_else(|| hit.path.display().to_string());
+                            let file_icon = crate::icons::icon_for_file(&name);
+                            ListRow {
+                                label: format!(
+                                    "{name}:{}  {}",
+                                    hit.line_number,
+                                    hit.preview.trim()
+                                ),
+                                action: Some(ListAction::OpenFileAt(
+                                    hit.path.clone(),
+                                    hit.line_number,
+                                )),
+                                depth: 0,
+                                chevron: None,
+                                icon: Some(file_icon.into()),
+                                icon_color: Some(file_icon.color()),
+                                kind: SidebarRowKind::File,
+                            }
                         })
                         .collect();
                     if result.truncated {
-                        rows.push(ListRow {
-                            label: "... more results exist; narrow the query".to_string(),
-                            action: None,
-                        });
+                        rows.push(ListRow::message("... more results exist; narrow the query"));
                     }
                     rows
                 }
                 None if self.core.is_workspace_search_pending() => {
-                    vec![ListRow { label: "Searching...".to_string(), action: None }]
+                    vec![ListRow::message("Searching...")]
                 }
                 None => Vec::new(),
             },
@@ -1577,8 +1906,7 @@ impl LightSpeed {
         self.file_tree_root = Some(start);
         self.list_selected = 0;
         self.active_list = Some(ListKind::FileTree);
-        self.refresh_focus();
-        self.request_redraw();
+        self.focus_list();
     }
 
     /// Opens the native folder picker and, if the user chooses one, opens it
@@ -1603,8 +1931,7 @@ impl LightSpeed {
                 self.file_tree_root = Some(dir);
                 self.list_selected = 0;
                 self.active_list = Some(ListKind::FileTree);
-                self.refresh_focus();
-                self.request_redraw();
+                self.focus_list();
             }
             Ok(None) => {}
             Err(error) => {
@@ -1627,8 +1954,7 @@ impl LightSpeed {
         }
         self.active_list = Some(ListKind::GitStatus);
         self.list_selected = 0;
-        self.refresh_focus();
-        self.request_redraw();
+        self.focus_list();
     }
 
     fn open_search_query(&mut self) {
@@ -1660,8 +1986,7 @@ impl LightSpeed {
             }
         }
         self.terminal_visible = true;
-        self.refresh_focus();
-        self.request_redraw();
+        self.focus_terminal();
     }
 
     fn drain_terminal_output(&mut self) {
@@ -1793,7 +2118,8 @@ impl LightSpeed {
     /// The terminal panel's rows: a fixed window of the scrollback plus the
     /// line being typed, in the same `Vec<String>` shape every other panel
     /// uses.
-    fn terminal_rows(&self) -> Vec<String> {
+    /// Rows for the docked bottom panel's terminal content.
+    fn bottom_panel_rows(&self) -> Vec<String> {
         let mut rows = Vec::new();
         rows.push("Terminal  (Enter to run, F11 to hide)".to_string());
         let visible_lines = 12;
@@ -1837,9 +2163,10 @@ impl LightSpeed {
                 // a file from the explorer or git status leaves it open, the
                 // way VS Code's does, instead of yanking it away every time.
                 // `open_path` already moves keyboard focus to the editor (via
-                // `adopt_new_document`), so this must not call
-                // `refresh_focus` afterwards -- that would see `active_list`
-                // still set and hand focus straight back to the list.
+                // `adopt_new_document`); `refresh_focus` now leaves an
+                // Editor-resting focus alone regardless of the panel still
+                // being open (see its doc comment), so there is nothing left
+                // to do here.
                 self.open_path(path);
                 self.request_redraw();
                 return;
@@ -1847,6 +2174,13 @@ impl LightSpeed {
             Some(ListAction::OpenFileAt(path, line)) => {
                 self.pending_jump = Some((path.clone(), line));
                 self.open_path(path);
+                self.request_redraw();
+                return;
+            }
+            Some(ListAction::ActivateTab(id)) => {
+                // Open Editors rows switch to a document that is already
+                // loaded; `activate_tab` moves focus to the editor itself.
+                self.activate_tab(id);
                 self.request_redraw();
                 return;
             }
@@ -1931,6 +2265,56 @@ impl LightSpeed {
         self.active_list.is_some() || self.search_query_input.is_some()
     }
 
+    /// Whether the docked bottom panel should be shown this frame. Terminal
+    /// is the only tenant it has today (Lapce also docks Search/Problem
+    /// there; we have neither as a real panel yet), so this is exactly
+    /// `terminal_visible` for now, named separately because the layout and
+    /// the panel-switching UI treat it as its own dock, not as "the
+    /// terminal's own state" -- the same way `sidebar_visible` is its own
+    /// concept even though today it is driven by `active_list`.
+    fn bottom_panel_visible(&self) -> bool {
+        self.terminal_visible
+    }
+
+    /// Which activity-bar row corresponds to the sidebar's current state, if
+    /// any -- so its cell reads as "cut into" the editor. Typing a search
+    /// query counts as Search being active even before any request has
+    /// gone out, matching how `sidebar_visible` already treats it.
+    fn activity_active_index(&self) -> Option<usize> {
+        if self.search_query_input.is_some() {
+            return Some(ACTIVITY_SEARCH);
+        }
+        match self.active_list {
+            Some(ListKind::FileTree) => Some(ACTIVITY_EXPLORER),
+            Some(ListKind::SearchResults) => Some(ACTIVITY_SEARCH),
+            Some(ListKind::GitStatus) => Some(ACTIVITY_SOURCE_CONTROL),
+            None => None,
+        }
+    }
+
+    /// Handles a click on activity-bar row `index`. Clicking the item that
+    /// is already active closes its panel, the same toggle behavior the
+    /// keyboard shortcuts for these panels already have. Extensions and
+    /// Debug (indices 3 and 4) are inert: there is no subsystem behind them.
+    fn activate_activity_item(&mut self, index: usize) {
+        let already_active = self.activity_active_index() == Some(index);
+        match index {
+            ACTIVITY_EXPLORER => self.toggle_file_tree(),
+            ACTIVITY_SEARCH => {
+                if already_active {
+                    self.active_list = None;
+                    self.search_query_input = None;
+                    self.refresh_focus();
+                    self.request_redraw();
+                } else {
+                    self.open_search_query();
+                }
+            }
+            ACTIVITY_SOURCE_CONTROL => self.toggle_git_status(),
+            _ => {}
+        }
+    }
+
     /// Rows for the docked sidebar, each tagged with what kind of row it is
     /// (`theme::SidebarRowKind`) so the renderer can color folders, files,
     /// the header, and plain messages differently -- the nearest this
@@ -1942,49 +2326,190 @@ impl LightSpeed {
     /// width, using its own font metrics -- so a name that fits a wide,
     /// user-dragged panel is never clipped mid-character the way a
     /// fixed-width assumption would.
-    fn sidebar_rows(&self, layout: &Layout) -> Vec<(String, crate::theme::SidebarRowKind)> {
+    fn sidebar_rows(&self, layout: &Layout) -> crate::text::RichText {
+        use crate::icons::Icon;
+        use crate::text::RichText;
         use crate::theme::SidebarRowKind;
-        let padding = 16.0 * layout.scale;
-        let max_chars = (((layout.sidebar.width - padding) / layout.metrics.digit_width.max(1.0))
+
+        let mut rich = RichText::new();
+        // How many monospace characters fit after the widest icon prefix, so
+        // a long name ends in an ellipsis rather than running under the
+        // editor.
+        let prefix = 16.0 * layout.scale + layout.metrics.icon_width * 3.0;
+        let max_chars = (((layout.sidebar.width - prefix) / layout.metrics.digit_width.max(1.0))
             as usize)
             .max(4);
-        let truncate = |label: String| -> String {
+        let truncate = |label: &str| -> String {
             if label.chars().count() <= max_chars {
-                return label;
+                return label.to_string();
             }
             let mut truncated: String = label.chars().take(max_chars.saturating_sub(1)).collect();
             truncated.push('\u{2026}');
             truncated
         };
 
+        // While a query is being typed, the panel is the search field: a
+        // magnifier, then what has been typed so far, then a caret.
         if let Some(query) = &self.search_query_input {
-            return vec![
-                (
-                    truncate("Search  (Enter to run, Esc to cancel)".to_string()),
-                    SidebarRowKind::Header,
-                ),
-                (truncate(format!("  {query}\u{2588}")), SidebarRowKind::Info),
-            ];
+            rich.colored("SEARCH", self.theme.dim_text).newline();
+            rich.icon(Icon::Search, self.theme.activity_icon_active);
+            rich.plain(" ");
+            rich.colored(&truncate(query), self.theme.text);
+            rich.colored("\u{2588}", self.theme.cursor);
+            return rich;
         }
-        let Some(kind) = self.active_list else { return Vec::new() };
+
+        let Some(kind) = self.active_list else { return rich };
         let title = match kind {
-            ListKind::FileTree => "Explorer",
-            ListKind::SearchResults => "Search Results",
-            ListKind::GitStatus => "Source Control",
+            ListKind::FileTree => "EXPLORER",
+            ListKind::SearchResults => "SEARCH",
+            ListKind::GitStatus => "SOURCE CONTROL",
         };
-        let mut rows =
-            vec![(truncate(format!("{title}  (Up/Down, Enter, Esc)")), SidebarRowKind::Header)];
+        rich.colored(title, self.theme.dim_text);
+
         for row in self.list_rows() {
-            let row_kind = match row.action {
-                Some(ListAction::ToggleDirectory(_)) => SidebarRowKind::Directory,
-                Some(ListAction::OpenFile(_)) | Some(ListAction::OpenFileAt(_, _)) => {
-                    SidebarRowKind::File
-                }
-                None => SidebarRowKind::Info,
+            rich.newline();
+            // Indentation is monospace spaces; the icon columns that follow
+            // are icon-width, so every row at the same depth lines up.
+            rich.plain(&"  ".repeat(row.depth));
+            match row.chevron {
+                Some(chevron) => rich.icon(chevron, self.theme.dim_text),
+                None if row.kind == SidebarRowKind::Header => &mut rich,
+                None => rich.icon_space(),
             };
-            rows.push((truncate(row.label), row_kind));
+            if let Some(icon) = row.icon {
+                // A file's icon carries its own characteristic color
+                // (`icon_color`, set alongside it by `icon_for_file`) --
+                // only the folder glyph and header chevron fall back to a
+                // kind-based default.
+                let color = row.icon_color.unwrap_or(match row.kind {
+                    SidebarRowKind::Header => self.theme.dim_text,
+                    SidebarRowKind::Directory => self.theme.sidebar_folder,
+                    _ => self.theme.dim_text,
+                });
+                rich.icon(icon, color);
+                rich.plain(" ");
+            }
+            rich.colored(&truncate(&row.label), self.theme.sidebar_row_color(row.kind));
         }
-        rows
+        rich
+    }
+
+    /// The activity bar's icon column: one glyph per cell, the active one
+    /// bright and the rest dim, padded so each lands in the middle of the
+    /// square cell its highlight quad occupies.
+    /// One icon glyph per line, one line per activity item -- `set_icon_cluster`
+    /// gives each line exactly one cell's worth of height, so this no longer
+    /// needs the blank-line padding a fixed UI-text line height used to
+    /// require to make one icon land in each square cell.
+    fn activity_rich(&self) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        for (index, icon) in ACTIVITY_ICONS.iter().enumerate() {
+            if index > 0 {
+                rich.newline();
+            }
+            let color = if self.activity_active_index() == Some(index) {
+                self.theme.activity_icon_active
+            } else {
+                self.theme.activity_icon_inactive
+            };
+            rich.icon(*icon, color);
+        }
+        rich
+    }
+
+    /// The bottom panel's icon rail. Only the terminal lives there today.
+    fn bottom_panel_rail_rich(&self) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        if self.bottom_panel_visible() {
+            rich.icon(crate::icons::Icon::Terminal, self.theme.activity_icon_active);
+        }
+        rich
+    }
+
+    /// The header's left cluster: the menu button that replaced the old
+    /// File/Edit/View bar.
+    fn title_left_rich(&self) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        rich.icon(crate::icons::Icon::Menu, self.theme.activity_icon_active);
+        rich
+    }
+
+    /// The header's centered command field: a magnifier and the workspace
+    /// name, the way Lapce shows the palette's entry point.
+    fn title_center_rich(&self) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        let name = self
+            .core
+            .workspace()
+            .root()
+            .and_then(|root| {
+                root.as_path().file_name().map(|name| name.to_string_lossy().to_string())
+            })
+            .unwrap_or_else(|| "Open Folder".to_string());
+        rich.icon(crate::icons::Icon::Search, self.theme.dim_text);
+        rich.plain(" ");
+        rich.colored(&name, self.theme.text);
+        rich
+    }
+
+    /// The tab row's leading navigation cluster.
+    fn tab_nav_rich(&self) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        rich.icon(crate::icons::Icon::ArrowLeft, self.theme.activity_icon_inactive);
+        rich.plain(" ");
+        rich.icon(crate::icons::Icon::ArrowRight, self.theme.activity_icon_inactive);
+        rich
+    }
+
+    /// The tab row's trailing split/close cluster.
+    fn tab_actions_rich(&self) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        rich.icon(crate::icons::Icon::SplitHorizontal, self.theme.activity_icon_inactive);
+        rich.plain(" ");
+        rich.icon(crate::icons::Icon::Close, self.theme.activity_icon_inactive);
+        rich
+    }
+
+    /// The header's right cluster: run and settings.
+    fn title_right_rich(&self) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        rich.icon(crate::icons::Icon::Play, self.theme.activity_icon_active);
+        rich.plain(" ");
+        rich.icon(crate::icons::Icon::SettingsGear, self.theme.activity_icon_active);
+        rich
+    }
+
+    /// The breadcrumb trail under the tab bar: the active document's path,
+    /// one segment at a time, exactly as Lapce shows it.
+    fn breadcrumb_rich(&self) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        let Some(document) = self.core.active_document() else { return rich };
+        let Some(path) = document.path() else {
+            rich.colored(document.display_name(), self.theme.dim_text);
+            return rich;
+        };
+        // Relative to the workspace root when there is one, so the trail
+        // reads as project structure rather than as a disk path.
+        let full = path.as_path();
+        let relative = self
+            .core
+            .workspace()
+            .root()
+            .and_then(|root| full.strip_prefix(root.as_path()).ok())
+            .unwrap_or(full);
+        let mut first = true;
+        for segment in relative.components() {
+            let text = segment.as_os_str().to_string_lossy();
+            if !first {
+                rich.plain(" ");
+                rich.icon(crate::icons::Icon::ChevronRight, self.theme.dim_text);
+                rich.plain(" ");
+            }
+            first = false;
+            rich.colored(&text, self.theme.dim_text);
+        }
+        rich
     }
 
     /// Which sidebar row is selected, in the row numbering `sidebar_rows`
@@ -1999,13 +2524,11 @@ impl LightSpeed {
 
     /// Rows for the floating performance/dev-tool panel, top-right. The
     /// explorer/search/git list lives in the docked sidebar instead (see
-    /// `sidebar_rows`), not here -- this panel is diagnostics, not the UI the
-    /// user works in day to day.
+    /// `sidebar_rows`), and the terminal lives in the docked bottom panel
+    /// (see `bottom_panel_rows`) -- neither belongs here any more; this
+    /// panel is diagnostics, not the UI the user works in day to day.
     fn panel_rows(&self) -> Vec<String> {
         let mut rows = Vec::new();
-        if self.terminal_visible {
-            rows.extend(self.terminal_rows());
-        }
         if self.dev_panel_visible {
             if !rows.is_empty() {
                 rows.push(String::new());
@@ -2100,6 +2623,8 @@ impl LightSpeed {
             self.show_status_bar,
             self.sidebar_visible(),
             self.sidebar_width,
+            self.bottom_panel_visible(),
+            self.bottom_panel_height,
         );
         self.last_layout = Some(layout);
         self.core.set_page_lines(layout.visible_lines());
@@ -2147,7 +2672,7 @@ impl LightSpeed {
 
         let recent_rows = self.recent_rows();
         let geometry = menu::geometry(
-            layout.menu_bar,
+            layout.title_menu_button,
             self.menu,
             layout.metrics.digit_width,
             layout.metrics.line_height,
@@ -2166,9 +2691,7 @@ impl LightSpeed {
         }
 
         let panel_rows = self.panel_rows();
-        let sidebar_rows = self.sidebar_rows(&layout);
-        let (sidebar_labels, sidebar_kinds): (Vec<String>, Vec<crate::theme::SidebarRowKind>) =
-            sidebar_rows.into_iter().unzip();
+        let sidebar_rich = self.sidebar_rows(&layout);
         let sidebar_selected_row = self.sidebar_selected_row();
         let status_left = self.status_left();
         let status_right = self.status_right();
@@ -2189,29 +2712,35 @@ impl LightSpeed {
             layout.tab_bar,
             &presentations,
             layout.metrics.digit_width,
+            layout.metrics.material_icon_width,
             layout.scale,
         );
         let tabs = self.tab_geometry.clone();
         let view =
             self.core.active().and_then(|id| self.views.get(&id).copied()).unwrap_or_default();
 
-        let menu_enabled: Vec<bool> = match self.menu.open {
-            Some(open) => {
-                let mut enabled: Vec<bool> = menu::MENUS[open]
-                    .items
-                    .iter()
-                    .map(|item| menu::is_enabled(&self.core, item))
-                    .collect();
-                // Opening a recent file is always allowed; only the registry
-                // command items above are ever refused.
-                if open == menu::FILE_MENU_INDEX {
-                    enabled.extend(std::iter::repeat_n(true, recent_rows.len()));
-                }
-                enabled
-            }
-            None => Vec::new(),
+        let menu_enabled: Vec<bool> = if self.menu.open.is_some() {
+            let mut enabled: Vec<bool> =
+                menu::all_items().iter().map(|item| menu::is_enabled(&self.core, item)).collect();
+            // Opening a recent file is always allowed; only the registry
+            // command items above are ever refused.
+            enabled.extend(std::iter::repeat_n(true, recent_rows.len()));
+            enabled
+        } else {
+            Vec::new()
         };
         let prompt_text = self.banner_text();
+        let bottom_panel_rows =
+            if self.bottom_panel_visible() { self.bottom_panel_rows() } else { Vec::new() };
+        let activity_active = self.activity_active_index();
+        let activity = self.activity_rich();
+        let bottom_panel_rail = self.bottom_panel_rail_rich();
+        let title_left = self.title_left_rich();
+        let title_center = self.title_center_rich();
+        let title_right = self.title_right_rich();
+        let breadcrumb = self.breadcrumb_rich();
+        let tab_nav = self.tab_nav_rich();
+        let tab_actions = self.tab_actions_rich();
         let menu_state = self.menu;
         let empty_geometry =
             menu::MenuGeometry { titles: Vec::new(), dropdown: None, items: Vec::new() };
@@ -2237,10 +2766,20 @@ impl LightSpeed {
             caret_visible,
             prompt: prompt_text.as_deref(),
             placeholder: "  LightSpeed IDE\n\n  Ctrl+O  open a file\n  Ctrl+N  new file\n  F12     performance overlay",
-            sidebar: (!sidebar_labels.is_empty()).then_some(sidebar_labels.as_slice()),
-            sidebar_kinds: (!sidebar_kinds.is_empty()).then_some(sidebar_kinds.as_slice()),
+            sidebar: (!sidebar_rich.is_empty()).then_some(&sidebar_rich),
             sidebar_selected_row,
             sidebar_hovered_row: self.sidebar_hovered_row,
+            activity: &activity,
+            activity_active,
+            activity_hovered: self.activity_hovered,
+            bottom_panel: (!bottom_panel_rows.is_empty()).then_some(bottom_panel_rows.as_slice()),
+            bottom_panel_rail: &bottom_panel_rail,
+            title_left: &title_left,
+            title_center: &title_center,
+            title_right: &title_right,
+            breadcrumb: &breadcrumb,
+            tab_nav: &tab_nav,
+            tab_actions: &tab_actions,
         };
 
         match renderer.render(&frame) {
@@ -2494,12 +3033,13 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                             if let Some(query) = self.search_query_input.take() {
                                 if let Err(error) = self.core.request_workspace_search(query) {
                                     self.set_status(error.to_string(), Severity::Error);
+                                    self.refresh_focus();
+                                    self.request_redraw();
                                 } else {
                                     self.active_list = Some(ListKind::SearchResults);
                                     self.list_selected = 0;
+                                    self.focus_list();
                                 }
-                                self.refresh_focus();
-                                self.request_redraw();
                             }
                         }
                         keymap::FindAction::None => {
@@ -2650,8 +3190,16 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                         self.sidebar_width = crate::layout::clamp_sidebar_width(requested);
                         self.request_redraw();
                     }
+                } else if self.dragging_bottom_panel {
+                    if let Some(layout) = self.last_layout {
+                        let requested =
+                            (layout.bottom_panel.bottom() - self.pointer.1) / layout.scale;
+                        self.bottom_panel_height =
+                            crate::layout::clamp_bottom_panel_height(requested);
+                        self.request_redraw();
+                    }
                 } else if let Some(layout) = self.last_layout {
-                    self.update_sidebar_interaction(&layout);
+                    self.update_pointer_interaction(&layout);
                 }
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
@@ -2665,6 +3213,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                         self.dragging_selection = false;
                         self.dragging_scrollbar = false;
                         self.dragging_sidebar = false;
+                        self.dragging_bottom_panel = false;
                     }
                 }
             }
@@ -2687,17 +3236,98 @@ mod tests {
             1000.0,
             700.0,
             1.0,
-            FontMetrics { font_size: 14.0, line_height: 20.0, digit_width: 8.0 },
+            FontMetrics {
+                font_size: 14.0,
+                line_height: 20.0,
+                digit_width: 8.0,
+                icon_width: 14.0,
+                material_icon_width: 14.0,
+            },
             4,
             true,
             true,
             false,
             crate::layout::SIDEBAR_WIDTH,
+            false,
+            crate::layout::BOTTOM_PANEL_HEIGHT,
         )
     }
 
     fn centre(rect: crate::layout::Rect) -> (f32, f32) {
         (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0)
+    }
+
+    #[test]
+    fn opening_a_file_from_a_still_open_explorer_keeps_editor_focus() {
+        // Regression test for "I could only type 1 character and then it
+        // stopped": opening a file focuses the editor, but the explorer
+        // stays open (a docked panel now, not a modal picker). The very next
+        // `refresh_focus` call -- triggered by nothing more than the load
+        // finishing -- used to see the still-open panel and hand focus
+        // straight back to it, so every keystroke after the first went to
+        // the list's Up/Down/Enter handler instead of the document.
+        let focus = derive_focus(InputFocus::Editor, false, false, false, false, true, false);
+        assert_eq!(
+            focus,
+            InputFocus::Editor,
+            "an open panel must not steal a resting Editor focus"
+        );
+    }
+
+    #[test]
+    fn a_resting_focus_survives_an_unrelated_refresh() {
+        // Diagnostics arriving, external-change polling, terminal output --
+        // none of these should be able to bounce focus away from wherever
+        // the user actually is, as long as that surface is still open.
+        assert_eq!(
+            derive_focus(InputFocus::List, false, false, false, false, true, false),
+            InputFocus::List
+        );
+        assert_eq!(
+            derive_focus(InputFocus::Terminal, false, false, false, false, false, true),
+            InputFocus::Terminal
+        );
+    }
+
+    #[test]
+    fn a_resting_focus_falls_back_to_the_editor_once_its_surface_closes() {
+        assert_eq!(
+            derive_focus(InputFocus::List, false, false, false, false, false, false),
+            InputFocus::Editor
+        );
+        assert_eq!(
+            derive_focus(InputFocus::Terminal, false, false, false, false, false, false),
+            InputFocus::Editor
+        );
+    }
+
+    #[test]
+    fn entering_list_or_terminal_focus_is_never_derived_only_explicit() {
+        // The panel being open is not, by itself, enough to grant it focus --
+        // that has to come from `focus_list`/`focus_terminal`. Otherwise
+        // simply opening the explorer while the user is mid-edit would yank
+        // the keyboard away without them asking for it.
+        assert_eq!(
+            derive_focus(InputFocus::Editor, false, false, false, false, true, false),
+            InputFocus::Editor
+        );
+        assert_eq!(
+            derive_focus(InputFocus::Editor, false, false, false, false, false, true),
+            InputFocus::Editor
+        );
+    }
+
+    #[test]
+    fn the_exclusive_surfaces_always_win_over_a_resting_focus() {
+        for (prompt, menu, search, find) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            let focus = derive_focus(InputFocus::List, prompt, menu, search, find, true, false);
+            assert_ne!(focus, InputFocus::List, "an exclusive surface must win over a resting one");
+        }
     }
 
     #[test]
@@ -2830,10 +3460,12 @@ mod tests {
 
         assert_eq!(rows.len(), 2, "one directory row, one file row, nothing from inside src/");
         let dir_row = rows.iter().find(|r| r.label.contains("src")).unwrap();
-        assert!(
-            dir_row.label.starts_with('\u{25b8}'),
-            "a collapsed directory shows the closed glyph"
+        assert_eq!(
+            dir_row.chevron,
+            Some(crate::icons::Icon::ChevronRight),
+            "a collapsed directory points its chevron sideways"
         );
+        assert_eq!(dir_row.icon, Some(crate::icons::Icon::Folder.into()));
         assert!(matches!(dir_row.action, Some(ListAction::ToggleDirectory(_))));
 
         let _ = std::fs::remove_dir_all(&root);
@@ -2853,17 +3485,17 @@ mod tests {
 
         assert_eq!(rows.len(), 2, "the directory row, plus main.rs inside it");
         let dir_row = &rows[0];
-        assert!(
-            dir_row.label.starts_with('\u{25be}'),
-            "an expanded directory shows the open glyph"
+        assert_eq!(
+            dir_row.chevron,
+            Some(crate::icons::Icon::ChevronDown),
+            "an expanded directory points its chevron down"
         );
+        assert_eq!(dir_row.icon, Some(crate::icons::Icon::FolderOpened.into()));
+        assert_eq!(dir_row.depth, 0);
         let file_row = &rows[1];
         assert!(file_row.label.contains("main.rs"));
-        assert!(
-            file_row.label.starts_with("    "),
-            "a child is indented two steps deeper than its parent's zero: {:?}",
-            file_row.label
-        );
+        assert_eq!(file_row.depth, 1, "a child sits one level deeper than its parent");
+        assert_eq!(file_row.chevron, None, "a file has nothing to expand");
         assert!(
             matches!(&file_row.action, Some(ListAction::OpenFile(p)) if p.ends_with("main.rs"))
         );
