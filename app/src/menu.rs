@@ -78,9 +78,24 @@ pub const MENUS: &[Menu] = &[
     Menu { title: "View", items: VIEW_ITEMS },
 ];
 
-/// Index of the File menu in [`MENUS`], named so the recent-files tail is
-/// never appended to the wrong dropdown by a stray literal.
-pub const FILE_MENU_INDEX: usize = 0;
+/// Every menu item as one flat list, with a separator between each group.
+///
+/// Lapce has no menu bar: one button in the header opens one popout holding
+/// everything. The three [`MENUS`] groups are still the source of truth --
+/// they are what the command-registry agreement test checks -- this only
+/// flattens them for display, so a command can never appear here without
+/// appearing there.
+pub fn all_items() -> Vec<MenuItem> {
+    let mut items = Vec::new();
+    for menu in MENUS {
+        // Each group keeps its name, as an inert header row -- without the
+        // File/Edit/View bar to group them, a flat list of thirty commands
+        // is where a menu stops being navigable.
+        items.push(MenuItem { label: menu.title, command: None, shortcut: "" });
+        items.extend(menu.items.iter().cloned());
+    }
+    items
+}
 
 /// One recently opened file, appended below File's static items.
 ///
@@ -149,40 +164,7 @@ pub const ROW_INSET: f32 = 6.0;
 /// Extra width reserved for shortcut text in a dropdown.
 const SHORTCUT_GAP: f32 = 24.0;
 
-/// Padding around a title, in characters rather than pixels.
-///
-/// This is the fix for a highlight that bled into the next title: the
-/// previous version padded the *rectangle* with `TEXT_INSET * scale` pixels on
-/// each side but padded the *drawn text* with two literal space characters, and
-/// those two widths only agreed by coincidence at one font size. A menu title
-/// is one row out of a monospace grid, so its rectangle should be measured in
-/// the same unit its text is: whole characters. Pad the label with spaces,
-/// measure the rectangle in exactly those characters, and the two cannot drift
-/// apart at any font size or scale factor.
-const TITLE_LEAD: usize = 2;
-const TITLE_TRAIL: usize = 2;
-
-/// The label drawn for one title, padded so its width is a whole number of
-/// character cells -- the same string [`geometry`] measures the title's
-/// rectangle from.
-pub fn title_label(menu: &Menu) -> String {
-    let mut text = String::with_capacity(TITLE_LEAD + menu.title.len() + TITLE_TRAIL);
-    for _ in 0..TITLE_LEAD {
-        text.push(' ');
-    }
-    text.push_str(menu.title);
-    for _ in 0..TITLE_TRAIL {
-        text.push(' ');
-    }
-    text
-}
-
-/// Characters in one title's cell, including its padding.
-fn title_cell_chars(menu: &Menu) -> usize {
-    TITLE_LEAD + menu.title.chars().count() + TITLE_TRAIL
-}
-
-/// Lays out the bar and, if one is open, its dropdown.
+/// Lays out the menu button and, if it is open, its dropdown.
 ///
 /// `char_width` and `line_height` are the measured advance and leading of the
 /// monospace face, so this stays correct at any font size or DPI. A dropdown
@@ -190,7 +172,7 @@ fn title_cell_chars(menu: &Menu) -> usize {
 /// and the text row it highlights the same strip of pixels rather than two
 /// nearly-aligned ones.
 pub fn geometry(
-    bar: Rect,
+    button: Rect,
     state: MenuState,
     char_width: f32,
     line_height: f32,
@@ -198,26 +180,17 @@ pub fn geometry(
     recent: &[RecentRow],
 ) -> MenuGeometry {
     let padding = TEXT_INSET * scale;
-    // Titles are laid out as a fixed-width character grid, so the rectangle a
-    // click lands in is exactly the cell the drawn label occupies -- no pixel
-    // padding to fall out of step with a character-based label.
-    let mut titles = Vec::with_capacity(MENUS.len());
-    let mut x = bar.x;
-    for menu in MENUS {
-        let width = title_cell_chars(menu) as f32 * char_width;
-        titles.push(Rect::new(x, bar.y, width, bar.height));
-        x += width;
-    }
+    // One trigger, not a row of them: Lapce's header has a single menu
+    // button, and its rectangle is the button's own -- there is no
+    // File/Edit/View strip to lay out any more.
+    let titles = vec![button];
 
-    let (dropdown, items) = match state.open.and_then(|index| Some((index, *titles.get(index)?))) {
-        Some((index, title)) => {
-            let menu = &MENUS[index];
-            // Recent files are a tail appended only to the File dropdown.
-            let recent = if index == FILE_MENU_INDEX { recent } else { &[] };
+    let (dropdown, items) = match state.open {
+        Some(_) => {
+            let all = all_items();
             let row_height = line_height;
             let inset = ROW_INSET * scale;
-            let widest_item = menu
-                .items
+            let widest_item = all
                 .iter()
                 .map(|item| item.label.chars().count() + item.shortcut.chars().count())
                 .max()
@@ -226,9 +199,9 @@ pub fn geometry(
                 recent.iter().map(|row| row.label.chars().count()).max().unwrap_or(0) as f32;
             let widest = widest_item.max(widest_recent);
             let width = widest * char_width + SHORTCUT_GAP * scale + padding * 2.0;
-            let total_rows = menu.items.len() + recent.len();
+            let total_rows = all.len() + recent.len();
             let height = total_rows as f32 * row_height + inset * 2.0;
-            let panel = Rect::new(title.x, bar.bottom(), width, height);
+            let panel = Rect::new(button.x, button.bottom() + 2.0 * scale, width, height);
 
             let mut rects = Vec::with_capacity(total_rows);
             for row in 0..total_rows {
@@ -279,9 +252,11 @@ pub fn hit(
         return MenuHit::None;
     }
 
-    let Some(open) = state.open else { return MenuHit::Swallowed };
-    let items = MENUS[open].items;
-    let recent = if open == FILE_MENU_INDEX { recent } else { &[] };
+    if state.open.is_none() {
+        return MenuHit::Swallowed;
+    }
+    // One flat popout: every group's items, then the recent-files tail.
+    let items = all_items();
     match geometry.items.iter().position(|rect| rect.contains(x, y)) {
         Some(row) if row < items.len() => match items[row].command {
             Some(command) => MenuHit::Command(command),
@@ -305,7 +280,12 @@ pub fn hovered_item(geometry: &MenuGeometry, x: f32, y: f32) -> Option<usize> {
 /// Renders one dropdown row, padded so shortcuts line up.
 pub fn item_text(item: &MenuItem, columns: usize) -> String {
     if item.is_separator() {
-        return "-".repeat(columns.min(40));
+        // An empty-labelled separator is a rule; a labelled one is a group
+        // header (see `all_items`).
+        if item.label.is_empty() {
+            return "-".repeat(columns.min(40));
+        }
+        return item.label.to_uppercase();
     }
     let label = item.label;
     let shortcut = item.shortcut;
@@ -391,101 +371,89 @@ mod tests {
     }
 
     #[test]
-    fn titles_are_laid_out_left_to_right_without_overlapping() {
+    fn clicking_the_button_reports_the_one_menu() {
         let geometry = geometry(bar(), MenuState::default(), 8.0, 20.0, 1.0, &[]);
-        assert_eq!(geometry.titles.len(), 3);
-        for pair in geometry.titles.windows(2) {
-            assert!(pair[0].right() <= pair[1].x + 0.01, "menu titles must not overlap");
-        }
+        assert_eq!(geometry.titles.len(), 1, "one button, not a row of titles");
         assert!(geometry.dropdown.is_none(), "nothing is open");
-    }
-
-    #[test]
-    fn clicking_a_title_reports_that_title() {
-        let geometry = geometry(bar(), MenuState::default(), 8.0, 20.0, 1.0, &[]);
-        let file = geometry.titles[0];
+        let button = geometry.titles[0];
         assert_eq!(
-            hit(&geometry, MenuState::default(), file.x + 2.0, file.y + 2.0, &[]),
+            hit(&geometry, MenuState::default(), button.x + 2.0, button.y + 2.0, &[]),
             MenuHit::Title(0)
         );
-        let edit = geometry.titles[1];
-        assert_eq!(
-            hit(&geometry, MenuState::default(), edit.x + 2.0, edit.y + 2.0, &[]),
-            MenuHit::Title(1)
-        );
+    }
+
+    /// Row index of `command` in the flat popout, so these tests do not have
+    /// to hard-code offsets that shift whenever a group gains an item.
+    fn row_of(command: &str) -> usize {
+        all_items()
+            .iter()
+            .position(|item| item.command == Some(command))
+            .unwrap_or_else(|| panic!("{command} is not in the popout"))
     }
 
     #[test]
     fn clicking_an_item_reports_its_command() {
         let state = MenuState { open: Some(0), hovered_item: None };
         let geometry = geometry(bar(), state, 8.0, 20.0, 1.0, &[]);
-        let panel = geometry.dropdown.expect("the file menu is open");
-        assert!(panel.y >= bar().bottom(), "the dropdown hangs below the bar");
+        let panel = geometry.dropdown.expect("the menu is open");
+        assert!(panel.y >= bar().bottom(), "the dropdown hangs below the button");
 
-        let new_item = geometry.items[0];
-        assert_eq!(
-            hit(&geometry, state, new_item.x + 4.0, new_item.y + 2.0, &[]),
-            MenuHit::Command("file.new")
-        );
-        let save_item = geometry.items[3]; // New, Open..., Open Folder, Save
-        assert_eq!(
-            hit(&geometry, state, save_item.x + 4.0, save_item.y + 2.0, &[]),
-            MenuHit::Command("file.save")
-        );
-    }
-
-    #[test]
-    fn a_titles_rectangle_is_exactly_as_wide_as_its_own_label() {
-        // The regression this encodes: the rectangle used to be padded in
-        // pixels (`TEXT_INSET * scale`) while the drawn text was padded with
-        // two literal spaces, so at ordinary font sizes the rectangle was
-        // wider than the label and reached into the next title's glyphs. If
-        // the rectangle and the label ever measure differently again, this
-        // catches it before it reaches the screen.
-        let char_width = 8.0;
-        for menu in MENUS {
-            let label = title_label(menu);
-            let cell = title_cell_chars(menu);
+        for command in ["file.new", "file.save", "edit.undo", "view.toggle_terminal"] {
+            let row = geometry.items[row_of(command)];
             assert_eq!(
-                label.chars().count(),
-                cell,
-                "the label's length must equal the cell width geometry() measures"
+                hit(&geometry, state, row.x + 4.0, row.y + 2.0, &[]),
+                MenuHit::Command(command),
+                "clicking {command}'s row must run {command}"
             );
-            let _ = char_width; // width is chars * char_width in geometry()
         }
     }
 
     #[test]
-    fn no_titles_highlight_rectangle_reaches_into_the_next_titles_text() {
-        let geometry = geometry(bar(), MenuState::default(), 8.0, 20.0, 1.0, &[]);
-        let labels: Vec<String> = MENUS.iter().map(title_label).collect();
+    fn a_group_header_row_runs_nothing() {
+        let state = MenuState { open: Some(0), hovered_item: None };
+        let geometry = geometry(bar(), state, 8.0, 20.0, 1.0, &[]);
+        let header = geometry.items[0]; // the "File" header
+        assert_eq!(
+            hit(&geometry, state, header.x + 4.0, header.y + 2.0, &[]),
+            MenuHit::Swallowed,
+            "a group header is a label, not a command"
+        );
+    }
 
-        // Reconstruct where each label's own glyphs start and end within the
-        // concatenated title row, exactly as the renderer draws them.
-        let mut cursor = 0.0f32;
-        for (index, label) in labels.iter().enumerate() {
-            let glyph_start = cursor + TITLE_LEAD as f32 * 8.0;
-            let glyph_end = cursor + (label.chars().count() - TITLE_TRAIL) as f32 * 8.0;
-            let rect = geometry.titles[index];
-
-            assert!(
-                rect.x <= glyph_start + 0.01,
-                "title {index}'s rectangle must start at or before its own glyphs"
-            );
-            assert!(
-                rect.right() >= glyph_end - 0.01,
-                "title {index}'s rectangle must cover its own glyphs"
-            );
-
-            if let Some(next) = geometry.titles.get(index + 1) {
+    #[test]
+    fn one_button_opens_one_popout_holding_every_group() {
+        // Lapce has no File/Edit/View row: the header's single button opens
+        // one list. Every command from every group has to still be reachable
+        // from it, or collapsing the bar quietly removed features.
+        let items = all_items();
+        for menu in MENUS {
+            for item in menu.items {
                 assert!(
-                    rect.right() <= next.x + 0.01,
-                    "title {index}'s highlight must not reach past where title {} begins",
-                    index + 1
+                    items.iter().any(|candidate| candidate.command == item.command),
+                    "{} is in {} but not in the popout",
+                    item.label,
+                    menu.title
                 );
             }
-            cursor += label.chars().count() as f32 * 8.0;
+            assert!(
+                items
+                    .iter()
+                    .any(|candidate| { candidate.is_separator() && candidate.label == menu.title }),
+                "{} has no header row in the popout",
+                menu.title
+            );
         }
+    }
+
+    #[test]
+    fn the_dropdown_hangs_off_the_button_rather_than_the_window_edge() {
+        let button = Rect::new(10.0, 4.0, 27.0, 27.0);
+        let state = MenuState { open: Some(0), hovered_item: None };
+        let geometry = geometry(button, state, 8.0, 20.0, 1.0, &[]);
+        assert_eq!(geometry.titles, vec![button], "the button is the only trigger");
+        let panel = geometry.dropdown.expect("an open menu has a panel");
+        assert_eq!(panel.x, button.x);
+        assert!(panel.y >= button.bottom(), "the panel hangs below the button");
     }
 
     #[test]
@@ -551,7 +519,7 @@ mod tests {
 
     #[test]
     fn recent_files_are_appended_below_files_static_items() {
-        let state = MenuState { open: Some(FILE_MENU_INDEX), hovered_item: None };
+        let state = MenuState { open: Some(0), hovered_item: None };
         let recent = recent(&["a.rs", "b.rs"]);
         let without = geometry(bar(), state, 8.0, 20.0, 1.0, &[]);
         let with = geometry(bar(), state, 8.0, 20.0, 1.0, &recent);
@@ -567,26 +535,22 @@ mod tests {
     }
 
     #[test]
-    fn recent_files_are_only_appended_to_the_file_menu() {
-        let recent = recent(&["a.rs"]);
-        for open in [1usize, 2] {
-            let state = MenuState { open: Some(open), hovered_item: None };
-            let without = geometry(bar(), state, 8.0, 20.0, 1.0, &[]);
-            let with = geometry(bar(), state, 8.0, 20.0, 1.0, &recent);
-            assert_eq!(
-                with.items.len(),
-                without.items.len(),
-                "menu {open} is not File and must not grow"
-            );
-        }
+    fn recent_files_are_appended_once_to_the_single_popout() {
+        // With one popout there is no "wrong menu" to append them to, but
+        // they must still be appended exactly once rather than per group.
+        let recent = recent(&["a.rs", "b.rs"]);
+        let state = MenuState { open: Some(0), hovered_item: None };
+        let without = geometry(bar(), state, 8.0, 20.0, 1.0, &[]);
+        let with = geometry(bar(), state, 8.0, 20.0, 1.0, &recent);
+        assert_eq!(with.items.len(), without.items.len() + recent.len());
     }
 
     #[test]
     fn clicking_a_recent_row_reports_its_path_not_a_command() {
-        let state = MenuState { open: Some(FILE_MENU_INDEX), hovered_item: None };
+        let state = MenuState { open: Some(0), hovered_item: None };
         let recent = recent(&["one.rs", "two.rs"]);
         let geometry = geometry(bar(), state, 8.0, 20.0, 1.0, &recent);
-        let static_len = FILE_ITEMS.len();
+        let static_len = all_items().len();
 
         let first_recent = geometry.items[static_len];
         assert_eq!(
@@ -600,7 +564,7 @@ mod tests {
         );
 
         // The static rows above them are unaffected.
-        let save = geometry.items[3]; // New, Open..., Open Folder, Save
+        let save = geometry.items[row_of("file.save")];
         assert_eq!(
             hit(&geometry, state, save.x + 4.0, save.y + 2.0, &recent),
             MenuHit::Command("file.save")
@@ -609,7 +573,7 @@ mod tests {
 
     #[test]
     fn an_empty_recent_list_leaves_the_file_menu_exactly_as_before() {
-        let state = MenuState { open: Some(FILE_MENU_INDEX), hovered_item: None };
+        let state = MenuState { open: Some(0), hovered_item: None };
         let with_empty_slice = geometry(bar(), state, 8.0, 20.0, 1.0, &[]);
         let with_empty_vec = geometry(bar(), state, 8.0, 20.0, 1.0, &recent(&[]));
         assert_eq!(with_empty_slice.items, with_empty_vec.items);
