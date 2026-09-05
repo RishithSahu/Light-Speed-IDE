@@ -56,9 +56,19 @@ pub enum Region {
     TabNav,
     /// The tab row's trailing split/close cluster.
     TabActions,
+    /// The command palette's own floating panel.
+    CommandPalette,
+    /// The dependency view's node labels, stamped into a character grid.
+    DependencyGraph,
+    /// The settings screen's search box.
+    SettingsSearch,
+    /// Its section list down the left.
+    SettingsCategories,
+    /// Its scrolling list of settings.
+    SettingsList,
 }
 
-const REGION_COUNT: usize = 19;
+const REGION_COUNT: usize = 24;
 
 fn region_index(region: Region) -> usize {
     match region {
@@ -81,6 +91,11 @@ fn region_index(region: Region) -> usize {
         Region::Breadcrumb => 16,
         Region::TabNav => 17,
         Region::TabActions => 18,
+        Region::CommandPalette => 19,
+        Region::DependencyGraph => 20,
+        Region::SettingsSearch => 21,
+        Region::SettingsCategories => 22,
+        Region::SettingsList => 23,
     }
 }
 
@@ -295,6 +310,43 @@ impl TextEngine {
 
     pub fn metrics(&self) -> FontMetrics {
         self.metrics
+    }
+
+    /// Changes the font every region is shaped with.
+    ///
+    /// Reports whether anything actually changed, so a caller can skip the
+    /// relayout when a settings write did not touch the font.
+    ///
+    /// Every region is emptied rather than merely re-measured: the cached
+    /// text is what `set_text` compares against to decide a region can be
+    /// left alone, and after a metrics change that comparison would say
+    /// "unchanged" about a buffer that now has to be shaped at a different
+    /// size.
+    pub fn set_font(&mut self, family: &str, font_size: f32, line_height_ratio: f32) -> bool {
+        let font_size = font_size.max(1.0);
+        let line_height = (font_size * line_height_ratio).round().max(1.0);
+        if (self.metrics.font_size - font_size).abs() < 0.01
+            && (self.metrics.line_height - line_height).abs() < 0.01
+            && self.family == family
+        {
+            return false;
+        }
+
+        let metrics = Metrics::new(font_size, line_height);
+        for region in &mut self.regions {
+            region.buffer.set_metrics(metrics);
+            region.text.clear();
+            region.spans.clear();
+            region.width = 0.0;
+            region.height = 0.0;
+        }
+        self.family = family.to_string();
+        self.metrics.font_size = font_size;
+        self.metrics.line_height = line_height;
+        self.metrics.digit_width = self.measure_digit_width();
+        self.metrics.icon_width = self.measure_icon_width();
+        self.metrics.material_icon_width = self.measure_material_icon_width();
+        true
     }
 
     /// Advance width of one digit in the chosen monospace face, measured rather

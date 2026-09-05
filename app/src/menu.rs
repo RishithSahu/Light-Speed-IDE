@@ -69,6 +69,9 @@ pub const VIEW_ITEMS: &[MenuItem] = &[
     MenuItem::item("Toggle File Tree", "view.toggle_file_tree", "Ctrl+Shift+E"),
     MenuItem::item("Search in Files...", "view.workspace_search", "Ctrl+Shift+F"),
     MenuItem::item("Toggle Git Status", "view.toggle_git_status", "Ctrl+Shift+G"),
+    MenuItem::item("Settings", "view.open_settings", "Ctrl+,"),
+    MenuItem::item("Toggle Dependency View", "view.toggle_dependencies", "Ctrl+Shift+D"),
+    MenuItem::item("Rescan Dependencies", "view.refresh_dependencies", "Ctrl+Shift+R"),
     MenuItem::item("Toggle Terminal", "view.toggle_terminal", "F11"),
 ];
 

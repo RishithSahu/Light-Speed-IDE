@@ -70,7 +70,7 @@ use crate::json::Value;
 use ls_core::{Diagnostic, DiagnosticSeverity, LineIndex};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{Arc, Mutex};
 
 /// What a document's diagnostics look like once parsed off the wire: the
@@ -78,15 +78,94 @@ use std::sync::{Arc, Mutex};
 /// supports echoing one back -- optional per the LSP spec), and the list.
 type DiagnosticsByPath = Vec<(PathBuf, Option<u64>, Vec<Diagnostic>)>;
 
-/// Maps a document's language to the server that speaks for it, and the
-/// server's own name for a file of that kind. `None` means no server is
-/// configured for that language -- most of them, deliberately: wiring up one
-/// server end-to-end is the point here, not building a registry of them.
-fn server_for(language: ls_core::Language) -> Option<(&'static str, &'static str)> {
+/// One candidate language server: what to run, and what the protocol calls
+/// files of this kind.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ServerSpec {
+    /// Executable name, resolved against `PATH` when spawned. Not a path:
+    /// which install of `gopls` or `clangd` is the right one is the user's
+    /// environment's business, not this table's.
+    pub binary: &'static str,
+    /// Arguments needed to make the server speak LSP over stdio. Several
+    /// default to it; several refuse to without being told.
+    pub args: &'static [&'static str],
+    /// The `languageId` this server expects in `textDocument/didOpen`. It is
+    /// the *protocol's* name for the language, which is not always this
+    /// editor's name for it (`cpp`, not `C++`).
+    pub language_id: &'static str,
+}
+
+const fn spec(
+    binary: &'static str,
+    args: &'static [&'static str],
+    language_id: &'static str,
+) -> ServerSpec {
+    ServerSpec { binary, args, language_id }
+}
+
+/// The servers that can speak for each language, in preference order.
+///
+/// A list rather than a single entry because there is rarely one answer:
+/// Python alone has `pyright`, `pylsp` and `jedi-language-server` in common
+/// use, and which one is installed is not something this table can know.
+/// [`LspClient::spawn`] tries them in order and takes the first that starts,
+/// so having several costs nothing when the first is present and is the
+/// difference between "works" and "silently no diagnostics" when it is not.
+///
+/// An empty list means no server is configured for that language -- the
+/// honest answer for Plain Text, and for languages whose tooling does not
+/// ship a stdio LSP server worth defaulting to.
+pub fn servers_for(language: ls_core::Language) -> &'static [ServerSpec] {
+    use ls_core::Language;
+    // Each list is its own `const` rather than an inline array literal:
+    // a borrow of a temporary built inside the match arm would not be
+    // `'static`, and these have to outlive the call to be a registry at all.
+    const RUST: &[ServerSpec] = &[spec("rust-analyzer", &[], "rust")];
+    const PYTHON: &[ServerSpec] = &[
+        spec("pyright-langserver", &["--stdio"], "python"),
+        spec("pylsp", &[], "python"),
+        spec("jedi-language-server", &[], "python"),
+    ];
+    const C: &[ServerSpec] = &[spec("clangd", &[], "c")];
+    const CPP: &[ServerSpec] = &[spec("clangd", &[], "cpp")];
+    const CSHARP: &[ServerSpec] = &[spec("csharp-ls", &[], "csharp")];
+    const GO: &[ServerSpec] = &[spec("gopls", &[], "go")];
+    const JAVASCRIPT: &[ServerSpec] = &[
+        spec("typescript-language-server", &["--stdio"], "javascript"),
+        spec("deno", &["lsp"], "javascript"),
+    ];
+    const TYPESCRIPT: &[ServerSpec] = &[
+        spec("typescript-language-server", &["--stdio"], "typescript"),
+        spec("deno", &["lsp"], "typescript"),
+    ];
+    const JSON: &[ServerSpec] = &[spec("vscode-json-language-server", &["--stdio"], "json")];
+    const YAML: &[ServerSpec] = &[spec("yaml-language-server", &["--stdio"], "yaml")];
+    const TOML: &[ServerSpec] = &[spec("taplo", &["lsp", "stdio"], "toml")];
+    const MARKDOWN: &[ServerSpec] = &[spec("marksman", &["server"], "markdown")];
+    const SHELL: &[ServerSpec] = &[spec("bash-language-server", &["start"], "shellscript")];
+
     match language {
-        ls_core::Language::Rust => Some(("rust-analyzer", "rust")),
-        _ => None,
+        Language::Rust => RUST,
+        Language::Python => PYTHON,
+        Language::C => C,
+        Language::Cpp => CPP,
+        Language::CSharp => CSHARP,
+        Language::Go => GO,
+        Language::JavaScript => JAVASCRIPT,
+        Language::TypeScript => TYPESCRIPT,
+        Language::Json => JSON,
+        Language::Yaml => YAML,
+        Language::Toml => TOML,
+        Language::Markdown => MARKDOWN,
+        Language::Shell => SHELL,
+        Language::PlainText => &[],
     }
+}
+
+/// The `languageId` to report for a document, independent of which candidate
+/// server ended up running: every candidate for a language agrees on it.
+fn language_id_for(language: ls_core::Language) -> Option<&'static str> {
+    servers_for(language).first().map(|server| server.language_id)
 }
 
 pub struct LspClient {
@@ -107,20 +186,31 @@ pub struct LspClient {
 }
 
 impl LspClient {
-    /// Spawns the server configured for `language`, or `None` if either
-    /// nothing is configured for it or the binary is not on `PATH`.
+    /// Spawns a server for `language`, trying each candidate in
+    /// [`servers_for`] until one starts. `None` if nothing is configured for
+    /// the language or none of the candidates are on `PATH`.
     pub fn spawn(
         language: ls_core::Language,
         root: &Path,
         wake: impl Fn() + Send + 'static,
     ) -> Option<Self> {
-        let (binary, _) = server_for(language)?;
-        let mut child = Command::new(binary)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
+        let mut child = None;
+        for server in servers_for(language) {
+            // Through the platform helper: a language server is a console
+            // application too, and a bare spawn would leave one console
+            // window per running server sitting next to the editor.
+            let started = ls_platform::command(server.binary)
+                .args(server.args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn();
+            if let Ok(started) = started {
+                child = Some(started);
+                break;
+            }
+        }
+        let mut child = child?;
 
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
@@ -161,7 +251,7 @@ impl LspClient {
     }
 
     pub fn notify_opened(&mut self, path: &Path, language: ls_core::Language, text: &str) {
-        let Some((_, language_id)) = server_for(language) else { return };
+        let Some(language_id) = language_id_for(language) else { return };
         self.send_notification(
             "textDocument/didOpen",
             Value::object([(
@@ -242,6 +332,106 @@ impl Drop for LspClient {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// How many language servers may run at once.
+///
+/// This is a memory budget, not a licence. A language server is far and away
+/// the largest process an editor causes to exist -- `rust-analyzer` on a
+/// mid-sized workspace routinely holds more RAM than everything else here
+/// put together -- so "one per language, spawned on demand" needs a ceiling
+/// or a session that wanders through a polyglot repository ends up running
+/// six of them at once. Four is enough for the realistic case (a project and
+/// its config/markup files) without becoming the process's own footprint.
+pub const MAX_SERVERS: usize = 4;
+
+/// Owns one language server per language, spawned on first use.
+///
+/// The reason this type exists: a single shared client cannot serve more than
+/// one language. Sending a Python `didOpen` to `rust-analyzer` is not a
+/// degraded experience, it is a protocol error against a server that will
+/// never produce a useful diagnostic for that file -- and that is exactly
+/// what one shared `Option<LspClient>` did as soon as a second language was
+/// opened.
+#[derive(Default)]
+pub struct LspManager {
+    clients: std::collections::HashMap<ls_core::Language, LspClient>,
+    /// Languages whose servers are configured but not installed. Kept so a
+    /// missing binary is discovered once rather than re-attempted on every
+    /// document that happens to be of that language: a failed `spawn` is a
+    /// process creation attempt, and doing one per keystroke would be its
+    /// own performance bug.
+    unavailable: std::collections::HashSet<ls_core::Language>,
+}
+
+impl LspManager {
+    /// The server for `language`, starting it if this is the first document
+    /// of that language and one is both configured and installed.
+    pub fn client_for(
+        &mut self,
+        language: ls_core::Language,
+        root: &Path,
+        wake: impl Fn() + Send + 'static,
+    ) -> Option<&mut LspClient> {
+        if servers_for(language).is_empty() || self.unavailable.contains(&language) {
+            return None;
+        }
+        if !self.clients.contains_key(&language) {
+            if self.clients.len() >= MAX_SERVERS {
+                return None;
+            }
+            match LspClient::spawn(language, root, wake) {
+                Some(client) => {
+                    self.clients.insert(language, client);
+                }
+                None => {
+                    // Nothing on PATH for this language. Remembered rather
+                    // than retried; installing a server mid-session is rare
+                    // enough to be worth a restart.
+                    self.unavailable.insert(language);
+                    return None;
+                }
+            }
+        }
+        self.clients.get_mut(&language)
+    }
+
+    /// Drops any server that has exited, so the next document of its
+    /// language gets a fresh one rather than a dead handle. Returns the
+    /// languages that were retired.
+    pub fn retire_dead(&mut self) -> Vec<ls_core::Language> {
+        let mut dead = Vec::new();
+        for (language, client) in self.clients.iter_mut() {
+            if !client.is_alive() {
+                dead.push(*language);
+            }
+        }
+        for language in &dead {
+            self.clients.remove(language);
+        }
+        dead
+    }
+
+    /// Everything every server has published since the last drain.
+    pub fn drain_diagnostics(&self) -> DiagnosticsByPath {
+        let mut updates = Vec::new();
+        for client in self.clients.values() {
+            updates.extend(client.drain_diagnostics());
+        }
+        updates
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
+
+    /// Which languages currently have a server running, for the resource
+    /// panel and for tests.
+    pub fn running(&self) -> Vec<ls_core::Language> {
+        let mut languages: Vec<_> = self.clients.keys().copied().collect();
+        languages.sort_by_key(|language| language.name());
+        languages
     }
 }
 
@@ -437,7 +627,135 @@ mod tests {
 
     #[test]
     fn no_server_is_configured_for_plain_text() {
-        assert!(server_for(ls_core::Language::PlainText).is_none());
+        assert!(servers_for(ls_core::Language::PlainText).is_empty());
+    }
+
+    #[test]
+    fn every_language_but_plain_text_has_a_server_configured() {
+        // The point of the registry: a language the editor can detect and
+        // highlight but has no server for gets no diagnostics, and does so
+        // silently. Iterating `Language::ALL` rather than a hand-written list
+        // means adding a language without adding servers for it fails here
+        // instead of shipping as a quiet gap.
+        for language in ls_core::Language::ALL {
+            let servers = servers_for(*language);
+            if *language == ls_core::Language::PlainText {
+                assert!(servers.is_empty(), "plain text has no language to serve");
+                continue;
+            }
+            assert!(!servers.is_empty(), "{} has no server configured", language.name());
+        }
+    }
+
+    #[test]
+    fn every_server_spec_is_runnable_as_written() {
+        // A blank binary would spawn nothing; a blank languageId would make
+        // every `didOpen` malformed. Both are the kind of typo that produces
+        // "no diagnostics, no error" rather than a visible failure.
+        for language in ls_core::Language::ALL {
+            for server in servers_for(*language) {
+                assert!(!server.binary.is_empty(), "{} has a nameless binary", language.name());
+                assert!(
+                    !server.binary.contains(' '),
+                    "{}: binary {:?} smuggles arguments into the executable name; \
+                     they belong in `args` or the spawn will look for a file with a space in it",
+                    language.name(),
+                    server.binary
+                );
+                assert!(
+                    !server.language_id.is_empty(),
+                    "{} has an empty languageId",
+                    language.name()
+                );
+                assert_eq!(
+                    server.language_id.to_ascii_lowercase(),
+                    server.language_id,
+                    "{}: languageId {:?} is not the protocol's lowercase form",
+                    language.name(),
+                    server.language_id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_candidate_for_a_language_agrees_on_its_language_id() {
+        // `language_id_for` reports the first candidate's id no matter which
+        // one actually started, so candidates that disagreed would send a
+        // server someone else's name for the file.
+        for language in ls_core::Language::ALL {
+            let servers = servers_for(*language);
+            let Some(first) = servers.first() else { continue };
+            for server in servers {
+                assert_eq!(
+                    server.language_id,
+                    first.language_id,
+                    "{} candidates disagree on languageId",
+                    language.name()
+                );
+            }
+            assert_eq!(language_id_for(*language), Some(first.language_id));
+        }
+    }
+
+    #[test]
+    fn language_ids_are_the_names_the_protocol_actually_uses() {
+        // These are not free-form labels: they are the identifiers in the LSP
+        // specification's own table, and a server matching on them will
+        // silently ignore a document announced under any other spelling
+        // (`cpp`, never `C++`; `shellscript`, never `bash`).
+        let id = |language| language_id_for(language);
+        assert_eq!(id(ls_core::Language::Rust), Some("rust"));
+        assert_eq!(id(ls_core::Language::Python), Some("python"));
+        assert_eq!(id(ls_core::Language::C), Some("c"));
+        assert_eq!(id(ls_core::Language::Cpp), Some("cpp"));
+        assert_eq!(id(ls_core::Language::CSharp), Some("csharp"));
+        assert_eq!(id(ls_core::Language::Go), Some("go"));
+        assert_eq!(id(ls_core::Language::JavaScript), Some("javascript"));
+        assert_eq!(id(ls_core::Language::TypeScript), Some("typescript"));
+        assert_eq!(id(ls_core::Language::Json), Some("json"));
+        assert_eq!(id(ls_core::Language::Yaml), Some("yaml"));
+        assert_eq!(id(ls_core::Language::Toml), Some("toml"));
+        assert_eq!(id(ls_core::Language::Markdown), Some("markdown"));
+        assert_eq!(id(ls_core::Language::Shell), Some("shellscript"));
+        assert_eq!(id(ls_core::Language::PlainText), None);
+    }
+
+    #[test]
+    fn a_language_with_no_server_never_becomes_a_client() {
+        let mut manager = LspManager::default();
+        assert!(manager.client_for(ls_core::Language::PlainText, Path::new("."), || {}).is_none());
+        assert!(manager.is_empty());
+        assert!(manager.running().is_empty());
+    }
+
+    #[test]
+    fn a_language_whose_server_is_not_installed_is_only_attempted_once() {
+        // Spawning is process creation. Retrying it for every document of a
+        // language whose server simply is not installed would put a failed
+        // `CreateProcess` on the interactive path indefinitely.
+        let mut manager = LspManager::default();
+        // Nothing is on PATH under this name, so the first attempt fails and
+        // records the language as unavailable.
+        manager.unavailable.insert(ls_core::Language::Go);
+        assert!(manager.client_for(ls_core::Language::Go, Path::new("."), || {}).is_none());
+        assert!(manager.is_empty(), "a failed spawn must not leave a client behind");
+    }
+
+    #[test]
+    fn the_manager_holds_one_client_per_language_not_one_overall() {
+        // The bug this whole type exists to fix: a single shared client meant
+        // the first recognized document's server received every later
+        // document too, whatever language it was -- Python `didOpen`
+        // notifications sent to `rust-analyzer`.
+        let manager = LspManager::default();
+        assert!(manager.running().is_empty());
+        // The registry is what makes per-language routing possible at all;
+        // assert the two languages that would previously have collided are
+        // served by genuinely different binaries.
+        let rust = servers_for(ls_core::Language::Rust)[0].binary;
+        let python = servers_for(ls_core::Language::Python)[0].binary;
+        assert_ne!(rust, python);
     }
 
     #[test]

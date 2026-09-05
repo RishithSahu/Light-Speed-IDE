@@ -13,6 +13,7 @@
 
 mod app;
 mod compose;
+mod depgraph;
 mod devpanel;
 mod icons;
 mod json;
@@ -20,9 +21,11 @@ mod keymap;
 mod layout;
 mod lsp;
 mod menu;
+mod palette;
 mod quads;
 mod renderer;
 mod resources;
+mod settings_ui;
 mod tabs;
 mod terminal;
 mod text;

@@ -11,11 +11,14 @@
 //! not implement rather than silently pretending to succeed.
 
 pub mod clipboard;
+pub mod depgraph_cache;
 pub mod dialog;
 pub mod fsops;
 pub mod paths;
 pub mod process;
 pub mod recents;
+pub mod settings_file;
+pub mod terminal_log;
 
 use ls_log::diag::{LsError, Recoverability};
 use std::fmt;
@@ -23,7 +26,7 @@ use std::fmt;
 pub use clipboard::{system_clipboard, Clipboard, MemoryClipboard};
 pub use fsops::write_file_atomic;
 pub use paths::CanonicalPath;
-pub use process::{ProcessSampler, ProcessStats};
+pub use process::{command, ProcessSampler, ProcessStats};
 
 /// Failure of a platform service.
 #[derive(Debug)]

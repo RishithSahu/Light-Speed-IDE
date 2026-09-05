@@ -393,6 +393,7 @@ impl Document {
         self.settings
     }
 
+
     /// Adopts new editor settings after a configuration change.
     pub fn apply_settings(&mut self, settings: DocumentSettings) {
         self.settings = settings;

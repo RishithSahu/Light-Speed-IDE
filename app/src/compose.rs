@@ -128,6 +128,8 @@ pub struct Chrome<'a> {
     /// drawn on top of the selection highlight -- the selected row already
     /// reads as "the current one".
     pub sidebar_hovered_row: Option<usize>,
+    /// How far the sidebar's row list is scrolled, in logical pixels.
+    pub sidebar_scroll_y: f32,
     /// Which activity item is the current panel, if any -- drawn "cut into"
     /// the editor rather than highlighted on top of it, matching Lapce.
     pub activity_active: Option<usize>,
@@ -138,6 +140,14 @@ pub struct Chrome<'a> {
     pub bottom_panel: Option<Rect>,
     /// The bottom panel's own icon rail, to the left of its content.
     pub bottom_panel_rail: Option<Rect>,
+    /// The command palette's own floating panel, when it is open.
+    pub palette_panel: Option<Rect>,
+    /// Which filtered row (if any) is highlighted as the current selection.
+    pub palette_selected: Option<usize>,
+    /// Which filtered row the pointer is over, for a lighter hover
+    /// highlight -- never drawn over the selection, same rule as the
+    /// sidebar's own hover/selection pair.
+    pub palette_hovered: Option<usize>,
 }
 
 /// Builds the chrome for one frame.
@@ -337,11 +347,18 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
             Quad::new(Rect::new(panel.right(), panel.y, scale, panel.height), theme.sidebar_border),
         );
         // A thin rule under the header (row 0) separates the panel's title
-        // from its rows, the way a real title bar would.
+        // from its rows, the way a real title bar would. Scrolls with row 0
+        // rather than staying pinned, since row 0 is itself part of the one
+        // scrollable buffer everything else in the panel is drawn from.
         list.push_quad(
             Layer::Base,
             Quad::new(
-                Rect::new(panel.x, panel.y + layout.metrics.line_height, panel.width, scale),
+                Rect::new(
+                    panel.x,
+                    panel.y + layout.metrics.line_height - input.sidebar_scroll_y,
+                    panel.width,
+                    scale,
+                ),
                 theme.sidebar_border,
             ),
         );
@@ -349,7 +366,7 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
             if input.sidebar_selected_row != Some(row) {
                 let row_rect = Rect::new(
                     panel.x,
-                    panel.y + row as f32 * layout.metrics.line_height,
+                    panel.y + row as f32 * layout.metrics.line_height - input.sidebar_scroll_y,
                     panel.width,
                     layout.metrics.line_height,
                 );
@@ -359,7 +376,7 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
         if let Some(row) = input.sidebar_selected_row {
             let row_rect = Rect::new(
                 panel.x,
-                panel.y + row as f32 * layout.metrics.line_height,
+                panel.y + row as f32 * layout.metrics.line_height - input.sidebar_scroll_y,
                 panel.width,
                 layout.metrics.line_height,
             );
@@ -380,7 +397,7 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
             TextRegionPlacement {
                 region: Region::Sidebar,
                 origin_x: panel.x + 8.0 * scale,
-                origin_y: panel.y,
+                origin_y: panel.y - input.sidebar_scroll_y,
                 clip: panel,
                 color: theme.text,
             },
@@ -512,6 +529,46 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
                 origin_y,
                 clip: panel,
                 color: theme.dim_text,
+            },
+        );
+    }
+
+    if let Some(panel) = input.palette_panel {
+        push_panel(&mut list, panel, scale, theme.menu_background, theme.menu_border);
+
+        let line_height = layout.metrics.line_height;
+        let list_top = panel.y + line_height;
+        let row_rect = |index: usize| {
+            Rect::new(panel.x, list_top + index as f32 * line_height, panel.width, line_height)
+        };
+        if let Some(row) = input.palette_hovered {
+            if input.palette_selected != Some(row) {
+                list.push_quad(Layer::Overlay, Quad::new(row_rect(row), theme.menu_highlight));
+            }
+        }
+        if let Some(row) = input.palette_selected {
+            list.push_quad(Layer::Overlay, Quad::new(row_rect(row), theme.menu_highlight));
+        }
+        // A thin rule under the query row, echoing the sidebar header's own
+        // separator -- the query field reads as its own control, not just
+        // the first line of the result list.
+        list.push_quad(
+            Layer::Overlay,
+            Quad::new(Rect::new(panel.x, list_top, panel.width, scale), theme.sidebar_border),
+        );
+        list.push_text(
+            Layer::Overlay,
+            TextRegionPlacement {
+                region: Region::CommandPalette,
+                origin_x: panel.x + 8.0 * scale,
+                // No extra inset here (unlike the dropdown menu's own
+                // `ROW_INSET`): the row highlight quads above are computed
+                // from the same `panel.y + line_height` origin, and the two
+                // must agree exactly or the highlight drifts from the text
+                // it is supposed to sit behind.
+                origin_y: panel.y,
+                clip: panel,
+                color: theme.text,
             },
         );
     }
@@ -662,11 +719,15 @@ mod tests {
             sidebar_panel: None,
             sidebar_selected_row: None,
             sidebar_hovered_row: None,
+            sidebar_scroll_y: 0.0,
 
             activity_active: None,
             activity_hovered: None,
             bottom_panel: None,
             bottom_panel_rail: None,
+            palette_panel: None,
+            palette_selected: None,
+            palette_hovered: None,
         })
     }
 
@@ -805,11 +866,15 @@ mod tests {
             sidebar_panel: Some(panel),
             sidebar_selected_row: Some(1),
             sidebar_hovered_row: None,
+            sidebar_scroll_y: 0.0,
 
             activity_active: None,
             activity_hovered: None,
             bottom_panel: None,
             bottom_panel_rail: None,
+            palette_panel: None,
+            palette_selected: None,
+            palette_hovered: None,
         });
         assert_eq!(list.layer_of(Region::Sidebar), Some(Layer::Base));
         let fill = list
@@ -881,11 +946,15 @@ mod tests {
             sidebar_panel: None,
             sidebar_selected_row: None,
             sidebar_hovered_row: None,
+            sidebar_scroll_y: 0.0,
 
             activity_active: None,
             activity_hovered: None,
             bottom_panel: None,
             bottom_panel_rail: None,
+            palette_panel: None,
+            palette_selected: None,
+            palette_hovered: None,
         });
         assert_eq!(list.layer_of(Region::Status), None);
         assert_eq!(list.layer_of(Region::StatusRight), None);

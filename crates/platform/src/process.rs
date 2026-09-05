@@ -6,6 +6,40 @@
 
 use std::time::{Duration, Instant};
 
+/// Builds a [`std::process::Command`] that does not give its child a console
+/// window of its own.
+///
+/// **Every child process this editor spawns must come from here.** A GUI
+/// process on Windows has no console, so spawning a console application
+/// (`cmd.exe`, `git`, a language server) makes Windows allocate one *and show
+/// it*. The result is a real, visible window that has nothing to do with the
+/// editor: `git status` flashes a black box on screen every time Source
+/// Control refreshes, and opening the built-in terminal panel pops a separate
+/// `cmd.exe` window next to the app -- the panel inside the editor and a
+/// stray console outside it, showing the same session.
+///
+/// `CREATE_NO_WINDOW` suppresses that console. It does not change how the
+/// child is talked to: stdio is still piped exactly as before, which is what
+/// the terminal panel reads and what makes the output appear *inside* the
+/// editor instead of somewhere else.
+///
+/// On every other platform this is `Command::new`; there is no equivalent
+/// problem to solve.
+pub fn command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// `CREATE_NO_WINDOW` from the Win32 process creation flags: run a console
+/// application without giving it a console window.
+#[cfg(windows)]
+pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// One observation of this process's resource usage.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct ProcessStats {

@@ -73,6 +73,8 @@ pub enum Icon {
     SourceControl,
     Extensions,
     Debug,
+    /// The dependency view -- which file takes which as input.
+    TypeHierarchy,
     // Title bar.
     Menu,
     SettingsGear,
@@ -95,16 +97,27 @@ pub enum Icon {
     LayoutSidebarLeft,
     LayoutPanel,
     SplitHorizontal,
+    // The Search panel's own header and field controls.
+    Refresh,
+    ClearAll,
+    NewFile,
+    CollapseAll,
+    Ellipsis,
+    CaseSensitive,
+    WholeWord,
+    Regex,
+    Replace,
 }
 
 /// Every icon, for the tests that check the whole table against the font.
 #[cfg(test)]
-pub const ALL_ICONS: [Icon; 23] = [
+pub const ALL_ICONS: [Icon; 33] = [
     Icon::Files,
     Icon::Search,
     Icon::SourceControl,
     Icon::Extensions,
     Icon::Debug,
+    Icon::TypeHierarchy,
     Icon::Menu,
     Icon::SettingsGear,
     Icon::Play,
@@ -123,6 +136,15 @@ pub const ALL_ICONS: [Icon; 23] = [
     Icon::LayoutSidebarLeft,
     Icon::LayoutPanel,
     Icon::SplitHorizontal,
+    Icon::Refresh,
+    Icon::ClearAll,
+    Icon::NewFile,
+    Icon::CollapseAll,
+    Icon::Ellipsis,
+    Icon::CaseSensitive,
+    Icon::WholeWord,
+    Icon::Regex,
+    Icon::Replace,
 ];
 
 impl Icon {
@@ -134,6 +156,7 @@ impl Icon {
             Icon::SourceControl => '\u{ea68}',
             Icon::Extensions => '\u{eae6}',
             Icon::Debug => '\u{eb91}',
+            Icon::TypeHierarchy => '\u{ebb9}',
             Icon::Menu => '\u{eb94}',
             Icon::SettingsGear => '\u{eb51}',
             Icon::Play => '\u{eb2c}',
@@ -152,6 +175,15 @@ impl Icon {
             Icon::LayoutSidebarLeft => '\u{ebf3}',
             Icon::LayoutPanel => '\u{ebf2}',
             Icon::SplitHorizontal => '\u{eb56}',
+            Icon::Refresh => '\u{eb37}',
+            Icon::ClearAll => '\u{eabf}',
+            Icon::NewFile => '\u{ea7f}',
+            Icon::CollapseAll => '\u{eac5}',
+            Icon::Ellipsis => '\u{ea7c}',
+            Icon::CaseSensitive => '\u{eab1}',
+            Icon::WholeWord => '\u{eb7e}',
+            Icon::Regex => '\u{eb38}',
+            Icon::Replace => '\u{eb3d}',
         }
     }
 }
@@ -196,6 +228,7 @@ pub enum FileIcon {
     Lock,
     Text,
     Image,
+    Svg,
     Pdf,
     Archive,
     Word,
@@ -208,7 +241,7 @@ pub enum FileIcon {
 /// Every file icon, for the tests that check the whole table against the
 /// font.
 #[cfg(test)]
-pub const ALL_FILE_ICONS: [FileIcon; 40] = [
+pub const ALL_FILE_ICONS: [FileIcon; 41] = [
     FileIcon::Rust,
     FileIcon::Python,
     FileIcon::JavaScript,
@@ -243,6 +276,7 @@ pub const ALL_FILE_ICONS: [FileIcon; 40] = [
     FileIcon::Lock,
     FileIcon::Text,
     FileIcon::Image,
+    FileIcon::Svg,
     FileIcon::Pdf,
     FileIcon::Archive,
     FileIcon::Word,
@@ -290,6 +324,7 @@ impl FileIcon {
             FileIcon::Lock => '\u{F1030}',
             FileIcon::Text => '\u{F09ED}',
             FileIcon::Image => '\u{F021F}',
+            FileIcon::Svg => '\u{F0721}',
             FileIcon::Pdf => '\u{F0226}',
             FileIcon::Archive => '\u{F05C4}',
             FileIcon::Word => '\u{F022C}',
@@ -342,6 +377,7 @@ impl FileIcon {
             FileIcon::Lock => Color::rgb(0x8f, 0x8f, 0x8f),
             FileIcon::Text => Color::rgb(0xc9, 0xc9, 0xc9),
             FileIcon::Image => Color::rgb(0xa0, 0x74, 0xc4),
+            FileIcon::Svg => Color::rgb(0xff, 0xb1, 0x3b),
             FileIcon::Pdf => Color::rgb(0xe0, 0x3e, 0x3e),
             FileIcon::Archive => Color::rgb(0xc9, 0xa2, 0x27),
             FileIcon::Word => Color::rgb(0x41, 0xa5, 0xee),
@@ -399,7 +435,8 @@ pub fn icon_for_file(name: &str) -> FileIcon {
         "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" => FileIcon::Config,
         "lock" => FileIcon::Lock,
         "txt" | "log" => FileIcon::Text,
-        "png" | "jpg" | "jpeg" | "gif" | "svg" | "ico" | "bmp" | "webp" => FileIcon::Image,
+        "png" | "jpg" | "jpeg" | "gif" | "ico" | "bmp" | "webp" => FileIcon::Image,
+        "svg" => FileIcon::Svg,
         "pdf" => FileIcon::Pdf,
         "zip" | "tar" | "gz" | "rar" | "7z" | "bz2" | "xz" => FileIcon::Archive,
         "doc" | "docx" => FileIcon::Word,

@@ -31,6 +31,8 @@
 
 pub mod commands;
 pub mod config;
+pub mod dependency_graph;
+pub mod settings;
 pub mod document;
 pub mod editor;
 pub mod encoding;

@@ -25,6 +25,7 @@ use crate::persistence::{
 use crate::render::{self, RenderSnapshot, Viewport};
 use crate::selection::{Movement, Selection};
 use crate::workspace::{Workspace, WorkspaceId};
+use crate::dependency_graph;
 use crate::workspace_search::{self, WorkspaceSearchResult};
 use crate::EffectiveConfig;
 use ls_buffer::{line_ending, CharOffset, LineIndex};
@@ -135,6 +136,37 @@ pub fn install_default_budgets() {
 }
 
 /// The editor.
+/// Why a dependency scan could not be started.
+///
+/// Its own type rather than a bare [`ls_scheduler::SubmitError`] because the
+/// commonest reason by far -- no folder is open -- is not a scheduler
+/// failure, and reporting it as one puts "the scheduler is shutting down" in
+/// front of someone whose only mistake was not having opened a folder yet.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DependencyScanError {
+    /// There is no workspace root to scan.
+    NoWorkspace,
+    /// The scan was refused by the scheduler.
+    Submit(ls_scheduler::SubmitError),
+}
+
+impl std::fmt::Display for DependencyScanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DependencyScanError::NoWorkspace => {
+                f.write_str("open a folder first (File > Open Folder)")
+            }
+            DependencyScanError::Submit(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<ls_scheduler::SubmitError> for DependencyScanError {
+    fn from(error: ls_scheduler::SubmitError) -> Self {
+        DependencyScanError::Submit(error)
+    }
+}
+
 pub struct EditorCore {
     documents: HashMap<DocumentId, Document>,
     order: Vec<DocumentId>,
@@ -145,6 +177,10 @@ pub struct EditorCore {
     workspace: Workspace,
     clipboard: Box<dyn Clipboard>,
     config: EffectiveConfig,
+    /// What documents are edited under *now*. `config` is the snapshot this
+    /// build booted with and stays that; this moves when the settings screen
+    /// moves it.
+    document_settings: crate::document::DocumentSettings,
     events: EventQueue,
     shell_requests: Vec<ShellRequest>,
     published_revisions: HashMap<DocumentId, ContentRevision>,
@@ -184,6 +220,10 @@ pub struct EditorCore {
     /// search cancels and replaces it rather than letting two walks race.
     pending_search: Option<TaskId>,
     workspace_search_result: Option<WorkspaceSearchResult>,
+    /// The one outstanding dependency-graph scan, on the same
+    /// newest-request-wins terms as `pending_search`.
+    pending_dependency_graph: Option<TaskId>,
+    dependency_graph: Option<dependency_graph::DependencyGraph>,
 }
 
 /// Files opened recently, most-recent first (capped at
@@ -231,6 +271,7 @@ impl EditorCore {
         install_default_budgets();
         ls_perf::set_enabled(config.performance.instrumentation);
         EditorCore {
+            document_settings: config.document_settings(),
             documents: HashMap::new(),
             order: Vec::new(),
             active: None,
@@ -259,6 +300,8 @@ impl EditorCore {
             pending_git_status: None,
             git_status: None,
             pending_search: None,
+            pending_dependency_graph: None,
+            dependency_graph: None,
             workspace_search_result: None,
         }
     }
@@ -274,6 +317,9 @@ impl EditorCore {
     pub fn set_config(&mut self, config: EffectiveConfig) {
         let settings = config.document_settings();
         self.config = config;
+        // The live copy has to follow, or the next document opened would be
+        // created under the settings this replaced.
+        self.document_settings = settings;
         ls_perf::set_enabled(self.config.performance.instrumentation);
         for document in self.documents.values_mut() {
             document.apply_settings(settings);
@@ -321,7 +367,11 @@ impl EditorCore {
         let task = self.scheduler.submit(
             spec,
             Box::new(move |_cancellation| {
-                let output = std::process::Command::new("git")
+                // Through the platform helper so `git` gets no console window
+                // of its own: this runs on every Source Control refresh, and
+                // a bare spawn flashed a black console box on screen each
+                // time.
+                let output = ls_platform::command("git")
                     .args(["status", "--porcelain=v1", "-b"])
                     .current_dir(&root)
                     .output();
@@ -394,8 +444,16 @@ impl EditorCore {
                 if cancellation.is_cancelled() {
                     return TaskOutcome::Cancelled;
                 }
-                let result = workspace_search::search(&root, &query);
-                if cancellation.is_cancelled() {
+                // Cancellation is checked *inside* the walk, not just at its
+                // ends: the shell re-runs this on a debounce as the user
+                // types, so by the time a keystroke lands the search in
+                // flight is already searching for the wrong thing. Polling
+                // per file bounds the wasted work at one file rather than
+                // one whole workspace.
+                let result = workspace_search::search_cancellable(&root, &query, &|| {
+                    cancellation.is_cancelled()
+                });
+                if result.cancelled || cancellation.is_cancelled() {
                     TaskOutcome::Cancelled
                 } else {
                     TaskOutcome::Completed(TaskProduct::new(result))
@@ -412,6 +470,76 @@ impl EditorCore {
 
     pub fn is_workspace_search_pending(&self) -> bool {
         self.pending_search.is_some()
+    }
+
+    // --- dependency graph (item: file interaction view) -----------------------
+
+    /// Requests a scan of the workspace for file-to-file imports.
+    ///
+    /// Only ever runs when something asks for it -- the view is built on the
+    /// click that opens it, not kept warm in the background, because a
+    /// workspace-wide read is far too much work to be doing on the chance
+    /// somebody might look. A second request while one is in flight cancels
+    /// the first, the same discipline `request_workspace_search` follows.
+    pub fn request_dependency_graph(&mut self) -> Result<TaskId, DependencyScanError> {
+        if let Some(previous) = self.pending_dependency_graph.take() {
+            self.scheduler.cancel(previous);
+        }
+        let Some(root) = self.workspace.root().map(|c| c.as_path().to_path_buf()) else {
+            return Err(DependencyScanError::NoWorkspace);
+        };
+        let cancellation = CancellationToken::new();
+        let spec = TaskSpec::new(
+            SubsystemId::INDEXING,
+            self.scheduler.base_priority(SubsystemId::INDEXING),
+            ResourceClass::Cpu,
+        )
+        .with_cancellation(cancellation.clone())
+        .with_workspace(WorkspaceRef(self.workspace.id().get()));
+
+        let task = self.scheduler.submit(
+            spec,
+            Box::new(move |cancellation| {
+                if cancellation.is_cancelled() {
+                    return TaskOutcome::Cancelled;
+                }
+                let graph = dependency_graph::build(&root);
+                if cancellation.is_cancelled() {
+                    TaskOutcome::Cancelled
+                } else {
+                    TaskOutcome::Completed(TaskProduct::new(graph))
+                }
+            }),
+        )?;
+        self.pending_dependency_graph = Some(task);
+        Ok(task)
+    }
+
+    /// Changes the settings new and open documents edit under.
+    ///
+    /// The configuration loaded at startup is a snapshot of what this build
+    /// booted with and stays that; this is the live value, which the settings
+    /// screen moves. Applied to every open document as well as to the ones
+    /// opened next, so changing the tab width does not leave the file already
+    /// on screen indenting the old way.
+    pub fn set_document_settings(&mut self, settings: crate::document::DocumentSettings) {
+        self.document_settings = settings;
+        for document in self.documents.values_mut() {
+            document.apply_settings(settings);
+        }
+    }
+
+    /// The settings documents are currently edited under.
+    pub fn document_settings(&self) -> crate::document::DocumentSettings {
+        self.document_settings
+    }
+
+    pub fn dependency_graph(&self) -> Option<&dependency_graph::DependencyGraph> {
+        self.dependency_graph.as_ref()
+    }
+
+    pub fn is_dependency_graph_pending(&self) -> bool {
+        self.pending_dependency_graph.is_some()
     }
 
     // --- documents ------------------------------------------------------------
@@ -599,6 +727,10 @@ impl EditorCore {
                 applied += self.apply_search_completion(completion);
                 continue;
             }
+            if completion.subsystem == SubsystemId::INDEXING {
+                applied += self.apply_dependency_graph_completion(completion);
+                continue;
+            }
             if completion.subsystem != SubsystemId::DOCUMENT_IO {
                 // Every subsystem that can complete work has a handler above
                 // or here; anything else is a caller mistake worth seeing
@@ -691,6 +823,25 @@ impl EditorCore {
         0
     }
 
+    fn apply_dependency_graph_completion(
+        &mut self,
+        completion: ls_scheduler::TaskCompletion,
+    ) -> usize {
+        // A completion for a scan that has since been superseded is dropped,
+        // not applied: the same staleness guard the search path uses.
+        if self.pending_dependency_graph != Some(completion.task) {
+            return 0;
+        }
+        self.pending_dependency_graph = None;
+        if let CompletionOutcome::Completed(product) = completion.outcome {
+            if let Ok(graph) = product.downcast::<dependency_graph::DependencyGraph>() {
+                self.dependency_graph = Some(*graph);
+                return 1;
+            }
+        }
+        0
+    }
+
     fn document_for_task(&self, task: TaskId) -> Option<DocumentId> {
         self.loading.iter().find(|(_, pending)| pending.task == task).map(|(document, _)| *document)
     }
@@ -756,7 +907,7 @@ impl EditorCore {
             data.line_ending,
             data.mixed_line_endings,
             data.stamp,
-            self.config.document_settings(),
+            self.document_settings,
         );
         let lines = document.text().len_lines();
         self.documents.insert(id, document);
@@ -911,7 +1062,7 @@ impl EditorCore {
         self.untitled_counter += 1;
         let name = format!("Untitled-{}", self.untitled_counter);
         let id = self.allocate_id();
-        let document = Document::untitled(id, name, self.config.document_settings());
+        let document = Document::untitled(id, name, self.document_settings);
         self.documents.insert(id, document);
         self.order.push(id);
         self.active = Some(id);
@@ -1221,7 +1372,7 @@ impl EditorCore {
 
     /// Inserts one indentation step.
     pub fn insert_tab(&mut self) {
-        let settings = self.config.document_settings();
+        let settings = self.document_settings;
         if settings.insert_spaces {
             let spaces = " ".repeat(settings.tab_width);
             self.type_text(&spaces);
@@ -2242,6 +2393,40 @@ mod tests {
         let document = editor.document(id).unwrap();
         let line = document.text().char_to_line(document.selections().primary().head);
         assert_eq!(line, LineIndex::new(70));
+    }
+
+    #[test]
+    fn the_settings_screen_and_the_config_file_do_not_fight_over_documents() {
+        // Two ways in: the configuration read at startup, and the settings
+        // screen while running. They have to leave the same answer behind,
+        // or whichever ran last silently wins and the next document opened
+        // is created under settings nobody chose.
+        let mut editor = editor();
+        let id = editor.new_document();
+
+        let mut config = EffectiveConfig::default();
+        config.editor.tab_width = 8;
+        editor.set_config(config);
+        assert_eq!(editor.document_settings().tab_width, 8, "the live copy followed the config");
+
+        editor.set_document_settings(ls_core_document_settings(2));
+        assert_eq!(editor.document_settings().tab_width, 2);
+        assert_eq!(editor.document(id).unwrap().settings().tab_width, 2, "and reached the file");
+
+        let second = editor.new_document();
+        assert_eq!(
+            editor.document(second).unwrap().settings().tab_width,
+            2,
+            "and the next file opened"
+        );
+    }
+
+    fn ls_core_document_settings(tab_width: usize) -> crate::document::DocumentSettings {
+        crate::document::DocumentSettings {
+            tab_width,
+            insert_spaces: true,
+            coalesce_window: crate::history::DEFAULT_COALESCE_WINDOW,
+        }
     }
 
     #[test]

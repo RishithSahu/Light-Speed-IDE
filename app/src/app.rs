@@ -68,6 +68,20 @@ const EXTERNAL_WATCH_INTERVAL: Duration = Duration::from_millis(1500);
 const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK_SLOP: f32 = 4.0;
 
+/// How long typing has to pause before the workspace search actually runs.
+///
+/// Results follow the query as it is typed, which is only affordable because
+/// of this: without it, "needle" is six full workspace walks, five of them
+/// for prefixes nobody asked about. At a typical typing cadence this fires
+/// once per word rather than once per letter, and the walk that *is* running
+/// when the next keystroke lands is cancelled mid-flight
+/// (`workspace_search::search_cancellable`) rather than left to finish.
+///
+/// 150ms is the usual sweet spot: below a fast typist's inter-key gap (so it
+/// does not fire mid-word), and short enough that the results feel attached
+/// to the typing rather than trailing it.
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+
 /// Which part of the window input is currently addressed to.
 ///
 /// The shell used to have no answer to this question, and two defects came out
@@ -105,6 +119,9 @@ pub enum InputFocus {
     List,
     /// The command-runner panel owns the keyboard.
     Terminal,
+    /// The command palette owns the keyboard until it runs a command or is
+    /// dismissed.
+    CommandPalette,
 }
 
 /// Where a wheel event should go.
@@ -112,6 +129,10 @@ pub enum InputFocus {
 pub enum WheelTarget {
     /// Scroll the active document.
     Editor,
+    /// Scroll the sidebar's row list.
+    Sidebar,
+    /// Scroll back through the terminal's output.
+    BottomPanel,
     /// The tab bar, the menu bar, or the status bar: no editor scrolling.
     Chrome,
     /// A modal-ish surface owns input; nothing scrolls.
@@ -124,16 +145,35 @@ pub enum WheelTarget {
 ///
 /// ```text
 /// pointer over editor / gutter / scrollbar -> editor scrolls
+/// pointer over the sidebar's row list      -> the sidebar scrolls
 /// pointer over tab bar or menu bar         -> nothing scrolls
 /// a dropdown or a confirmation is up       -> nothing scrolls
 /// ```
 pub fn wheel_target(layout: &Layout, focus: InputFocus, x: f32, y: f32) -> WheelTarget {
+    // Checked ahead of `focus`: the sidebar is non-modal chrome, not a
+    // surface that claims the wheel only while it holds keyboard focus --
+    // scrolling it while the caret is still in the editor (or the list has
+    // just been clicked into, which is `InputFocus::List`) is the whole
+    // point of it staying open non-modally. `layout.sidebar` is a
+    // zero-width rect when the panel is hidden, so this never fires then.
+    if layout.sidebar.contains(x, y) {
+        return WheelTarget::Sidebar;
+    }
+    // Same reasoning for the terminal: scrolling back through output is not
+    // something that should require clicking into the panel first, and it
+    // must work while `InputFocus::Terminal` holds the keyboard rather than
+    // being swallowed by the "a modal surface owns input" arm below.
+    // `layout.bottom_panel` is empty when the panel is hidden.
+    if layout.bottom_panel_visible && layout.bottom_panel.contains(x, y) {
+        return WheelTarget::BottomPanel;
+    }
     match focus {
         InputFocus::Menu
         | InputFocus::Prompt
         | InputFocus::SearchQuery
-        | InputFocus::List
-        | InputFocus::Terminal => WheelTarget::Blocked,
+        | InputFocus::Terminal
+        | InputFocus::CommandPalette => WheelTarget::Blocked,
+        InputFocus::List => WheelTarget::Chrome,
         // The find bar takes the keyboard, not the mouse: looking elsewhere in
         // the document while search results are up is normal, not a reason to
         // swallow the wheel.
@@ -248,21 +288,169 @@ pub fn derive_focus(
     find_open: bool,
     list_open: bool,
     terminal_visible: bool,
+    command_palette_open: bool,
 ) -> InputFocus {
     if prompt_open {
         InputFocus::Prompt
+    } else if command_palette_open {
+        InputFocus::CommandPalette
     } else if menu_open {
         InputFocus::Menu
-    } else if search_query_open {
-        InputFocus::SearchQuery
     } else if find_open {
         InputFocus::Find
+    // A typed workspace-search query is a resting focus, not an exclusive
+    // one, the same as List/Terminal below and for the same bug this fixes:
+    // `search_query_open` alone used to force `SearchQuery` back on every
+    // refresh (a diagnostics update, a heartbeat tick, anything routed
+    // through `after_state_change`), so a click into the editor -- which
+    // sets `focus` directly rather than through here -- got silently
+    // reverted the moment anything else refreshed. It reads as the editor
+    // being stuck until Escape, because functionally it was. Entering
+    // `SearchQuery` is still an explicit act (`open_search_query`); this
+    // only stops it from being *re*-entered against the user's own click.
+    } else if current == InputFocus::SearchQuery && search_query_open {
+        InputFocus::SearchQuery
     } else if current == InputFocus::List && list_open {
         InputFocus::List
     } else if current == InputFocus::Terminal && terminal_visible {
         InputFocus::Terminal
     } else {
         InputFocus::Editor
+    }
+}
+
+/// How many lines of terminal output fit in the bottom panel, after the
+/// header and the input line have taken their rows.
+///
+/// A pure function of the layout for the same reason `wheel_target` is: the
+/// scroll clamp and the row builder have to agree on this number exactly, or
+/// scrolling either stops short of the end or runs past it.
+pub fn terminal_visible_lines(layout: &Layout) -> usize {
+    const CHROME_ROWS: usize = 2; // the header, and the input line
+    let line_height = layout.metrics.line_height.max(1.0);
+    let rows = (layout.bottom_panel.height / line_height).floor() as usize;
+    rows.saturating_sub(CHROME_ROWS).max(1)
+}
+
+/// The byte offset in `line` for character index `cursor`, clamped to the
+/// line's own length in characters.
+///
+/// Every terminal-input edit needs this: `String` operations (`insert_str`,
+/// `replace_range`) are byte-indexed, but a cursor is inherently a character
+/// position -- someone arrowing past an accented letter or an emoji has moved
+/// one character, not however many bytes it happens to encode as. Splicing
+/// at a raw byte offset derived any other way risks landing mid-character,
+/// which is not a rare-input edge case here so much as the ordinary case for
+/// text that is not pure ASCII.
+fn terminal_char_boundary(line: &str, cursor: usize) -> usize {
+    line.char_indices().nth(cursor).map(|(byte, _)| byte).unwrap_or(line.len())
+}
+
+/// Builds the terminal's live input row with a visible cursor spliced in at
+/// character index `cursor`.
+///
+/// A pure function of the same shape as `terminal_visible_lines`, and worth
+/// pulling out for the same reason: this is the fix for "the cursor is not
+/// visible in the terminal" landing somewhere it can be asserted on
+/// directly rather than only eyeballed in a screenshot. The block glyph is
+/// spliced into the plain-text row itself rather than drawn as a separate,
+/// distinctly colored overlay, because `Region::BottomPanel` is rendered
+/// with `set_text` -- one color for the whole region, no per-character
+/// spans the way `RichText` gives the sidebar and the command palette their
+/// colored icons and highlights (see `text::TextEngine::set_rich_text`).
+pub fn terminal_input_row(input: &str, cursor: usize) -> String {
+    let byte = terminal_char_boundary(input, cursor);
+    let mut row = String::with_capacity(input.len() + "> ".len() + '\u{2588}'.len_utf8());
+    row.push_str("> ");
+    row.push_str(&input[..byte]);
+    row.push('\u{2588}');
+    row.push_str(&input[byte..]);
+    row
+}
+
+/// Which way the terminal's command history is being walked.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HistoryDirection {
+    /// Up: toward commands run further in the past.
+    Older,
+    /// Down: back toward the live input line.
+    Newer,
+}
+
+/// Resolves one Up/Down press against the command history, returning the
+/// index it lands on (`None` means back at the live input line, not
+/// recalling anything).
+///
+/// A pure function for the same reason `wheel_target` is: recall has to
+/// agree exactly with what `terminal_command_history` actually holds, or
+/// pressing Up either skips the newest command or walks one entry past the
+/// oldest into a panic. `current` is `None` while the live line is showing
+/// (a fresh prompt, or Down walked past the newest entry back to it).
+///
+/// Older never runs off the front (it just stops at index `0`, the oldest
+/// entry, the way a real shell's history does); Newer past the newest entry
+/// returns to `None` rather than wrapping.
+pub fn navigate_terminal_history(
+    history: &[String],
+    current: Option<usize>,
+    direction: HistoryDirection,
+) -> Option<usize> {
+    if history.is_empty() {
+        return None;
+    }
+    match (direction, current) {
+        (HistoryDirection::Older, None) => Some(history.len() - 1),
+        (HistoryDirection::Older, Some(index)) => Some(index.saturating_sub(1)),
+        (HistoryDirection::Newer, Some(index)) if index + 1 < history.len() => Some(index + 1),
+        (HistoryDirection::Newer, _) => None,
+    }
+}
+
+/// What a click on a sidebar row acts on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SidebarClick {
+    /// The Search panel's own header, which is a text field rather than a
+    /// caption: the click belongs to the field, not to the list.
+    SearchField,
+    /// List entry `0`-based `index`, below the header.
+    Row(usize),
+    /// An ordinary panel's title line. Nothing to act on.
+    Header,
+}
+
+/// Resolves a sidebar click by row, given how many header lines the panel
+/// has and whether it is the Search panel.
+///
+/// A pure function for the same reason `wheel_target` is, and for a bug worth
+/// pinning down: the Search panel's header is *interactive*, which no other
+/// panel's is. Treating "the click is in the header" as "the click does
+/// nothing to the list, so claim list focus and move on" is what made
+/// clicking the search box silently take the keyboard away from it.
+pub fn sidebar_click(row: usize, header_lines: usize, is_search_panel: bool) -> SidebarClick {
+    if row >= header_lines {
+        return SidebarClick::Row(row - header_lines);
+    }
+    if is_search_panel {
+        SidebarClick::SearchField
+    } else {
+        SidebarClick::Header
+    }
+}
+
+/// Whether a workspace-search result that has landed is for the query in the
+/// search field right now.
+///
+/// A pure function for the same reason `wheel_target` is: this is the rule
+/// that keeps a panel updating as you type from showing the wrong thing.
+/// Searches run on a worker against a query captured when they were
+/// dispatched, so the result in hand is routinely for a prefix of what has
+/// since been typed -- "nee" landing under a field that already reads
+/// "needle". `typed` is `None` once the field is dismissed but the results
+/// are still on screen, where whatever last completed is what to show.
+pub fn search_result_is_current(result_query: &str, typed: Option<&str>) -> bool {
+    match typed {
+        Some(query) => result_query == query,
+        None => true,
     }
 }
 
@@ -391,22 +579,52 @@ enum ListKind {
 }
 
 /// The persistent activity bar's icons, top to bottom -- Explorer, Search,
-/// Source Control, Extensions, Debug, matching Lapce's own default order.
-const ACTIVITY_ICONS: [crate::icons::Icon; 5] = [
+/// Source Control, Extensions, Debug, matching Lapce's own default order,
+/// then Dependencies, which is ours.
+const ACTIVITY_ICONS: [crate::icons::Icon; 6] = [
     crate::icons::Icon::Files,
     crate::icons::Icon::Search,
     crate::icons::Icon::SourceControl,
     crate::icons::Icon::Extensions,
     crate::icons::Icon::Debug,
+    crate::icons::Icon::TypeHierarchy,
 ];
 
-/// Which activity-bar row (by index into [`ACTIVITY_LABELS`]) is wired to a
-/// real action. `Extensions` and `Debug` have no subsystem behind them --
-/// they render dimmed and inert, present for layout fidelity rather than
-/// faking a feature that does not exist.
+/// Which activity-bar row is wired to a real action. `Extensions` and
+/// `Debug` have no subsystem behind them -- they render dimmed and inert,
+/// present for layout fidelity rather than faking a feature that does not
+/// exist.
 const ACTIVITY_EXPLORER: usize = 0;
 const ACTIVITY_SEARCH: usize = 1;
 const ACTIVITY_SOURCE_CONTROL: usize = 2;
+/// The dependency view. Its scan is expensive enough to be worth not doing
+/// on startup, so it runs on this click and nowhere else.
+const ACTIVITY_DEPENDENCIES: usize = 5;
+
+/// Which settings file the screen is editing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SettingsScope {
+    /// This person's own settings, which follow them between projects.
+    User,
+    /// This project's settings, committed with its code.
+    Workspace,
+}
+
+/// A press being held over the dependency graph.
+#[derive(Copy, Clone, Debug)]
+struct DependencyPress {
+    /// Where the button went down. Never moves, so the release can tell a
+    /// click from a drag.
+    origin: (f32, f32),
+    /// Where the pointer has reached, so each motion pans by its own step.
+    at: (f32, f32),
+    /// The node the press started on, if any.
+    node: Option<usize>,
+}
+
+/// How much one notch of the wheel zooms the dependency graph. Chosen so a
+/// notch is a noticeable step and about eight of them cross the whole range.
+const ZOOM_PER_NOTCH: f32 = 1.25;
 
 /// What the editor is waiting for the user to decide.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -420,7 +638,9 @@ pub enum Prompt {
 /// This is the only way background work reaches the shell: a worker publishes a
 /// completion and wakes the loop, the loop pumps, and every resulting state
 /// change happens here on the event-loop thread (amendment section 3.6).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Not `Copy`/`Eq` any more: `FolderPicked` carries an owned answer rather
+/// than being a bare wake-up signal like the rest.
+#[derive(Debug)]
 pub enum UserEvent {
     /// A scheduler task finished; drain and apply completions.
     TaskCompleted,
@@ -432,6 +652,10 @@ pub enum UserEvent {
     /// split as the two events above: the reader thread only appends to a
     /// shared buffer and wakes the loop.
     LspDiagnostics,
+    /// The folder picker closed. Carries the answer directly, since unlike
+    /// the events above there is no shared buffer to drain -- one dialog
+    /// produces one path (or `None` for cancelled).
+    FolderPicked(Box<Result<Option<PathBuf>, ls_platform::PlatformError>>),
 }
 
 /// How prominently a status message should read.
@@ -481,6 +705,51 @@ pub struct LightSpeed {
     startup_paths: Vec<PathBuf>,
     /// Sends [`UserEvent`]s from a worker back onto the event-loop thread.
     proxy: EventLoopProxy<UserEvent>,
+    /// Whether the settings screen has taken over the editor area.
+    settings_open: bool,
+    /// Settings this person chose, wherever they are.
+    user_settings: ls_core::settings::Settings,
+    /// Settings this project chose, committed alongside its code.
+    workspace_settings: ls_core::settings::Settings,
+    /// The two merged, which is what the rest of the shell reads.
+    settings: ls_core::settings::Settings,
+    /// Which file the screen is editing.
+    settings_scope: SettingsScope,
+    /// What has been typed into the search box.
+    settings_query: String,
+    /// The section picked on the left, or `None` for all of them.
+    settings_section: Option<usize>,
+    /// How far the list is scrolled, in rows.
+    settings_scroll: usize,
+    /// The field being typed into, and what has been typed so far. Held as a
+    /// draft rather than written through on every keystroke, so a half-typed
+    /// number never reaches the rest of the application.
+    settings_editing: Option<(&'static str, String)>,
+    /// Whether the search box has the keyboard.
+    settings_search_focused: bool,
+    /// The screen as last measured, so a click resolves against exactly what
+    /// was drawn.
+    settings_screen: crate::settings_ui::Screen,
+    /// Whether the dependency view has taken over the editor area.
+    dependency_view: bool,
+    /// The settled simulation: who imports whom and where each file rests.
+    /// Expensive to produce and independent of the window, so this is what
+    /// is cached on disk between sessions.
+    dependency_settled: Option<crate::depgraph::Settled>,
+    /// The settled graph fitted to the current pane. Cheap, and rebuilt
+    /// whenever the window resizes.
+    dependency_scene: Option<crate::depgraph::Scene>,
+    /// Where the reader has panned and zoomed to.
+    dependency_view_at: crate::depgraph::View,
+    /// The node under the pointer, traced along its edges.
+    dependency_hovered: Option<usize>,
+    /// A press being held over the graph: where it started, where the
+    /// pointer has reached, and which node it began on. The origin is kept
+    /// apart from the running position because a drag that ends somewhere
+    /// else is a pan, and only a press that stayed put opens a file.
+    dependency_press: Option<DependencyPress>,
+    /// Whether the graph on screen came off the disk rather than a scan.
+    dependency_from_cache: bool,
     dev_panel_visible: bool,
     dev_panel_rows: Vec<String>,
     resource_center_visible: bool,
@@ -488,6 +757,29 @@ pub struct LightSpeed {
     heartbeat: Heartbeat,
     menu: MenuState,
     menu_geometry: Option<menu::MenuGeometry>,
+    /// Whether the command palette is open, and what it is doing while it
+    /// is: `command_palette_query` is what has been typed so far,
+    /// `command_palette_selected` is the highlighted row (by index into the
+    /// filtered list, recomputed fresh each frame rather than stored), and
+    /// `command_palette_hovered` mirrors `sidebar_hovered_row`'s role for
+    /// the sidebar.
+    /// When the debounced workspace search should actually run, if a query
+    /// has been typed since the last one was dispatched. `None` means there
+    /// is nothing waiting -- the event loop only wakes for this when it is
+    /// `Some` (see `next_wakeup`), so an idle search panel costs nothing.
+    search_debounce_deadline: Option<Instant>,
+    /// Whether a folder picker is already on screen. It runs on its own
+    /// thread now, so unlike a modal dialog nothing else stops a second
+    /// request from arriving while the first is still open.
+    folder_picker_open: bool,
+    command_palette_open: bool,
+    command_palette_query: String,
+    command_palette_selected: usize,
+    command_palette_hovered: Option<usize>,
+    /// The palette's own floating panel rectangle for the frame on screen,
+    /// the same reason `tab_geometry` is stored rather than recomputed at
+    /// click time: drawing and hit testing must agree on one rectangle.
+    palette_geometry: Option<crate::layout::Rect>,
     /// The tab bar's rectangles for the frame that is on screen. Computed once
     /// per frame and handed to both the renderer and the click handler.
     tab_geometry: TabGeometry,
@@ -556,6 +848,12 @@ pub struct LightSpeed {
     /// header, see `sidebar_selected_row`) the pointer is currently over, for
     /// a hover highlight distinct from the selection.
     sidebar_hovered_row: Option<usize>,
+    /// How far the sidebar's row list is scrolled, in logical pixels. Its own
+    /// state rather than a derived value, the same reason the editor's
+    /// `scroll_y` lives on `EditorView` instead of being recomputed from the
+    /// caret every frame -- a list taller than the panel needs somewhere to
+    /// remember where the user left it.
+    sidebar_scroll_y: f32,
     /// The bottom panel's height in logical pixels, dragged via the grip on
     /// its top edge. Same shape as `sidebar_width`, on the vertical axis.
     bottom_panel_height: f32,
@@ -572,11 +870,39 @@ pub struct LightSpeed {
     terminal: Option<crate::terminal::Terminal>,
     terminal_visible: bool,
     terminal_scrollback: String,
+    /// How far the terminal view is scrolled back, in lines up from the
+    /// newest output. `0` means pinned to the bottom, which is where it sits
+    /// unless the user deliberately scrolls away -- so output written while
+    /// they are reading history does not yank the view out from under them.
+    terminal_scroll_lines: usize,
     terminal_input: String,
-    /// The one running language server, if a recognized document has been
-    /// opened. Keyed by nothing -- Stage 1.1 runs at most one, for whichever
-    /// language last needed it, since only Rust has a server configured.
-    lsp: Option<crate::lsp::LspClient>,
+    /// Where the caret sits in `terminal_input`, as a character index (never
+    /// a byte offset -- see `terminal_char_boundary`). `0` is before the
+    /// first character; `terminal_input.chars().count()` is past the last
+    /// one, which is where a fresh or freshly-recalled line leaves it.
+    terminal_cursor: usize,
+    /// Commands run this session, oldest first, for the Up/Down recall
+    /// `terminal_history_index` walks. Separate from the *permanent*
+    /// transcript (`ls_platform::terminal_log`, written from
+    /// `Terminal::send_line`/`drain_output`): that one is an unbounded,
+    /// append-only record meant for reading later outside the editor; this
+    /// one is a bounded, in-memory list meant for recall inside it, the same
+    /// distinction a real shell draws between its history file and what
+    /// pressing Up walks through in the current session.
+    terminal_command_history: Vec<String>,
+    /// Which entry of `terminal_command_history` Up/Down has navigated to,
+    /// counting from the oldest. `None` means the input line is live text
+    /// the user is typing, not a recalled command -- the state a fresh
+    /// prompt and a Down-arrowed-past-the-newest-entry prompt share.
+    terminal_history_index: Option<usize>,
+    /// What was being typed before the first Up press, restored if Down
+    /// walks back past the newest history entry to a live line again.
+    terminal_history_draft: String,
+    /// The running language servers, one per language, started on demand.
+    /// Previously a single shared client, which meant the first recognized
+    /// document's server received every later document too, whatever
+    /// language it was.
+    lsp: crate::lsp::LspManager,
     /// Documents the server has already been told about, so `didOpen` is
     /// sent exactly once per document.
     lsp_opened: std::collections::HashSet<DocumentId>,
@@ -653,6 +979,24 @@ impl LightSpeed {
             overlay_rows: Vec::new(),
             startup_paths,
             proxy,
+            settings_open: false,
+            user_settings: ls_core::settings::Settings::new(),
+            workspace_settings: ls_core::settings::Settings::new(),
+            settings: ls_core::settings::Settings::new(),
+            settings_scope: SettingsScope::User,
+            settings_query: String::new(),
+            settings_section: None,
+            settings_scroll: 0,
+            settings_editing: None,
+            settings_search_focused: false,
+            settings_screen: crate::settings_ui::Screen::default(),
+            dependency_view: false,
+            dependency_settled: None,
+            dependency_scene: None,
+            dependency_view_at: crate::depgraph::View::default(),
+            dependency_hovered: None,
+            dependency_press: None,
+            dependency_from_cache: false,
             dev_panel_visible: false,
             dev_panel_rows: Vec::new(),
             resource_center_visible: false,
@@ -660,6 +1004,13 @@ impl LightSpeed {
             heartbeat: Heartbeat::new(),
             menu: MenuState::default(),
             menu_geometry: None,
+            search_debounce_deadline: None,
+            folder_picker_open: false,
+            command_palette_open: false,
+            command_palette_query: String::new(),
+            command_palette_selected: 0,
+            command_palette_hovered: None,
+            palette_geometry: None,
             tab_geometry: TabGeometry::default(),
             focus: InputFocus::Editor,
             last_active: None,
@@ -683,6 +1034,7 @@ impl LightSpeed {
             dragging_sidebar: false,
             sidebar_grip_hovered: false,
             sidebar_hovered_row: None,
+            sidebar_scroll_y: 0.0,
             bottom_panel_height: crate::layout::BOTTOM_PANEL_HEIGHT,
             dragging_bottom_panel: false,
             bottom_panel_grip_hovered: false,
@@ -692,8 +1044,13 @@ impl LightSpeed {
             terminal: None,
             terminal_visible: false,
             terminal_scrollback: String::new(),
+            terminal_scroll_lines: 0,
             terminal_input: String::new(),
-            lsp: None,
+            terminal_cursor: 0,
+            terminal_command_history: Vec::new(),
+            terminal_history_index: None,
+            terminal_history_draft: String::new(),
+            lsp: crate::lsp::LspManager::default(),
             lsp_opened: std::collections::HashSet::new(),
             lsp_last_persistence: HashMap::new(),
             lsp_applied_version: HashMap::new(),
@@ -802,6 +1159,16 @@ impl LightSpeed {
                     ),
                 }
             }
+        }
+
+        // A finished scan is settled and saved once, here, rather than on
+        // every frame that notices it.
+        if self.dependency_view
+            && self.dependency_settled.is_none()
+            && !self.core.is_dependency_graph_pending()
+            && self.core.dependency_graph().is_some()
+        {
+            self.adopt_dependency_scan();
         }
 
         // Once a load is no longer in flight (loaded, failed, or cancelled)
@@ -918,6 +1285,12 @@ impl LightSpeed {
                 ShellRequest::OpenFolderDialog => self.show_open_folder_dialog(),
                 ShellRequest::WorkspaceSearch => self.open_search_query(),
                 ShellRequest::ToggleGitStatus => self.toggle_git_status(),
+                ShellRequest::ToggleSettings => self.toggle_settings(),
+                ShellRequest::RefreshDependencyView => self.refresh_dependency_view(),
+                ShellRequest::ToggleDependencyView => {
+                    let active = self.activity_active_index() == Some(ACTIVITY_DEPENDENCIES);
+                    self.toggle_dependency_view(active);
+                }
                 ShellRequest::ToggleTerminal => self.toggle_terminal(),
                 ShellRequest::ToggleStatusBar => {
                     self.show_status_bar = !self.show_status_bar;
@@ -1009,6 +1382,14 @@ impl LightSpeed {
     }
 
     fn open_path_with(&mut self, path: PathBuf, injection: LoadInjection) {
+        // `lightspeed .` is an ordinary thing to type, and a directory is not
+        // a document: opening it as the workspace is what was meant. Without
+        // this it reported "... is a directory" and started on an empty
+        // buffer with no workspace at all.
+        if path.is_dir() {
+            self.open_workspace_at(path);
+            return;
+        }
         match self.core.request_open_document_with(&path, injection) {
             Ok(request) => {
                 // A joined request reuses a document already loading, whose
@@ -1202,6 +1583,19 @@ impl LightSpeed {
         self.request_redraw();
     }
 
+    /// Scrolls the sidebar's row list rather than the document -- the same
+    /// shape as `scroll_by_pixels`, clamped against the sidebar's own row
+    /// count instead of the document's line count.
+    fn scroll_sidebar_by_pixels(&mut self, dy: f32) {
+        let Some(layout) = self.last_layout else { return };
+        let sidebar_rich = self.sidebar_rows(&layout);
+        let total_height =
+            (sidebar_rich.text.matches('\n').count() + 1) as f32 * layout.metrics.line_height;
+        let max_scroll = (total_height - layout.sidebar.height).max(0.0);
+        self.sidebar_scroll_y = (self.sidebar_scroll_y - dy).clamp(0.0, max_scroll);
+        self.request_redraw();
+    }
+
     fn on_mouse_press(&mut self, x: f32, y: f32) {
         let Some(layout) = self.last_layout else { return };
 
@@ -1245,8 +1639,32 @@ impl LightSpeed {
             }
         }
 
+        // The palette is drawn over everything else too, and gets the click
+        // before anything underneath it does.
+        if self.command_palette_open {
+            let hit = self
+                .palette_geometry
+                .and_then(|panel| crate::palette::row_hit(panel, layout.metrics.line_height, x, y));
+            match hit {
+                Some(index) => {
+                    self.command_palette_selected = index;
+                    self.run_palette_selection();
+                }
+                None => self.close_command_palette(),
+            }
+            return;
+        }
+
         if self.prompt.is_some() {
             // The confirmation owns input until it is answered.
+            return;
+        }
+
+        // Clicking the title bar's own command field opens the palette --
+        // Lapce's primary entry point for it, the search-box look it already
+        // had before this was wired to anything.
+        if layout.title_search.contains(x, y) {
+            self.open_command_palette();
             return;
         }
 
@@ -1282,6 +1700,16 @@ impl LightSpeed {
             return;
         }
 
+        // The settings screen and the graph both stand in for the document,
+        // so they take presses over the editor area before the editor's own
+        // handling can place a caret in a document nobody can see.
+        if layout.text.contains(x, y) && self.press_settings(x, y) {
+            return;
+        }
+        if self.press_dependency_view(x, y, &layout) {
+            return;
+        }
+
         if layout.bottom_panel_visible && layout.bottom_panel_rail.contains(x, y) {
             self.toggle_terminal();
             return;
@@ -1290,6 +1718,15 @@ impl LightSpeed {
         if layout.bottom_panel_visible && layout.bottom_panel.contains(x, y) {
             self.focus_terminal();
             return;
+        }
+
+        if layout.title_actions.contains(x, y) {
+            // The right-hand cluster is Run and then the gear. Only the gear
+            // does anything today, and it is the second of the two.
+            if x >= layout.title_actions.x + layout.title_actions.width / 2.0 {
+                self.toggle_settings();
+                return;
+            }
         }
 
         if layout.tab_bar.contains(x, y) {
@@ -1310,19 +1747,36 @@ impl LightSpeed {
         }
 
         if layout.sidebar_visible && layout.sidebar.contains(x, y) && self.active_list.is_some() {
-            // Clicking anywhere in the panel claims its focus outright, the
-            // same as clicking a tab claims the editor's -- otherwise a click
-            // on a row while the editor happened to have focus would select
-            // the row but leave the keyboard pointed at the document.
-            self.focus_list();
-            // Row 0 is the header, drawn but not itself a list entry.
-            let row = ((y - layout.sidebar.y) / layout.metrics.line_height) as usize;
-            if row >= 1 {
-                let rows = self.list_rows();
-                let index = row - 1;
-                if index < rows.len() {
-                    self.list_selected = index;
-                    self.activate_list_selection();
+            // Rows before `sidebar_header_lines()` are the panel's own
+            // header -- a single title line normally, or the Search panel's
+            // title/field/replace block -- drawn but not a list entry.
+            let header_lines = self.sidebar_header_lines();
+            let row = ((y - layout.sidebar.y + self.sidebar_scroll_y) / layout.metrics.line_height)
+                as usize;
+
+            match sidebar_click(row, header_lines, self.showing_search_panel()) {
+                // The Search panel's header is a text field, not a caption:
+                // clicking it has to put the keyboard *into* it. Claiming
+                // list focus here instead is exactly what made clicking the
+                // search box appear to do nothing -- the panel was open, the
+                // caret was drawn, and every keystroke went to the results.
+                SidebarClick::SearchField => {
+                    self.focus_search_field();
+                }
+                SidebarClick::Header => {
+                    self.focus_list();
+                }
+                SidebarClick::Row(index) => {
+                    // Clicking a row claims the panel's focus outright, the
+                    // same as clicking a tab claims the editor's -- otherwise
+                    // a click on a row while the editor happened to have
+                    // focus would select the row but leave the keyboard
+                    // pointed at the document.
+                    self.focus_list();
+                    if index < self.list_rows().len() {
+                        self.list_selected = index;
+                        self.activate_list_selection();
+                    }
                 }
             }
             return;
@@ -1375,13 +1829,23 @@ impl LightSpeed {
             && !any_grip_hovered
             && self.active_list.is_some()
         {
-            let row = ((y - layout.sidebar.y) / layout.metrics.line_height) as usize;
-            (row >= 1 && row - 1 < self.list_rows().len()).then_some(row)
+            let header_lines = self.sidebar_header_lines();
+            let row = ((y - layout.sidebar.y + self.sidebar_scroll_y) / layout.metrics.line_height)
+                as usize;
+            (row >= header_lines && row - header_lines < self.list_rows().len()).then_some(row)
         } else {
             None
         };
         if hovered_row != self.sidebar_hovered_row {
             self.sidebar_hovered_row = hovered_row;
+            self.request_redraw();
+        }
+
+        let palette_hovered = self
+            .palette_geometry
+            .and_then(|panel| crate::palette::row_hit(panel, layout.metrics.line_height, x, y));
+        if palette_hovered != self.command_palette_hovered {
+            self.command_palette_hovered = palette_hovered;
             self.request_redraw();
         }
 
@@ -1636,21 +2100,27 @@ impl LightSpeed {
 
     /// Recomputes the input target from the surfaces that are up.
     ///
-    /// Prompt, Menu, SearchQuery and Find are genuinely exclusive: while any
-    /// of them is up, nothing else can reasonably hold the keyboard, so they
-    /// are derived fresh every time. Editor, List and Terminal are not --
-    /// the file tree and the terminal both stay visible after the user's
-    /// attention moves elsewhere (see `focus_list`/`focus_terminal`), so
-    /// visibility alone can no longer decide between them the way it used
-    /// to. This is the fix for a real bug: opening a file from the explorer
+    /// Prompt, the command palette, Menu and Find are genuinely exclusive:
+    /// while any of them is up, nothing else can reasonably hold the
+    /// keyboard, so they are derived fresh every time. Editor, List,
+    /// Terminal and SearchQuery are not -- the file tree, the terminal and a
+    /// typed-but-not-yet-submitted search query all stay around after the
+    /// user's attention moves elsewhere (see `focus_list`/`focus_terminal`/
+    /// `open_search_query`), so visibility or "is there a query" alone can
+    /// no longer decide between them the way it used to. This is the fix for
+    /// two real bugs of the same shape: opening a file from the explorer
     /// left it typeable for exactly one keystroke, because the very next
     /// `refresh_focus` call -- triggered by the load simply finishing --
-    /// saw the still-open file tree and handed focus straight back to it.
-    /// A resting focus (Editor/List/Terminal) is now left alone unless its
-    /// own surface has closed out from under it, in which case it falls
-    /// back to the editor; entering List or Terminal in the first place is
-    /// always an explicit call to `focus_list`/`focus_terminal`, never
-    /// something this function decides on its own.
+    /// saw the still-open file tree and handed focus straight back to it;
+    /// clicking into the editor while a workspace-search query was typed
+    /// but not yet submitted looked identical, but for search (nothing ever
+    /// clears `search_query_input` on a stray click, only Escape/Enter do).
+    /// A resting focus (Editor/List/Terminal/SearchQuery) is now left alone
+    /// unless its own surface has closed out from under it, in which case it
+    /// falls back to the editor; entering List, Terminal or SearchQuery in
+    /// the first place is always an explicit call to
+    /// `focus_list`/`focus_terminal`/`open_search_query`, never something
+    /// this function decides on its own.
     fn refresh_focus(&mut self) {
         self.focus = derive_focus(
             self.focus,
@@ -1660,7 +2130,80 @@ impl LightSpeed {
             self.core.is_find_open(),
             self.active_list.is_some(),
             self.terminal_visible,
+            self.command_palette_open,
         );
+    }
+
+    /// Opens the command palette, the way clicking the title bar's own
+    /// command field or Ctrl+Shift+P does in Lapce -- an explicit action,
+    /// not something `refresh_focus` derives, the same discipline
+    /// `focus_list`/`focus_terminal` already follow.
+    fn open_command_palette(&mut self) {
+        self.menu.close();
+        self.command_palette_open = true;
+        self.command_palette_query.clear();
+        self.command_palette_selected = 0;
+        self.command_palette_hovered = None;
+        self.refresh_focus();
+        self.request_redraw();
+    }
+
+    fn close_command_palette(&mut self) {
+        self.command_palette_open = false;
+        self.refresh_focus();
+        self.request_redraw();
+    }
+
+    /// The commands the palette currently offers: the full registry, filtered
+    /// by the typed query and by what the active document actually allows
+    /// right now -- the same enablement check the dropdown menu uses, so the
+    /// palette never lists something it would then refuse to run.
+    fn command_palette_rows(&self) -> Vec<crate::palette::PaletteRow> {
+        crate::palette::filter(ls_core::commands::all(), &self.command_palette_query, |id| {
+            self.core.is_command_enabled(id)
+        })
+    }
+
+    /// Runs the highlighted row, if any, and closes the palette either way --
+    /// selecting something that turns out to be disabled by the time Enter
+    /// is pressed is vanishingly unlikely (the list it was chosen from is
+    /// filtered by the same check moments earlier), but `run_command` itself
+    /// already handles a command that refuses to apply.
+    fn run_palette_selection(&mut self) {
+        let rows = self.command_palette_rows();
+        if let Some(row) = rows.get(self.command_palette_selected) {
+            let id = row.id;
+            self.close_command_palette();
+            self.run_command(id, CommandArgs::None);
+        } else {
+            self.close_command_palette();
+        }
+    }
+
+    /// The palette's own content: a query row (magnifier, typed text, a
+    /// caret), then one line per still-matching command. Selection/hover
+    /// highlighting is drawn separately, from the same row rectangles
+    /// `palette::row_hit` uses, the same split `sidebar_rows` and its
+    /// highlight quads keep.
+    fn palette_rich(&self, rows: &[crate::palette::PaletteRow]) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        rich.icon(crate::icons::Icon::Search, self.theme.dim_text);
+        rich.plain(" ");
+        if self.command_palette_query.is_empty() {
+            rich.colored("Type a command...", self.theme.dim_text);
+        } else {
+            rich.colored(&self.command_palette_query, self.theme.text);
+        }
+        rich.colored("\u{2588}", self.theme.cursor);
+        // Capped the same way `palette::geometry` caps the panel's height:
+        // there is no scrolling here, so a row this buffer shaped but the
+        // panel had no room to show would just be an invisible, still-
+        // selectable command -- confusing rather than merely absent.
+        for row in rows.iter().take(crate::palette::MAX_VISIBLE_ROWS) {
+            rich.newline();
+            rich.colored(row.display_name, self.theme.text);
+        }
+        rich
     }
 
     /// Activates a tab and moves editing focus to it.
@@ -1731,13 +2274,15 @@ impl LightSpeed {
     /// One banner strip's text: a close confirmation and the find bar are
     /// mutually exclusive (`refresh_focus` gives the confirmation priority),
     /// so they share the single overlay strip rather than needing two.
-    fn search_query_bar_text(&self) -> Option<String> {
-        let query = self.search_query_input.as_ref()?;
-        Some(format!("Search workspace: {query}    [Enter] Search  [Esc] Cancel"))
-    }
-
+    ///
+    /// A typed workspace-search query used to get a banner here too, a
+    /// second, modal-looking box floating over the editor duplicating the
+    /// same query already live in the sidebar's own Search panel (see
+    /// `push_search_header`) -- worse, one with no click-away out, only
+    /// Escape, which read as the editor being stuck. The sidebar's field is
+    /// the only place that query needs to show.
     fn banner_text(&self) -> Option<String> {
-        self.prompt_text().or_else(|| self.find_bar_text()).or_else(|| self.search_query_bar_text())
+        self.prompt_text().or_else(|| self.find_bar_text())
     }
 
     /// Builds the rows for whichever list is currently shown, fresh every
@@ -1830,7 +2375,18 @@ impl LightSpeed {
                     vec![ListRow::message("Not a git repository, or git is not installed")]
                 }
             },
-            Some(ListKind::SearchResults) => match self.core.workspace_search_result() {
+            // Only ever the result for the query in the field right now:
+            // `matching_search_result` drops one for an older prefix, so a
+            // panel that updates as you type never shows hits for a query
+            // you have already typed past.
+            Some(ListKind::SearchResults) => match self.matching_search_result() {
+                _ if self
+                    .search_query_input
+                    .as_deref()
+                    .is_some_and(|query| query.trim().is_empty()) =>
+                {
+                    Vec::new()
+                }
                 Some(result) if result.hits.is_empty() => {
                     vec![ListRow::message(format!("No matches for \"{}\"", result.query))]
                 }
@@ -1868,7 +2424,12 @@ impl LightSpeed {
                     }
                     rows
                 }
-                None if self.core.is_workspace_search_pending() => {
+                // A query is typed but its own results have not landed yet:
+                // either a walk is running, or the debounce is still
+                // counting down before one starts.
+                None if self.core.is_workspace_search_pending()
+                    || self.search_debounce_deadline.is_some() =>
+                {
                     vec![ListRow::message("Searching...")]
                 }
                 None => Vec::new(),
@@ -1914,7 +2475,11 @@ impl LightSpeed {
     /// document already being open -- the picker itself is where the folder
     /// comes from.
     fn show_open_folder_dialog(&mut self) {
-        let owner = self.window_handle_id();
+        if self.folder_picker_open {
+            // A second request while one is already up would stack two
+            // dialogs the user never asked for.
+            return;
+        }
         let initial_dir =
             self.core.workspace().root().map(|c| c.as_path().to_path_buf()).or_else(|| {
                 self.core
@@ -1922,23 +2487,56 @@ impl LightSpeed {
                     .and_then(|d| d.path())
                     .and_then(|p| p.as_path().parent().map(|parent| parent.to_path_buf()))
             });
-        match ls_platform::dialog::open_folder(owner, "Open Folder", initial_dir.as_deref()) {
-            Ok(Some(dir)) => {
-                if let Err(error) = self.core.open_workspace(&dir) {
-                    self.set_status(error.to_string(), Severity::Error);
-                    return;
-                }
-                self.file_tree_root = Some(dir);
-                self.list_selected = 0;
-                self.active_list = Some(ListKind::FileTree);
-                self.focus_list();
-            }
+
+        // The picker runs elsewhere and reports back through the event loop.
+        // It used to run here, which meant the editor stopped painting for as
+        // long as the Windows shell took to put its dialog on screen -- and
+        // measurably that is seconds, none of it this program's work (see
+        // `ls_platform::dialog::open_folder_async`).
+        self.folder_picker_open = true;
+        self.set_status("Opening the folder picker...", Severity::Success);
+        let proxy = self.proxy.clone();
+        ls_platform::dialog::open_folder_async(
+            "Open Folder",
+            initial_dir.as_deref(),
+            move |result| {
+                let _ = proxy.send_event(UserEvent::FolderPicked(Box::new(result)));
+            },
+        );
+    }
+
+    /// Applies whatever the folder picker came back with.
+    /// Opens `dir` as the workspace root and shows it in the explorer --
+    /// shared by the folder picker and by a directory named on the command
+    /// line, so both land in exactly the same state.
+    fn open_workspace_at(&mut self, dir: PathBuf) {
+        if let Err(error) = self.core.open_workspace(&dir) {
+            self.set_status(error.to_string(), Severity::Error);
+            return;
+        }
+        self.file_tree_root = Some(dir);
+        self.list_selected = 0;
+        self.active_list = Some(ListKind::FileTree);
+        // The project half of the settings moves with the folder.
+        self.reload_settings();
+        self.apply_settings();
+        self.focus_list();
+    }
+
+    fn folder_picked(&mut self, result: Result<Option<PathBuf>, ls_platform::PlatformError>) {
+        self.folder_picker_open = false;
+        // Drop the "opening..." note: whatever happens next either replaces
+        // it or means there is nothing left to say.
+        self.status_message = None;
+        match result {
+            Ok(Some(dir)) => self.open_workspace_at(dir),
             Ok(None) => {}
             Err(error) => {
                 ls_log::diag::log_error(&error);
                 self.set_status(error.to_string(), Severity::Error);
             }
         }
+        self.request_redraw();
     }
 
     fn toggle_git_status(&mut self) {
@@ -1958,10 +2556,80 @@ impl LightSpeed {
     }
 
     fn open_search_query(&mut self) {
-        self.active_list = None;
+        // The results list stays mounted under the query field from the
+        // moment the panel opens: `list_rows` shows the state of the search
+        // for the *current* query (nothing / searching / hits), so there is
+        // no separate "results mode" to switch into once one completes.
+        self.active_list = Some(ListKind::SearchResults);
         self.search_query_input = Some(String::new());
-        self.refresh_focus();
+        self.list_selected = 0;
+        self.search_debounce_deadline = None;
+        // Explicit, the same as `focus_list`/`focus_terminal`: entering
+        // `SearchQuery` focus is no longer something `derive_focus` grants
+        // just because a query happens to be set (see its own comment).
+        self.focus = InputFocus::SearchQuery;
         self.request_redraw();
+    }
+
+    /// Restarts the debounce window after the query changed. The search
+    /// itself runs from `about_to_wait` once the window elapses without
+    /// another keystroke resetting it.
+    fn schedule_search_debounce(&mut self) {
+        self.search_debounce_deadline = Some(Instant::now() + SEARCH_DEBOUNCE);
+        self.list_selected = 0;
+        self.request_redraw();
+    }
+
+    /// Dispatches the typed query now, cancelling whatever walk is already in
+    /// flight (`EditorCore::request_workspace_search` cancels the previous
+    /// task, and the walk polls that flag per file).
+    fn run_pending_search(&mut self) {
+        self.search_debounce_deadline = None;
+        let Some(query) = self.search_query_input.clone() else { return };
+        if query.is_empty() {
+            return;
+        }
+        if let Err(error) = self.core.request_workspace_search(query) {
+            self.set_status(error.to_string(), Severity::Error);
+        }
+        self.request_redraw();
+    }
+
+    /// Fires the debounced search if its window has elapsed. Returns whether
+    /// anything was dispatched, so the caller knows to redraw.
+    fn tick_search_debounce(&mut self) -> bool {
+        let Some(deadline) = self.search_debounce_deadline else { return false };
+        if Instant::now() < deadline {
+            return false;
+        }
+        self.run_pending_search();
+        true
+    }
+
+    /// How many result rows the search panel is currently showing, for
+    /// bounding arrow-key movement through them.
+    fn search_result_rows(&self) -> usize {
+        if self.active_list != Some(ListKind::SearchResults) {
+            return 0;
+        }
+        match self.matching_search_result() {
+            Some(result) => result.hits.len(),
+            None => 0,
+        }
+    }
+
+    /// The completed search result, but only if it is for the query that is
+    /// in the field right now.
+    ///
+    /// Results arrive from a worker, so the one in hand is routinely for a
+    /// prefix of what has since been typed. Showing it anyway is how a
+    /// live-updating panel ends up flashing hits for "nee" under a field
+    /// that reads "needle" -- so a result whose query does not match is
+    /// treated as not being there at all.
+    fn matching_search_result(&self) -> Option<&ls_core::workspace_search::WorkspaceSearchResult> {
+        let result = self.core.workspace_search_result()?;
+        search_result_is_current(&result.query, self.search_query_input.as_deref())
+            .then_some(result)
     }
 
     /// Shows or hides the command runner. The child process, once spawned,
@@ -1990,11 +2658,15 @@ impl LightSpeed {
     }
 
     fn drain_terminal_output(&mut self) {
-        let Some(terminal) = self.terminal.as_ref() else { return };
+        let Some(terminal) = self.terminal.as_mut() else { return };
         let text = terminal.drain_output();
         if text.is_empty() {
             return;
         }
+        // Held so the view can stay on the same lines if the user is reading
+        // history while output keeps arriving underneath.
+        let before = self.terminal_scrollback.lines().count();
+
         self.terminal_scrollback.push_str(&text);
         let cap = 64 * 1024;
         if self.terminal_scrollback.len() > cap {
@@ -2004,6 +2676,22 @@ impl LightSpeed {
                 .find(|&i| self.terminal_scrollback.is_char_boundary(i))
                 .unwrap_or(cut);
             self.terminal_scrollback.drain(..boundary);
+        }
+
+        if self.terminal_scroll_lines > 0 {
+            // Scrolled back: the offset is measured from the bottom, so new
+            // lines at the bottom would slide the visible window forward.
+            // Growing the offset by however many lines arrived keeps the
+            // text the user is actually reading still. Trimming the
+            // scrollback can shrink the total, so this is clamped rather
+            // than simply added to.
+            let after = self.terminal_scrollback.lines().count();
+            let added = after.saturating_sub(before);
+            let max_scroll = self
+                .last_layout
+                .map(|layout| after.saturating_sub(terminal_visible_lines(&layout)))
+                .unwrap_or(after);
+            self.terminal_scroll_lines = (self.terminal_scroll_lines + added).min(max_scroll);
         }
         if self.terminal_visible {
             self.request_redraw();
@@ -2023,30 +2711,35 @@ impl LightSpeed {
         let Some(path) = document.path().map(|p| p.as_path().to_path_buf()) else { return };
         let language = document.language();
 
-        if let Some(client) = self.lsp.as_mut() {
-            if !client.is_alive() {
-                // The server crashed or exited; a future recognized document
-                // gets a fresh one rather than silently having none forever.
-                self.lsp = None;
-                self.lsp_opened.clear();
-            }
+        // A server that crashed or exited is dropped, and any document it
+        // had been told about is forgotten, so the next document of that
+        // language starts a fresh one and re-announces itself rather than
+        // talking to a dead handle forever.
+        for retired in self.lsp.retire_dead() {
+            self.lsp_opened.retain(|document| {
+                self.core
+                    .document(*document)
+                    .map(|document| document.language() != retired)
+                    .unwrap_or(false)
+            });
         }
 
+        let proxy = self.proxy.clone();
+        let root = self
+            .core
+            .workspace()
+            .root()
+            .map(|c| c.as_path().to_path_buf())
+            .or_else(|| path.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+
         if !self.lsp_opened.contains(&id) {
-            if self.lsp.is_none() {
-                let proxy = self.proxy.clone();
-                let root = self
-                    .core
-                    .workspace()
-                    .root()
-                    .map(|c| c.as_path().to_path_buf())
-                    .or_else(|| path.parent().map(|p| p.to_path_buf()))
-                    .unwrap_or_else(|| PathBuf::from("."));
-                self.lsp = crate::lsp::LspClient::spawn(language, &root, move || {
-                    let _ = proxy.send_event(UserEvent::LspDiagnostics);
-                });
-            }
-            if let Some(client) = self.lsp.as_mut() {
+            // Routed by the document's *own* language, so a Python file
+            // reaches a Python server rather than whichever server happened
+            // to start first.
+            if let Some(client) = self.lsp.client_for(language, &root, move || {
+                let _ = proxy.send_event(UserEvent::LspDiagnostics);
+            }) {
                 client.notify_opened(&path, language, &document.text().to_string());
             }
             // Marked regardless of whether a client actually started: there
@@ -2061,7 +2754,9 @@ impl LightSpeed {
         let previous = self.lsp_last_persistence.insert(id, persistence);
         if previous != Some(persistence) && persistence == ls_core::PersistenceState::SaveSucceeded
         {
-            if let Some(client) = self.lsp.as_mut() {
+            if let Some(client) = self.lsp.client_for(language, &root, move || {
+                let _ = proxy.send_event(UserEvent::LspDiagnostics);
+            }) {
                 client.notify_saved(&path, &document.text().to_string());
             }
         }
@@ -2082,8 +2777,10 @@ impl LightSpeed {
     /// version field gets applied unconditionally, which is the pre-existing
     /// behavior and the best any client can do without that signal.
     fn drain_lsp_diagnostics(&mut self) {
-        let Some(client) = self.lsp.as_ref() else { return };
-        let updates = client.drain_diagnostics();
+        if self.lsp.is_empty() {
+            return;
+        }
+        let updates = self.lsp.drain_diagnostics();
         if updates.is_empty() {
             return;
         }
@@ -2102,6 +2799,8 @@ impl LightSpeed {
 
     fn send_terminal_line(&mut self) {
         let line = std::mem::take(&mut self.terminal_input);
+        self.terminal_cursor = 0;
+        self.record_terminal_history(&line);
         if let Some(terminal) = self.terminal.as_mut() {
             if !terminal.is_alive() {
                 self.set_status("The shell has exited", Severity::Warning);
@@ -2111,23 +2810,165 @@ impl LightSpeed {
             self.terminal_scrollback.push_str("> ");
             self.terminal_scrollback.push_str(&line);
             self.terminal_scrollback.push('\n');
+            // Also writes "> {line}" to the permanent transcript
+            // (`ls_platform::terminal_log`) -- one call, so a line can never
+            // reach the on-screen scrollback without also reaching the
+            // record meant to outlive it.
             terminal.send_line(&line);
+            // Running something is a statement about wanting to see what it
+            // does, so this snaps back to the newest output however far back
+            // the user had scrolled.
+            self.terminal_scroll_lines = 0;
         }
     }
 
-    /// The terminal panel's rows: a fixed window of the scrollback plus the
-    /// line being typed, in the same `Vec<String>` shape every other panel
-    /// uses.
-    /// Rows for the docked bottom panel's terminal content.
-    fn bottom_panel_rows(&self) -> Vec<String> {
+    /// Adds a run command to the recall list Up/Down walks, and ends
+    /// whatever recall was in progress -- running something is a decision
+    /// about what to do next, not a browse through what was done before.
+    fn record_terminal_history(&mut self, line: &str) {
+        self.terminal_history_index = None;
+        self.terminal_history_draft.clear();
+        if line.trim().is_empty() {
+            return;
+        }
+        // Immediately repeating the last command is common (rerunning a
+        // build, say) and not worth a second, identical entry to arrow past.
+        if self.terminal_command_history.last().map(String::as_str) != Some(line) {
+            self.terminal_command_history.push(line.to_string());
+        }
+        // Bounded the same way the permanent transcript is not: this list
+        // exists for in-session recall, and a session that ran ten thousand
+        // commands does not need all of them one Up-press away -- the file
+        // `ls_platform::terminal_log` writes to is where the full record
+        // lives.
+        const MAX_RECALL_HISTORY: usize = 1000;
+        if self.terminal_command_history.len() > MAX_RECALL_HISTORY {
+            let overflow = self.terminal_command_history.len() - MAX_RECALL_HISTORY;
+            self.terminal_command_history.drain(..overflow);
+        }
+    }
+
+    /// Recalls an older command (Up). The first press off a live line saves
+    /// what was being typed so Down can restore it later.
+    fn terminal_history_up(&mut self) {
+        let next = navigate_terminal_history(
+            &self.terminal_command_history,
+            self.terminal_history_index,
+            HistoryDirection::Older,
+        );
+        let Some(index) = next else { return };
+        if self.terminal_history_index.is_none() {
+            self.terminal_history_draft = std::mem::take(&mut self.terminal_input);
+        }
+        self.terminal_history_index = Some(index);
+        self.terminal_input = self.terminal_command_history[index].clone();
+        // A recalled command lands with the caret at the end, ready to run
+        // as-is or be edited -- the same place a real shell's history
+        // recall leaves it.
+        self.terminal_cursor = self.terminal_input.chars().count();
+    }
+
+    /// Walks back toward the live input line (Down). A no-op while not
+    /// already recalling something -- otherwise every Down press on an
+    /// ordinary line would clobber whatever was being typed with a stale,
+    /// empty draft.
+    fn terminal_history_down(&mut self) {
+        if self.terminal_history_index.is_none() {
+            return;
+        }
+        let next = navigate_terminal_history(
+            &self.terminal_command_history,
+            self.terminal_history_index,
+            HistoryDirection::Newer,
+        );
+        self.terminal_history_index = next;
+        self.terminal_input = match next {
+            Some(index) => self.terminal_command_history[index].clone(),
+            None => std::mem::take(&mut self.terminal_history_draft),
+        };
+        self.terminal_cursor = self.terminal_input.chars().count();
+    }
+
+    /// Inserts `text` at the caret and advances it past what was inserted.
+    fn terminal_insert(&mut self, text: &str) {
+        let byte = terminal_char_boundary(&self.terminal_input, self.terminal_cursor);
+        self.terminal_input.insert_str(byte, text);
+        self.terminal_cursor += text.chars().count();
+    }
+
+    /// Deletes the character behind the caret (Backspace) and moves the
+    /// caret back onto where it used to be.
+    fn terminal_backspace(&mut self) {
+        let Some(previous) = self.terminal_cursor.checked_sub(1) else { return };
+        let start = terminal_char_boundary(&self.terminal_input, previous);
+        let end = terminal_char_boundary(&self.terminal_input, self.terminal_cursor);
+        self.terminal_input.replace_range(start..end, "");
+        self.terminal_cursor = previous;
+    }
+
+    /// Deletes the character under/ahead of the caret (Delete). The caret
+    /// itself does not move -- there is nothing left of it to step back
+    /// over, unlike Backspace.
+    fn terminal_delete_forward(&mut self) {
+        if self.terminal_cursor >= self.terminal_input.chars().count() {
+            return;
+        }
+        let start = terminal_char_boundary(&self.terminal_input, self.terminal_cursor);
+        let end = terminal_char_boundary(&self.terminal_input, self.terminal_cursor + 1);
+        self.terminal_input.replace_range(start..end, "");
+    }
+
+    fn terminal_move_left(&mut self) {
+        self.terminal_cursor = self.terminal_cursor.saturating_sub(1);
+    }
+
+    fn terminal_move_right(&mut self) {
+        let end = self.terminal_input.chars().count();
+        self.terminal_cursor = (self.terminal_cursor + 1).min(end);
+    }
+
+    /// Rows for the docked bottom panel's terminal content: the visible
+    /// window of scrollback plus the line being typed, in the same
+    /// `Vec<String>` shape every other panel uses.
+    fn bottom_panel_rows(&self, layout: &Layout) -> Vec<String> {
         let mut rows = Vec::new();
-        rows.push("Terminal  (Enter to run, F11 to hide)".to_string());
-        let visible_lines = 12;
-        let tail: Vec<&str> = self.terminal_scrollback.lines().collect();
-        let start = tail.len().saturating_sub(visible_lines);
-        rows.extend(tail[start..].iter().map(|line| line.to_string()));
-        rows.push(format!("> {}", self.terminal_input));
+        rows.push("Terminal  (Enter to run, \u{2191}\u{2193} for history, F11 to hide)".to_string());
+
+        // Sized to the panel the user actually dragged out, not a fixed 12:
+        // a hardcoded count clipped output on a tall panel and left a short
+        // one half empty. Two rows are spent on the header and the input
+        // line, so they come off the budget.
+        let visible_lines = terminal_visible_lines(layout);
+        let all: Vec<&str> = self.terminal_scrollback.lines().collect();
+        // `terminal_scroll_lines` counts lines *up from the bottom*, so 0 is
+        // pinned to the newest output -- the state a terminal is in almost
+        // all the time.
+        let from_bottom = self.terminal_scroll_lines.min(all.len().saturating_sub(visible_lines));
+        let end = all.len().saturating_sub(from_bottom);
+        let start = end.saturating_sub(visible_lines);
+        rows.extend(all[start..end].iter().map(|line| line.to_string()));
+
+        // Only the live prompt when looking at the newest output: showing an
+        // input line under scrolled-back history would be an invitation to
+        // type into something that is not where the cursor is.
+        if from_bottom == 0 {
+            rows.push(terminal_input_row(&self.terminal_input, self.terminal_cursor));
+        } else {
+            rows.push(format!("-- scrolled back {from_bottom} lines --"));
+        }
         rows
+    }
+
+    /// Scrolls the terminal's output by `lines` (positive scrolls back into
+    /// history), clamped so it can never run past either end.
+    fn scroll_terminal_by_lines(&mut self, lines: f32) {
+        let Some(layout) = self.last_layout else { return };
+        let total = self.terminal_scrollback.lines().count();
+        let max_scroll = total.saturating_sub(terminal_visible_lines(&layout));
+        let delta = lines.round() as i64;
+        let next = self.terminal_scroll_lines as i64 + delta;
+        self.terminal_scroll_lines = next.clamp(0, max_scroll as i64) as usize;
+        self.request_redraw();
     }
 
     /// Once a file a list row opened finishes loading, moves the caret to the
@@ -2204,15 +3045,14 @@ impl LightSpeed {
 
     /// When the loop should wake next, if anything is on a timer.
     fn next_wakeup(&self) -> Option<Instant> {
-        // The caret and the disk-change poll are the only timers; everything
-        // else is event-driven. Whichever fires first is when the loop wakes.
+        // The caret, the disk-change poll and a pending search debounce are
+        // the only timers; everything else is event-driven. Whichever fires
+        // first is when the loop wakes -- and with no query waiting, the
+        // search contributes no wakeup at all rather than a ticking one.
         let caret =
             (self.core.active().is_some() && self.prompt.is_none()).then_some(self.caret_deadline);
         let watch = (!self.core.tabs().is_empty()).then_some(self.next_watch_check);
-        match (caret, watch) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [caret, watch, self.search_debounce_deadline].into_iter().flatten().min()
     }
 
     /// Window title, from authoritative document state.
@@ -2281,6 +3121,9 @@ impl LightSpeed {
     /// query counts as Search being active even before any request has
     /// gone out, matching how `sidebar_visible` already treats it.
     fn activity_active_index(&self) -> Option<usize> {
+        if self.dependency_view {
+            return Some(ACTIVITY_DEPENDENCIES);
+        }
         if self.search_query_input.is_some() {
             return Some(ACTIVITY_SEARCH);
         }
@@ -2298,6 +3141,21 @@ impl LightSpeed {
     /// Debug (indices 3 and 4) are inert: there is no subsystem behind them.
     fn activate_activity_item(&mut self, index: usize) {
         let already_active = self.activity_active_index() == Some(index);
+        // A query left typed-but-unsubmitted is what keeps the Search panel
+        // showing (see `activity_active_index`, `sidebar_header_lines`): it
+        // outranks `active_list` on its own, so switching to Explorer or
+        // Source Control without clearing it left the sidebar showing
+        // Search regardless of which icon was actually clicked -- Explorer
+        // looked unclickable because activating it worked, the *display*
+        // just never noticed.
+        if index != ACTIVITY_SEARCH {
+            self.search_query_input = None;
+        }
+        // Only one activity is shown at a time, so picking any other one
+        // puts the document back in the editor area.
+        if index != ACTIVITY_DEPENDENCIES {
+            self.dependency_view = false;
+        }
         match index {
             ACTIVITY_EXPLORER => self.toggle_file_tree(),
             ACTIVITY_SEARCH => {
@@ -2311,8 +3169,615 @@ impl LightSpeed {
                 }
             }
             ACTIVITY_SOURCE_CONTROL => self.toggle_git_status(),
+            ACTIVITY_DEPENDENCIES => self.toggle_dependency_view(already_active),
             _ => {}
         }
+    }
+
+    // --- settings -----------------------------------------------------
+
+    /// Loads both settings files and merges them.
+    ///
+    /// Called at startup and whenever the workspace changes, because the
+    /// project half of the answer moves with the folder.
+    fn reload_settings(&mut self) {
+        self.user_settings = ls_platform::settings_file::user_path()
+            .and_then(|path| ls_platform::settings_file::load(&path))
+            .map(|text| ls_core::settings::Settings::decode(&text))
+            .unwrap_or_default();
+        self.workspace_settings = self
+            .core
+            .workspace()
+            .root()
+            .map(|root| ls_platform::settings_file::workspace_path(root.as_path()))
+            .and_then(|path| ls_platform::settings_file::load(&path))
+            .map(|text| ls_core::settings::Settings::decode(&text))
+            .unwrap_or_default();
+        self.remerge_settings();
+    }
+
+    /// Recomputes what the rest of the shell reads: the person's settings,
+    /// with the project's laid over whatever it actually states.
+    fn remerge_settings(&mut self) {
+        let mut merged = self.user_settings.clone();
+        merged.overlay(&self.workspace_settings);
+        self.settings = merged;
+    }
+
+    /// Writes the file the screen is currently editing.
+    fn save_settings(&mut self) {
+        let (path, settings) = match self.settings_scope {
+            SettingsScope::User => {
+                (ls_platform::settings_file::user_path(), &self.user_settings)
+            }
+            SettingsScope::Workspace => (
+                self.core
+                    .workspace()
+                    .root()
+                    .map(|root| ls_platform::settings_file::workspace_path(root.as_path())),
+                &self.workspace_settings,
+            ),
+        };
+        let Some(path) = path else {
+            self.set_status("Open a folder to keep settings with the project", Severity::Warning);
+            return;
+        };
+        if !ls_platform::settings_file::save(&path, &settings.encode()) {
+            self.set_status(format!("Could not write {}", path.display()), Severity::Error);
+        }
+    }
+
+    /// Changes one setting in the file being edited, then applies and saves.
+    fn write_setting(&mut self, key: &str, value: &str) {
+        let changed = match self.settings_scope {
+            SettingsScope::User => self.user_settings.set(key, value),
+            SettingsScope::Workspace => self.workspace_settings.set(key, value),
+        };
+        if !changed {
+            return;
+        }
+        self.remerge_settings();
+        self.apply_settings();
+        self.save_settings();
+        self.request_redraw();
+    }
+
+    /// Puts one setting back to its default.
+    fn reset_setting(&mut self, key: &str) {
+        let changed = match self.settings_scope {
+            SettingsScope::User => self.user_settings.reset(key),
+            SettingsScope::Workspace => self.workspace_settings.reset(key),
+        };
+        if !changed {
+            return;
+        }
+        self.remerge_settings();
+        self.apply_settings();
+        self.save_settings();
+        self.request_redraw();
+    }
+
+    /// Pushes the merged settings into the things they configure.
+    ///
+    /// Only the ones that can change under a running window are here; the
+    /// rest are read where they are used, and the screen says so on their
+    /// own row rather than pretending otherwise.
+    fn apply_settings(&mut self) {
+        let family = self.settings.text("editor.fontFamily");
+        let size = self.settings.integer("editor.fontSize") as f32;
+        let ratio = self.settings.float("editor.lineHeight") as f32;
+        let scale = self.window.as_ref().map(|window| window.scale_factor()).unwrap_or(1.0) as f32;
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_font(&family, size * scale, ratio);
+        }
+
+        self.core.set_document_settings(ls_core::document::DocumentSettings {
+            tab_width: self.settings.integer("editor.tabWidth").max(1) as usize,
+            insert_spaces: self.settings.bool("editor.insertSpaces"),
+            coalesce_window: self.core.config().editor.coalesce_window,
+        });
+
+        self.sidebar_width = self.settings.integer("workbench.sidebarWidth") as f32;
+        self.overlay_visible = self.settings.bool("performance.showOverlay");
+        if let Some(terminal) = self.terminal.as_ref() {
+            terminal.set_scrollback(self.settings.integer("terminal.scrollbackBytes") as usize);
+        }
+        // A caret that is not blinking must also stop asking for frames.
+        if !self.settings.bool("editor.caretBlink") {
+            self.caret_visible = true;
+        }
+        self.request_redraw();
+    }
+
+    /// Handles a key while the settings screen is up, reporting whether it
+    /// was consumed.
+    ///
+    /// Escape is the one key that always means something: it takes the
+    /// keyboard back from a field, and closes the screen when nothing has
+    /// it. Everything else only applies while the search box or a field is
+    /// focused, so the shortcuts that open other views still work with the
+    /// settings on screen.
+    fn settings_key(&mut self, key: &winit::keyboard::Key) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        match key {
+            Key::Named(NamedKey::Escape) => {
+                if self.settings_editing.is_some() {
+                    // Abandons the draft rather than writing it: Escape has
+                    // meant "forget what I typed" everywhere else here.
+                    self.settings_editing = None;
+                } else if self.settings_search_focused && !self.settings_query.is_empty() {
+                    self.settings_query.clear();
+                    self.settings_scroll = 0;
+                } else {
+                    self.settings_open = false;
+                    self.refresh_focus();
+                }
+                self.request_redraw();
+                true
+            }
+            Key::Named(NamedKey::Enter) => {
+                if self.settings_editing.is_some() {
+                    self.commit_settings_field();
+                    self.request_redraw();
+                    return true;
+                }
+                false
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if self.settings_editing.is_some() || self.settings_search_focused {
+                    self.settings_backspace();
+                    return true;
+                }
+                false
+            }
+            Key::Named(NamedKey::Tab) => {
+                // Moves between the two settings files, which is the only
+                // other thing the screen has to switch between.
+                if self.settings_editing.is_none() {
+                    self.settings_scope = match self.settings_scope {
+                        SettingsScope::User => SettingsScope::Workspace,
+                        SettingsScope::Workspace => SettingsScope::User,
+                    };
+                    self.request_redraw();
+                    return true;
+                }
+                false
+            }
+            Key::Character(text) => {
+                if self.modifiers.control_key() || self.modifiers.alt_key() {
+                    return false;
+                }
+                if self.settings_editing.is_some() || self.settings_search_focused {
+                    self.settings_type(text);
+                    return true;
+                }
+                false
+            }
+            Key::Named(NamedKey::Space) => {
+                if self.settings_editing.is_some() || self.settings_search_focused {
+                    self.settings_type(" ");
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Opens or closes the settings screen.
+    fn toggle_settings(&mut self) {
+        self.settings_open = !self.settings_open;
+        if self.settings_open {
+            self.dependency_view = false;
+            self.settings_editing = None;
+            self.settings_search_focused = true;
+        }
+        self.refresh_focus();
+        self.request_redraw();
+    }
+
+    /// The settings the screen is currently showing: the section picked on
+    /// the left, narrowed by whatever is in the search box.
+    fn visible_settings(&self) -> Vec<&'static ls_core::settings::SettingDescriptor> {
+        let section = self
+            .settings_section
+            .and_then(|at| ls_core::settings::SECTIONS.get(at))
+            .copied();
+        ls_core::settings::Settings::search(&self.settings_query)
+            .into_iter()
+            .filter(|setting| section.is_none_or(|section| setting.section == section))
+            .collect()
+    }
+
+    /// Handles a click on the settings screen, reporting whether it landed.
+    fn press_settings(&mut self, x: f32, y: f32) -> bool {
+        use crate::settings_ui::Hit;
+        if !self.settings_open {
+            return false;
+        }
+        let visible = self.visible_settings();
+        let hit = crate::settings_ui::hit(&self.settings_screen, &visible, x, y);
+        // Anything but going on typing in the same field commits the draft,
+        // so a value is never left half-entered behind a click elsewhere.
+        if !matches!(hit, Hit::Control(key) if Some(key) == self.settings_editing.as_ref().map(|(key, _)| *key))
+        {
+            self.commit_settings_field();
+        }
+        match hit {
+            Hit::Search => {
+                self.settings_search_focused = true;
+                self.settings_editing = None;
+            }
+            Hit::Category(at) => {
+                // Clicking the section already showing widens back to all of
+                // them, which is the only way back without a separate row.
+                self.settings_section = if self.settings_section == Some(at) { None } else { Some(at) };
+                self.settings_scroll = 0;
+                self.settings_search_focused = false;
+            }
+            Hit::Control(key) => {
+                self.settings_search_focused = false;
+                let Some(descriptor) = ls_core::settings::descriptor(key) else { return true };
+                match descriptor.kind {
+                    ls_core::settings::SettingKind::Bool => {
+                        let now = !self.settings.bool(key);
+                        self.write_setting(key, if now { "true" } else { "false" });
+                    }
+                    _ => {
+                        self.settings_editing = Some((key, self.settings.text(key)));
+                    }
+                }
+            }
+            Hit::Option(key, option) => {
+                self.settings_search_focused = false;
+                self.write_setting(key, option);
+            }
+            Hit::Reset(key) => {
+                self.settings_search_focused = false;
+                self.reset_setting(key);
+            }
+            Hit::Nothing => {
+                self.settings_search_focused = false;
+            }
+        }
+        self.request_redraw();
+        true
+    }
+
+    /// Writes whatever is in the field being edited, if any.
+    fn commit_settings_field(&mut self) {
+        let Some((key, draft)) = self.settings_editing.take() else { return };
+        self.write_setting(key, &draft);
+    }
+
+    /// Types into whichever of the search box or a field has the keyboard.
+    fn settings_type(&mut self, text: &str) {
+        if let Some((_, draft)) = self.settings_editing.as_mut() {
+            draft.push_str(text);
+        } else if self.settings_search_focused {
+            self.settings_query.push_str(text);
+            self.settings_scroll = 0;
+        } else {
+            return;
+        }
+        self.request_redraw();
+    }
+
+    /// Backspace in whichever of the two has the keyboard.
+    fn settings_backspace(&mut self) {
+        if let Some((_, draft)) = self.settings_editing.as_mut() {
+            draft.pop();
+        } else if self.settings_search_focused {
+            self.settings_query.pop();
+            self.settings_scroll = 0;
+        } else {
+            return;
+        }
+        self.request_redraw();
+    }
+
+    /// Scrolls the settings list, clamped so it always shows something.
+    fn scroll_settings(&mut self, rows: f32) {
+        let furthest = crate::settings_ui::max_scroll(
+            &self.settings_screen,
+            self.last_layout.map(|layout| layout.metrics.line_height).unwrap_or(20.0),
+        );
+        let moved = (self.settings_scroll as f32 - rows).clamp(0.0, furthest as f32) as usize;
+        if moved != self.settings_scroll {
+            self.settings_scroll = moved;
+            self.request_redraw();
+        }
+    }
+
+    /// Opens the dependency view.
+    ///
+    /// The workspace is only scanned when there is nothing already known
+    /// about it: a settled graph is written to disk the first time and read
+    /// back on every visit after, so opening the view is normally instant.
+    /// Scanning and settling are real work -- walking every file, then
+    /// running the simulation -- and neither happens on startup or in the
+    /// background, only when the reader asks to look. Ctrl+Shift+R rescans.
+    fn toggle_dependency_view(&mut self, already_active: bool) {
+        if already_active {
+            self.dependency_view = false;
+            self.dependency_press = None;
+            self.refresh_focus();
+            self.request_redraw();
+            return;
+        }
+        self.dependency_view = true;
+        self.active_list = None;
+        self.dependency_press = None;
+        self.dependency_hovered = None;
+        self.refresh_focus();
+
+        if self.dependency_settled.is_some() {
+            // Already in hand from earlier this session.
+            self.request_redraw();
+            return;
+        }
+        if self.load_cached_dependencies() {
+            self.request_redraw();
+            return;
+        }
+        self.rescan_dependencies();
+    }
+
+    /// Throws away what is known and scans the workspace again.
+    fn rescan_dependencies(&mut self) {
+        if let Err(error) = self.core.request_dependency_graph() {
+            self.set_status(format!("Dependency view: {error}"), Severity::Warning);
+            return;
+        }
+        self.dependency_settled = None;
+        self.dependency_scene = None;
+        self.dependency_hovered = None;
+        self.dependency_from_cache = false;
+        self.dependency_view_at = crate::depgraph::View::default();
+        self.request_redraw();
+    }
+
+    /// The command behind Ctrl+Shift+R: rescan, and open the view if it is
+    /// not already up, so the shortcut works from anywhere.
+    fn refresh_dependency_view(&mut self) {
+        if self.core.workspace().root().is_none() {
+            self.set_status("Dependency view: open a folder first", Severity::Warning);
+            return;
+        }
+        self.dependency_view = true;
+        self.active_list = None;
+        self.refresh_focus();
+        self.rescan_dependencies();
+        self.set_status("Rescanning the workspace for dependencies...", Severity::Success);
+    }
+
+    /// Reads back the graph saved for this workspace, reporting whether
+    /// there was one to read.
+    fn load_cached_dependencies(&mut self) -> bool {
+        let Some(root) = self.core.workspace().root().map(|root| root.as_path().to_path_buf())
+        else {
+            return false;
+        };
+        let Some(text) = ls_platform::depgraph_cache::load(&root) else { return false };
+        let Some(settled) = crate::depgraph::decode(&root, &text) else { return false };
+
+        let files = settled.files.len();
+        let edges = settled.edges.len();
+        self.dependency_settled = Some(settled);
+        self.dependency_scene = None;
+        self.dependency_view_at = crate::depgraph::View::default();
+        self.dependency_from_cache = true;
+        self.set_status(
+            format!("Dependencies: {files} files, {edges} links (saved; Ctrl+Shift+R to rescan)"),
+            Severity::Success,
+        );
+        true
+    }
+
+    /// Settles a completed scan, saves it, and reports what was found.
+    ///
+    /// Settling happens here rather than on the worker because this is where
+    /// a completed scan first becomes visible to the shell. It costs a few
+    /// hundred milliseconds once per workspace, and never again while the
+    /// saved copy stands.
+    fn adopt_dependency_scan(&mut self) {
+        let Some(graph) = self.core.dependency_graph() else { return };
+        let files = graph.files.len();
+        let edges = graph.edges.len();
+        let truncated = graph.truncated;
+        let settled = crate::depgraph::settle_graph(graph);
+
+        if let Some(root) = self.core.workspace().root().map(|root| root.as_path().to_path_buf()) {
+            let text = crate::depgraph::encode(&root, &settled);
+            // Best-effort: a cache that will not write costs a rescan next
+            // time, which is not worth interrupting anyone over.
+            ls_platform::depgraph_cache::save(&root, &text);
+        }
+
+        self.dependency_settled = Some(settled);
+        self.dependency_scene = None;
+        self.dependency_from_cache = false;
+        self.dependency_view_at = crate::depgraph::View::default();
+        if truncated {
+            self.set_status(
+                format!("Dependencies: {files} files, {edges} links (workspace too large; the scan stopped early)"),
+                Severity::Warning,
+            );
+        } else {
+            self.set_status(
+                format!("Dependencies: {files} files, {edges} links"),
+                Severity::Success,
+            );
+        }
+    }
+
+    /// Fits the settled graph to the pane, at the first frame after it lands
+    /// and again whenever the pane changes size.
+    ///
+    /// Done here rather than where the scan completes because it needs the
+    /// pane's size, which belongs to the renderer. Re-fitting on every frame
+    /// of a window drag would be wasteful, so it only re-runs once the pane
+    /// has actually changed by a visible amount. The reader's pan and zoom
+    /// survive it: a resize should not throw away where they were looking.
+    fn ensure_dependency_scene(&mut self, layout: &Layout) {
+        const RESIZE_SLOP: f32 = 8.0;
+        let viewport = (layout.text.width, layout.text.height);
+        let fitted = self.dependency_scene.as_ref().is_some_and(|scene| {
+            (scene.width - viewport.0).abs() < RESIZE_SLOP
+                && (scene.height - viewport.1).abs() < RESIZE_SLOP
+        });
+        if fitted {
+            return;
+        }
+        let Some(settled) = self.dependency_settled.as_ref() else { return };
+        self.dependency_scene = Some(crate::depgraph::build_scene(settled, viewport));
+    }
+
+    /// What the dependency pane shows when there is no graph to draw yet.
+    fn dependency_placeholder(&self) -> &'static str {
+        if self.core.workspace().root().is_none() {
+            "  No folder is open.\n\n  File > Open Folder, then pick the dependency view again."
+        } else if self.core.is_dependency_graph_pending() {
+            "  Scanning the workspace for dependencies..."
+        } else if self.dependency_settled.is_some() {
+            "  Laying the graph out..."
+        } else {
+            "  No files in a language this understands were found here."
+        }
+    }
+
+    /// The rectangle the graph is drawn in.
+    fn dependency_pane(layout: &Layout) -> crate::layout::Rect {
+        layout.text
+    }
+
+    /// Zooms about the pointer, so what is under it stays under it.
+    fn zoom_dependency_view(&mut self, factor: f32, layout: &Layout) {
+        let Some(scene) = self.dependency_scene.as_ref() else { return };
+        let pane = Self::dependency_pane(layout);
+        let zoomed = self.dependency_view_at.zoomed_at(factor, self.pointer, pane);
+        let zoomed = zoomed.clamped(scene, pane);
+        if zoomed != self.dependency_view_at {
+            self.dependency_view_at = zoomed;
+            self.request_redraw();
+        }
+    }
+
+    /// Puts the whole graph back on screen, at the framing it opened with.
+    fn reset_dependency_view(&mut self) {
+        if self.dependency_view_at != crate::depgraph::View::default() {
+            self.dependency_view_at = crate::depgraph::View::default();
+            self.set_status("Dependency view: fitted to the window", Severity::Success);
+            self.request_redraw();
+        }
+    }
+
+    /// Handles a press inside the graph, reporting whether it was consumed.
+    fn press_dependency_view(&mut self, x: f32, y: f32, layout: &Layout) -> bool {
+        if !self.dependency_view {
+            return false;
+        }
+        let pane = Self::dependency_pane(layout);
+        if !pane.contains(x, y) {
+            return false;
+        }
+        let at = self.dependency_view_at;
+        let hit = self
+            .dependency_scene
+            .as_ref()
+            .and_then(|scene| crate::depgraph::hit_test(scene, pane, at, (x, y)));
+
+        // Double-clicking the empty canvas puts the whole graph back on
+        // screen -- the same gesture every other graph canvas uses to fit,
+        // and one that costs no keybinding to remember.
+        let repeats = self.last_click.map(|(_, _, _, count)| count).unwrap_or(1);
+        if hit.is_none() && repeats >= 2 {
+            self.reset_dependency_view();
+            self.dependency_press = None;
+            return true;
+        }
+
+        self.dependency_press =
+            Some(DependencyPress { origin: (x, y), at: (x, y), node: hit });
+        true
+    }
+
+    /// Handles the release that ends a press in the graph.
+    ///
+    /// A press that stayed put on a node opens that file; one that moved was
+    /// a drag, and the graph has already followed the pointer. Deciding on
+    /// release rather than on press is what lets one button both pan and
+    /// open, with no modifier to remember.
+    fn release_dependency_view(&mut self, x: f32, y: f32) {
+        let Some(press) = self.dependency_press.take() else { return };
+        if !crate::depgraph::is_click(press.origin, (x, y)) {
+            return;
+        }
+        let Some(node) = press.node else { return };
+        let Some(path) = self
+            .dependency_scene
+            .as_ref()
+            .and_then(|scene| scene.nodes.get(node))
+            .map(|node| node.path.clone())
+        else {
+            return;
+        };
+        let Some(root) = self.core.workspace().root().map(|root| root.as_path().to_path_buf())
+        else {
+            return;
+        };
+        // Step out of the way: the graph covers the editor, so opening a file
+        // without closing it leaves the reader looking at the picture they
+        // just clicked instead of the file they asked for. The graph and
+        // where they had panned to are both kept, so Ctrl+Shift+D puts them
+        // straight back where they were.
+        self.dependency_view = false;
+        self.dependency_hovered = None;
+        self.refresh_focus();
+        self.open_path(root.join(path));
+    }
+
+    /// Drags the graph with the pointer while a press is held.
+    fn drag_dependency_view(&mut self, x: f32, y: f32, layout: &Layout) {
+        let Some(press) = self.dependency_press else { return };
+        let Some(scene) = self.dependency_scene.as_ref() else { return };
+        let pane = Self::dependency_pane(layout);
+        // Moved by the step since the last position, while `origin` stays
+        // put so the release can still tell a drag from a click.
+        let step = (x - press.at.0, y - press.at.1);
+        self.dependency_view_at = self.dependency_view_at.panned(step).clamped(scene, pane);
+        self.dependency_press = Some(DependencyPress { at: (x, y), ..press });
+        self.request_redraw();
+    }
+
+    /// Follows the pointer over the graph, tracing whichever file it is on.
+    fn hover_dependency_view(&mut self, x: f32, y: f32, layout: &Layout) {
+        let pane = Self::dependency_pane(layout);
+        let at = self.dependency_view_at;
+        let hovered = self
+            .dependency_scene
+            .as_ref()
+            .and_then(|scene| crate::depgraph::hit_test(scene, pane, at, (x, y)));
+        if hovered == self.dependency_hovered {
+            return;
+        }
+        self.dependency_hovered = hovered;
+        // The status bar has room for the whole path and the counts, which
+        // no label inside a circle ever will.
+        if let Some((scene, node)) = self.dependency_scene.as_ref().zip(hovered) {
+            if let Some(file) = scene.nodes.get(node) {
+                let (imports, imported_by) = scene.connections(node);
+                self.status_message = Some((
+                    format!(
+                        "{}  -  imports {imports}, imported by {imported_by}  (click to open)",
+                        file.path.display()
+                    ),
+                    Instant::now(),
+                    Severity::Success,
+                ));
+            }
+        }
+        self.request_redraw();
     }
 
     /// Rows for the docked sidebar, each tagged with what kind of row it is
@@ -2327,7 +3792,6 @@ impl LightSpeed {
     /// user-dragged panel is never clipped mid-character the way a
     /// fixed-width assumption would.
     fn sidebar_rows(&self, layout: &Layout) -> crate::text::RichText {
-        use crate::icons::Icon;
         use crate::text::RichText;
         use crate::theme::SidebarRowKind;
 
@@ -2348,24 +3812,27 @@ impl LightSpeed {
             truncated
         };
 
-        // While a query is being typed, the panel is the search field: a
-        // magnifier, then what has been typed so far, then a caret.
-        if let Some(query) = &self.search_query_input {
-            rich.colored("SEARCH", self.theme.dim_text).newline();
-            rich.icon(Icon::Search, self.theme.activity_icon_active);
-            rich.plain(" ");
-            rich.colored(&truncate(query), self.theme.text);
-            rich.colored("\u{2588}", self.theme.cursor);
+        // The Search panel gets its own header -- title plus action icons, a
+        // real search field, a (decorative, for now) replace field -- drawn
+        // the same whether a query is still being typed or its results are
+        // being browsed, the way VS Code's own Search view never collapses
+        // those fields away once you start reading results.
+        if self.showing_search_panel() {
+            // The results list follows the header even while the query is
+            // still being typed -- that is the whole point of the debounced
+            // re-search: the panel updates under the field rather than
+            // waiting for the field to be committed.
+            self.push_search_header(&mut rich, layout, &truncate);
+        } else if let Some(kind) = self.active_list {
+            let title = match kind {
+                ListKind::FileTree => "EXPLORER",
+                ListKind::GitStatus => "SOURCE CONTROL",
+                ListKind::SearchResults => unreachable!("handled by `is_search` above"),
+            };
+            rich.colored(title, self.theme.dim_text);
+        } else {
             return rich;
         }
-
-        let Some(kind) = self.active_list else { return rich };
-        let title = match kind {
-            ListKind::FileTree => "EXPLORER",
-            ListKind::SearchResults => "SEARCH",
-            ListKind::GitStatus => "SOURCE CONTROL",
-        };
-        rich.colored(title, self.theme.dim_text);
 
         for row in self.list_rows() {
             rich.newline();
@@ -2393,6 +3860,86 @@ impl LightSpeed {
             rich.colored(&truncate(&row.label), self.theme.sidebar_row_color(row.kind));
         }
         rich
+    }
+
+    /// The Search panel's own three-line header, in place of the plain title
+    /// line every other panel gets: a title row with the same refresh /
+    /// clear / new-search-editor / collapse-all actions VS Code's Search
+    /// view header has, a real search field, and a replace field. Matches
+    /// `sidebar_header_lines()`'s count of `3`.
+    ///
+    /// The case-sensitive / whole-word / regex toggles and the replace field
+    /// are drawn but not wired to anything yet -- the workspace search
+    /// behind them is a plain substring match with no such flags to toggle.
+    /// Right-alignment of the trailing icons is padded with monospace
+    /// spaces, the same approximation `menu::item_text` uses to line up
+    /// shortcuts: this renderer has no per-run alignment within a line, only
+    /// per-region (see `TextEngine::set_icon_cluster`), so a precise right
+    /// edge is not available here the way it is for an icon-only cluster.
+    fn push_search_header(
+        &self,
+        rich: &mut crate::text::RichText,
+        layout: &Layout,
+        truncate: &impl Fn(&str) -> String,
+    ) {
+        use crate::icons::Icon;
+        let dim = self.theme.dim_text;
+        let digit = layout.metrics.digit_width.max(1.0);
+        let margin = 16.0 * layout.scale;
+
+        // Row 0: "SEARCH", right-aligned action icons.
+        rich.colored("SEARCH", dim);
+        let header_icons = [Icon::Refresh, Icon::ClearAll, Icon::NewFile, Icon::CollapseAll];
+        let used = margin
+            + "SEARCH".len() as f32 * digit
+            + header_icons.len() as f32 * layout.metrics.icon_width;
+        rich.plain(&" ".repeat((((layout.sidebar.width - used) / digit).max(0.0)) as usize));
+        for icon in header_icons {
+            rich.icon(icon, dim);
+        }
+        rich.newline();
+
+        // Row 1: the search field -- a magnifier, the query (typed so far,
+        // or the last submitted one while browsing results, or a dim
+        // placeholder if there is neither), a caret only while actually
+        // typing, then the case/word/regex toggles.
+        let typing = self.search_query_input.is_some();
+        let submitted = self.core.workspace_search_result().map(|result| result.query.as_str());
+        let query = self.search_query_input.as_deref().or(submitted).unwrap_or("");
+        let query_shown = truncate(query);
+        rich.icon(Icon::Search, self.theme.activity_icon_active);
+        rich.plain(" ");
+        if query.is_empty() && !typing {
+            rich.colored("Search", dim);
+        } else {
+            rich.colored(&query_shown, self.theme.text);
+        }
+        if typing {
+            rich.colored("\u{2588}", self.theme.cursor);
+        }
+        let toggle_icons = [Icon::CaseSensitive, Icon::WholeWord, Icon::Regex];
+        let used = margin
+            + layout.metrics.icon_width
+            + digit
+            + query_shown.chars().count() as f32 * digit
+            + toggle_icons.len() as f32 * layout.metrics.icon_width;
+        rich.plain(&" ".repeat((((layout.sidebar.width - used) / digit).max(0.0)) as usize));
+        for icon in toggle_icons {
+            rich.icon(icon, dim);
+        }
+        rich.newline();
+
+        // Row 2: the replace field -- not wired to anything (there is no
+        // find-and-replace behind it yet), shown collapsed and dim the way
+        // VS Code's own replace field reads before it has ever been typed
+        // into.
+        rich.icon(Icon::Replace, dim);
+        rich.plain(" ");
+        rich.colored("Replace", dim);
+        let used = margin + layout.metrics.icon_width + digit + "Replace".len() as f32 * digit
+            + layout.metrics.icon_width;
+        rich.plain(&" ".repeat((((layout.sidebar.width - used) / digit).max(0.0)) as usize));
+        rich.icon(Icon::Ellipsis, dim);
     }
 
     /// The activity bar's icon column: one glyph per cell, the active one
@@ -2516,10 +4063,47 @@ impl LightSpeed {
     /// uses (the header is row 0). `None` while typing a query: the input
     /// line is not a "selection" in the list sense.
     fn sidebar_selected_row(&self) -> Option<usize> {
-        if self.search_query_input.is_some() {
-            return None;
+        // A typed query no longer suppresses the highlight: the arrow keys
+        // walk the live results underneath the field, so the row they are on
+        // has to be visible as the selection.
+        self.active_list.map(|_| self.list_selected + self.sidebar_header_lines())
+    }
+
+    /// How many lines at the top of the sidebar's row buffer are its own
+    /// header rather than a list entry. A plain title is one line; the
+    /// Search panel's own header (title + action icons, the search field,
+    /// the replace field -- see `push_search_header`) is three, in either of
+    /// its two states (typing a query, or browsing results), since the
+    /// header block is drawn the same either way.
+    fn sidebar_header_lines(&self) -> usize {
+        if self.showing_search_panel() {
+            3
+        } else {
+            1
         }
-        self.active_list.map(|_| self.list_selected + 1)
+    }
+
+    /// Whether the sidebar is showing the Search panel -- either because a
+    /// query is being typed, or because its results are on screen.
+    fn showing_search_panel(&self) -> bool {
+        self.search_query_input.is_some() || self.active_list == Some(ListKind::SearchResults)
+    }
+
+    /// Puts the keyboard in the search field, restoring the query that
+    /// produced the results on screen so it can be refined rather than
+    /// retyped.
+    fn focus_search_field(&mut self) {
+        if self.search_query_input.is_none() {
+            let previous = self
+                .core
+                .workspace_search_result()
+                .map(|result| result.query.clone())
+                .unwrap_or_default();
+            self.search_query_input = Some(previous);
+        }
+        self.active_list = Some(ListKind::SearchResults);
+        self.focus = InputFocus::SearchQuery;
+        self.request_redraw();
     }
 
     /// Rows for the floating performance/dev-tool panel, top-right. The
@@ -2680,6 +4264,22 @@ impl LightSpeed {
             &recent_rows,
         );
         self.menu_geometry = Some(geometry.clone());
+        let palette_rows = self.command_palette_rows();
+        self.palette_geometry = self.command_palette_open.then(|| {
+            crate::palette::geometry(
+                layout.window,
+                palette_rows.len(),
+                layout.metrics.line_height,
+                layout.scale,
+            )
+        });
+        let palette_rich = self.command_palette_open.then(|| self.palette_rich(&palette_rows));
+        // The selected row is only meaningful up to the same visible cap the
+        // panel itself and `palette_rich` both already clamp to.
+        let palette_selected = self
+            .command_palette_open
+            .then_some(self.command_palette_selected)
+            .filter(|_| !palette_rows.is_empty());
         if self.overlay_visible {
             self.build_overlay();
         }
@@ -2687,11 +4287,20 @@ impl LightSpeed {
             self.dev_panel_rows = devpanel::lines(&self.core, &self.heartbeat);
         }
         if self.resource_center_visible {
-            self.resource_center_rows = resources::lines(&self.core, &self.process_stats);
+            self.resource_center_rows =
+                resources::lines(&self.core, &self.process_stats, &self.lsp.running());
         }
 
         let panel_rows = self.panel_rows();
         let sidebar_rich = self.sidebar_rows(&layout);
+        // Clamped here rather than only where the wheel mutates it: the row
+        // list itself can shrink between frames (a directory collapses, a
+        // search returns fewer hits) and leave a stale scroll position
+        // pointing past the end of a now-shorter list.
+        let sidebar_total_height =
+            (sidebar_rich.text.matches('\n').count() + 1) as f32 * layout.metrics.line_height;
+        let sidebar_max_scroll = (sidebar_total_height - layout.sidebar.height).max(0.0);
+        self.sidebar_scroll_y = self.sidebar_scroll_y.clamp(0.0, sidebar_max_scroll);
         let sidebar_selected_row = self.sidebar_selected_row();
         let status_left = self.status_left();
         let status_right = self.status_right();
@@ -2730,8 +4339,11 @@ impl LightSpeed {
             Vec::new()
         };
         let prompt_text = self.banner_text();
+        if self.dependency_view {
+            self.ensure_dependency_scene(&layout);
+        }
         let bottom_panel_rows =
-            if self.bottom_panel_visible() { self.bottom_panel_rows() } else { Vec::new() };
+            if self.bottom_panel_visible() { self.bottom_panel_rows(&layout) } else { Vec::new() };
         let activity_active = self.activity_active_index();
         let activity = self.activity_rich();
         let bottom_panel_rail = self.bottom_panel_rail_rich();
@@ -2746,6 +4358,53 @@ impl LightSpeed {
             menu::MenuGeometry { titles: Vec::new(), dropdown: None, items: Vec::new() };
         let menu_geometry = self.menu_geometry.as_ref().unwrap_or(&empty_geometry);
         let caret_visible = self.caret_visible;
+
+        // The settings screen is measured here, once, so the click handler
+        // and the renderer both read the same geometry.
+        let settings_visible = self.settings_open.then(|| self.visible_settings());
+        let settings_rows = settings_visible.as_ref().map(|visible| {
+            crate::settings_ui::rows(
+                visible,
+                &self.settings,
+                self.settings_editing.as_ref().map(|(key, draft)| (*key, draft.as_str())),
+            )
+        });
+        if let Some(visible) = settings_visible.as_ref() {
+            self.settings_screen = crate::settings_ui::layout(
+                layout.text,
+                layout.metrics.line_height,
+                layout.metrics.digit_width,
+                visible,
+                &self.settings,
+                self.settings_scroll,
+            );
+        }
+        let settings_frame = match (settings_visible.as_ref(), settings_rows.as_ref()) {
+            (Some(visible), Some(rows)) => Some(crate::renderer::SettingsFrame {
+                screen: &self.settings_screen,
+                rows,
+                visible,
+                values: &self.settings,
+                query: &self.settings_query,
+                query_focused: self.settings_search_focused,
+                section: self.settings_section,
+                editing: self
+                    .settings_editing
+                    .as_ref()
+                    .map(|(key, draft)| (*key, draft.as_str())),
+                scroll_rows: self.settings_scroll,
+                workspace_scope: self.settings_scope == SettingsScope::Workspace,
+            }),
+            _ => None,
+        };
+
+        let dependency_placeholder = self.dependency_placeholder();
+        let dependency = self.dependency_view.then_some(crate::renderer::DependencyFrame {
+            scene: self.dependency_scene.as_ref(),
+            view: self.dependency_view_at,
+            traced: self.dependency_hovered,
+            placeholder: dependency_placeholder,
+        });
 
         let renderer = self.renderer.as_mut().expect("renderer checked above");
         let frame = Frame {
@@ -2769,6 +4428,11 @@ impl LightSpeed {
             sidebar: (!sidebar_rich.is_empty()).then_some(&sidebar_rich),
             sidebar_selected_row,
             sidebar_hovered_row: self.sidebar_hovered_row,
+            sidebar_scroll_y: self.sidebar_scroll_y,
+            palette: palette_rich.as_ref(),
+            palette_panel: self.palette_geometry,
+            palette_selected,
+            palette_hovered: self.command_palette_hovered,
             activity: &activity,
             activity_active,
             activity_hovered: self.activity_hovered,
@@ -2780,6 +4444,8 @@ impl LightSpeed {
             breadcrumb: &breadcrumb,
             tab_nav: &tab_nav,
             tab_actions: &tab_actions,
+            dependency,
+            settings: settings_frame,
         };
 
         match renderer.render(&frame) {
@@ -2873,6 +4539,11 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
 
         self.install_completion_waker();
 
+        // Settings are read once the renderer exists, because applying them
+        // reaches the font, which the renderer owns.
+        self.reload_settings();
+        self.apply_settings();
+
         let paths = std::mem::take(&mut self.startup_paths);
         for path in paths {
             self.open_path(path);
@@ -2904,6 +4575,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
         if self.tick_caret() {
             self.request_redraw();
         }
+        self.tick_search_debounce();
         self.poll_external_changes();
         match self.next_wakeup() {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
@@ -2917,6 +4589,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
             UserEvent::TaskCompleted => self.pump_background_work(),
             UserEvent::TerminalOutput => self.drain_terminal_output(),
             UserEvent::LspDiagnostics => self.drain_lsp_diagnostics(),
+            UserEvent::FolderPicked(result) => self.folder_picked(*result),
         }
     }
 
@@ -2957,6 +4630,91 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                     return;
                 }
 
+                // Ctrl+, opens the settings from anywhere, the same standing
+                // the command palette's shortcut has below. Routing it
+                // through the editor keymap meant it did nothing whenever
+                // the explorer or the terminal had the keyboard, which is
+                // most of the time somebody wants it.
+                if !self.settings_open
+                    && self.modifiers.control_key()
+                    && !self.modifiers.shift_key()
+                    && matches!(&event.logical_key, winit::keyboard::Key::Character(text) if text.as_str() == ",")
+                {
+                    self.toggle_settings();
+                    return;
+                }
+
+                // The settings screen owns the keyboard while it is up:
+                // typing goes to the search box or to the field being
+                // edited, and neither should reach the document behind it.
+                // Checked after the prompt and before everything else, the
+                // same standing the palette has below.
+                if self.settings_open && self.settings_key(&event.logical_key) {
+                    return;
+                }
+
+                // Ctrl+Shift+P opens the palette from anywhere -- checked
+                // ahead of every focus-specific handler below, the same
+                // priority a confirmation prompt gets, since a command
+                // palette that only opened from some focuses would not be
+                // the "run anything from anywhere" tool it is meant to be.
+                let modifiers_for_palette = winit::event::Modifiers::from(self.modifiers);
+                if keymap::is_command_palette_shortcut(&event.logical_key, &modifiers_for_palette)
+                {
+                    self.open_command_palette();
+                    return;
+                }
+
+                // The palette owns the keyboard while it is open: typing
+                // filters it, arrows move the highlight, Enter runs the
+                // highlighted command.
+                if self.focus == InputFocus::CommandPalette {
+                    match &event.logical_key {
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
+                            self.close_command_palette();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                            self.run_palette_selection();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
+                            // Capped to what the palette actually shows --
+                            // there is no scrolling, so selection must never
+                            // move past the last visible row.
+                            let count = self
+                                .command_palette_rows()
+                                .len()
+                                .min(crate::palette::MAX_VISIBLE_ROWS);
+                            if count > 0 {
+                                self.command_palette_selected =
+                                    (self.command_palette_selected + 1).min(count - 1);
+                            }
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                            self.command_palette_selected =
+                                self.command_palette_selected.saturating_sub(1);
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
+                            self.command_palette_query.pop();
+                            self.command_palette_selected = 0;
+                            self.request_redraw();
+                        }
+                        _ => {
+                            if let Some(text) = event.text.as_ref() {
+                                let printable: String =
+                                    text.chars().filter(|c| !c.is_control()).collect();
+                                if !printable.is_empty() {
+                                    self.command_palette_query.push_str(&printable);
+                                    self.command_palette_selected = 0;
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
                 // A navigable list (file tree / search results / git status)
                 // owns the keyboard while it is open.
                 // The command runner owns the keyboard while it is shown.
@@ -2971,7 +4729,40 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                             self.request_redraw();
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
-                            self.terminal_input.pop();
+                            self.terminal_backspace();
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Delete) => {
+                            self.terminal_delete_forward();
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                            self.terminal_history_up();
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
+                            self.terminal_history_down();
+                            self.request_redraw();
+                        }
+                        // Recall (Up/Down) walks entire commands; within one
+                        // line, Left/Right move the caret over it rather than
+                        // being left to fall into the default arm below and
+                        // do nothing, which is what made the caret look
+                        // stuck in place.
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft) => {
+                            self.terminal_move_left();
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight) => {
+                            self.terminal_move_right();
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home) => {
+                            self.terminal_cursor = 0;
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::End) => {
+                            self.terminal_cursor = self.terminal_input.chars().count();
                             self.request_redraw();
                         }
                         _ => {
@@ -2979,7 +4770,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                                 let printable: String =
                                     text.chars().filter(|c| !c.is_control()).collect();
                                 if !printable.is_empty() {
-                                    self.terminal_input.push_str(&printable);
+                                    self.terminal_insert(&printable);
                                     self.request_redraw();
                                 }
                             }
@@ -3014,35 +4805,47 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                     return;
                 }
 
-                // Typing a workspace-search query.
+                // Typing a workspace-search query. Results follow the query
+                // as it is typed (see `schedule_search_debounce`), so the
+                // arrow keys walk the results underneath the field and Enter
+                // opens the highlighted one -- there is nothing left for
+                // Enter to "submit".
                 if self.focus == InputFocus::SearchQuery {
-                    let shift = self.modifiers.contains(ModifiersState::SHIFT);
-                    match keymap::resolve_find(&event.logical_key, shift) {
-                        keymap::FindAction::Close => {
+                    match &event.logical_key {
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
                             self.search_query_input = None;
+                            self.search_debounce_deadline = None;
                             self.refresh_focus();
                             self.request_redraw();
                         }
-                        keymap::FindAction::Backspace => {
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
                             if let Some(query) = self.search_query_input.as_mut() {
                                 query.pop();
                             }
-                            self.request_redraw();
+                            self.schedule_search_debounce();
                         }
-                        keymap::FindAction::Next | keymap::FindAction::Previous => {
-                            if let Some(query) = self.search_query_input.take() {
-                                if let Err(error) = self.core.request_workspace_search(query) {
-                                    self.set_status(error.to_string(), Severity::Error);
-                                    self.refresh_focus();
-                                    self.request_redraw();
-                                } else {
-                                    self.active_list = Some(ListKind::SearchResults);
-                                    self.list_selected = 0;
-                                    self.focus_list();
-                                }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                            // Enter on a highlighted result opens it; with no
+                            // results yet it forces the pending search to run
+                            // now rather than waiting out the debounce.
+                            if self.search_result_rows() == 0 {
+                                self.run_pending_search();
+                            } else {
+                                self.activate_list_selection();
                             }
                         }
-                        keymap::FindAction::None => {
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowDown) => {
+                            let rows = self.search_result_rows();
+                            if rows > 0 {
+                                self.list_selected = (self.list_selected + 1).min(rows - 1);
+                            }
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowUp) => {
+                            self.list_selected = self.list_selected.saturating_sub(1);
+                            self.request_redraw();
+                        }
+                        _ => {
                             if let Some(text) = event.text.as_ref() {
                                 let printable: String =
                                     text.chars().filter(|c| !c.is_control()).collect();
@@ -3050,7 +4853,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                                     if let Some(query) = self.search_query_input.as_mut() {
                                         query.push_str(&printable);
                                     }
-                                    self.request_redraw();
+                                    self.schedule_search_debounce();
                                 }
                             }
                         }
@@ -3144,7 +4947,69 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                     // The tab bar and the status bar do not scroll the
                     // document, and an open menu or confirmation owns input.
                     WheelTarget::Chrome | WheelTarget::Blocked => return,
-                    WheelTarget::Editor => {}
+                    WheelTarget::Editor | WheelTarget::Sidebar | WheelTarget::BottomPanel => {}
+                }
+                if target == WheelTarget::BottomPanel {
+                    // Positive `dy` is a scroll *up*, which in a terminal
+                    // means back into history.
+                    match delta {
+                        MouseScrollDelta::LineDelta(_, dy) => {
+                            self.scroll_terminal_by_lines(dy * WHEEL_LINES);
+                        }
+                        MouseScrollDelta::PixelDelta(position) => {
+                            let line_height = self
+                                .last_layout
+                                .map(|layout| layout.metrics.line_height)
+                                .unwrap_or(20.0);
+                            self.scroll_terminal_by_lines(position.y as f32 / line_height.max(1.0));
+                        }
+                    }
+                    return;
+                }
+                if target == WheelTarget::Sidebar {
+                    match delta {
+                        MouseScrollDelta::LineDelta(_, dy) => {
+                            let step = self
+                                .last_layout
+                                .map(|layout| layout.metrics.line_height)
+                                .unwrap_or(20.0);
+                            self.scroll_sidebar_by_pixels(dy * WHEEL_LINES * step);
+                        }
+                        MouseScrollDelta::PixelDelta(position) => {
+                            self.scroll_sidebar_by_pixels(position.y as f32);
+                        }
+                    }
+                    return;
+                }
+                if self.settings_open {
+                    let rows = match delta {
+                        MouseScrollDelta::LineDelta(_, dy) => dy * 3.0,
+                        MouseScrollDelta::PixelDelta(position) => {
+                            position.y as f32
+                                / self
+                                    .last_layout
+                                    .map(|layout| layout.metrics.line_height)
+                                    .unwrap_or(20.0)
+                        }
+                    };
+                    self.scroll_settings(rows);
+                    return;
+                }
+                if self.dependency_view {
+                    // A graph canvas zooms under the wheel rather than
+                    // scrolling: the picture is already fitted to the pane,
+                    // so there is nothing above or below it to scroll to,
+                    // and getting closer is the thing a reader wants.
+                    if let Some(layout) = self.last_layout {
+                        let notches = match delta {
+                            MouseScrollDelta::LineDelta(_, dy) => dy,
+                            MouseScrollDelta::PixelDelta(position) => position.y as f32 / 60.0,
+                        };
+                        if notches != 0.0 {
+                            self.zoom_dependency_view(ZOOM_PER_NOTCH.powf(notches), &layout);
+                        }
+                    }
+                    return;
                 }
                 match delta {
                     MouseScrollDelta::LineDelta(dx, dy) => {
@@ -3164,6 +5029,17 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.pointer = (position.x as f32, position.y as f32);
+                if self.dependency_view {
+                    let (x, y) = self.pointer;
+                    if let Some(layout) = self.last_layout {
+                        if self.dependency_press.is_some() {
+                            self.drag_dependency_view(x, y, &layout);
+                        } else {
+                            self.hover_dependency_view(x, y, &layout);
+                        }
+                    }
+                    return;
+                }
                 if self.menu.is_open() {
                     // The highlight follows the pointer down an open dropdown.
                     if let Some(geometry) = &self.menu_geometry {
@@ -3210,6 +5086,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                         self.on_mouse_press(x, y);
                     }
                     ElementState::Released => {
+                        self.release_dependency_view(x, y);
                         self.dragging_selection = false;
                         self.dragging_scrollbar = false;
                         self.dragging_sidebar = false;
@@ -3266,7 +5143,8 @@ mod tests {
         // finishing -- used to see the still-open panel and hand focus
         // straight back to it, so every keystroke after the first went to
         // the list's Up/Down/Enter handler instead of the document.
-        let focus = derive_focus(InputFocus::Editor, false, false, false, false, true, false);
+        let focus =
+            derive_focus(InputFocus::Editor, false, false, false, false, true, false, false);
         assert_eq!(
             focus,
             InputFocus::Editor,
@@ -3280,11 +5158,11 @@ mod tests {
         // none of these should be able to bounce focus away from wherever
         // the user actually is, as long as that surface is still open.
         assert_eq!(
-            derive_focus(InputFocus::List, false, false, false, false, true, false),
+            derive_focus(InputFocus::List, false, false, false, false, true, false, false),
             InputFocus::List
         );
         assert_eq!(
-            derive_focus(InputFocus::Terminal, false, false, false, false, false, true),
+            derive_focus(InputFocus::Terminal, false, false, false, false, false, true, false),
             InputFocus::Terminal
         );
     }
@@ -3292,11 +5170,11 @@ mod tests {
     #[test]
     fn a_resting_focus_falls_back_to_the_editor_once_its_surface_closes() {
         assert_eq!(
-            derive_focus(InputFocus::List, false, false, false, false, false, false),
+            derive_focus(InputFocus::List, false, false, false, false, false, false, false),
             InputFocus::Editor
         );
         assert_eq!(
-            derive_focus(InputFocus::Terminal, false, false, false, false, false, false),
+            derive_focus(InputFocus::Terminal, false, false, false, false, false, false, false),
             InputFocus::Editor
         );
     }
@@ -3308,26 +5186,57 @@ mod tests {
         // simply opening the explorer while the user is mid-edit would yank
         // the keyboard away without them asking for it.
         assert_eq!(
-            derive_focus(InputFocus::Editor, false, false, false, false, true, false),
+            derive_focus(InputFocus::Editor, false, false, false, false, true, false, false),
             InputFocus::Editor
         );
         assert_eq!(
-            derive_focus(InputFocus::Editor, false, false, false, false, false, true),
+            derive_focus(InputFocus::Editor, false, false, false, false, false, true, false),
             InputFocus::Editor
         );
     }
 
     #[test]
     fn the_exclusive_surfaces_always_win_over_a_resting_focus() {
-        for (prompt, menu, search, find) in [
+        // SearchQuery is deliberately not here: unlike Prompt/Menu/Find/the
+        // palette, it is a resting focus too now (see the next test) --
+        // typing a query must not be able to steal focus back from
+        // somewhere the user has since clicked, only the click itself grants
+        // it, the same as List and Terminal.
+        for (prompt, menu, find, palette) in [
             (true, false, false, false),
             (false, true, false, false),
             (false, false, true, false),
             (false, false, false, true),
         ] {
-            let focus = derive_focus(InputFocus::List, prompt, menu, search, find, true, false);
+            let focus =
+                derive_focus(InputFocus::List, prompt, menu, false, find, true, false, palette);
             assert_ne!(focus, InputFocus::List, "an exclusive surface must win over a resting one");
         }
+    }
+
+    #[test]
+    fn a_typed_search_query_cannot_steal_focus_back_from_a_click() {
+        // Regression test: `search_query_open` alone used to force
+        // `SearchQuery` focus on every `refresh_focus` call, so clicking into
+        // the editor while a query was typed but not yet submitted got
+        // silently reverted the instant anything else refreshed (a
+        // diagnostics update, a heartbeat tick) -- the editor read as
+        // permanently stuck until Escape.
+        assert_eq!(
+            derive_focus(InputFocus::Editor, false, false, true, false, false, false, false),
+            InputFocus::Editor,
+            "a query being open must not be able to grab focus the click already left"
+        );
+        assert_eq!(
+            derive_focus(InputFocus::SearchQuery, false, false, true, false, false, false, false),
+            InputFocus::SearchQuery,
+            "but it is still a resting focus: unrelated refreshes must not evict it either"
+        );
+        assert_eq!(
+            derive_focus(InputFocus::SearchQuery, false, false, false, false, false, false, false),
+            InputFocus::Editor,
+            "falls back to the editor once the query itself closes"
+        );
     }
 
     #[test]
@@ -3398,6 +5307,221 @@ mod tests {
         let (x, y) = centre(layout.text);
         assert_eq!(wheel_target(&layout, InputFocus::Menu, x, y), WheelTarget::Blocked);
         assert_eq!(wheel_target(&layout, InputFocus::Prompt, x, y), WheelTarget::Blocked);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_sidebar_regardless_of_focus() {
+        // Regression test: the sidebar had no wheel target at all, so a
+        // file tree taller than the panel could never be scrolled. The
+        // sidebar is non-modal chrome (see `derive_focus`), so this must work
+        // whether the editor still has focus or a click has already claimed
+        // `InputFocus::List`.
+        let layout = Layout::with_chrome(
+            1000.0,
+            700.0,
+            1.0,
+            FontMetrics {
+                font_size: 14.0,
+                line_height: 20.0,
+                digit_width: 8.0,
+                icon_width: 14.0,
+                material_icon_width: 14.0,
+            },
+            4,
+            true,
+            true,
+            true,
+            crate::layout::SIDEBAR_WIDTH,
+            false,
+            crate::layout::BOTTOM_PANEL_HEIGHT,
+        );
+        let (x, y) = centre(layout.sidebar);
+        assert_eq!(wheel_target(&layout, InputFocus::Editor, x, y), WheelTarget::Sidebar);
+        assert_eq!(wheel_target(&layout, InputFocus::List, x, y), WheelTarget::Sidebar);
+    }
+
+    #[test]
+    fn the_cursor_is_visible_at_the_end_of_an_empty_or_full_line() {
+        // Regression test for "cursor is not visible in the terminal": the
+        // input row used to be plain `"> {input}"` with nothing marking
+        // where typing would land.
+        assert_eq!(terminal_input_row("", 0), "> \u{2588}");
+        assert_eq!(terminal_input_row("cd Light", 8), "> cd Light\u{2588}");
+    }
+
+    #[test]
+    fn the_cursor_splices_in_wherever_it_actually_is_not_just_the_end() {
+        // Regression test for "I cannot move cursor back using arrow keys":
+        // this is the render-side half of that fix -- the cursor must show
+        // up mid-line, not only ever at the end.
+        assert_eq!(terminal_input_row("cd Light", 2), "> cd\u{2588} Light");
+        assert_eq!(terminal_input_row("cd Light", 0), "> \u{2588}cd Light");
+    }
+
+    #[test]
+    fn the_cursor_never_splits_a_multibyte_character() {
+        // `terminal_char_boundary` counts characters, not bytes -- a cursor
+        // landing on a raw byte offset instead could splice a block glyph
+        // into the middle of an accented letter's or an emoji's encoding.
+        let line = "caf\u{e9} \u{1f389}party"; // "café 🎉party"
+        assert_eq!(terminal_input_row(line, 4), "> caf\u{e9}\u{2588} \u{1f389}party");
+        assert_eq!(terminal_input_row(line, 5), "> caf\u{e9} \u{2588}\u{1f389}party");
+        assert_eq!(terminal_input_row(line, 6), "> caf\u{e9} \u{1f389}\u{2588}party");
+    }
+
+    #[test]
+    fn a_cursor_index_past_the_end_of_the_line_clamps_to_the_end() {
+        assert_eq!(terminal_input_row("hi", 50), "> hi\u{2588}");
+    }
+
+    #[test]
+    fn the_terminal_shows_as_many_lines_as_its_panel_actually_has_room_for() {
+        // The bug this replaces: a hardcoded 12 lines regardless of the
+        // panel's size, so dragging it taller showed the same twelve with
+        // empty space under them, and a short panel drew rows that were
+        // clipped off the bottom.
+        let mut layout = layout();
+        layout.metrics.line_height = 20.0;
+
+        layout.bottom_panel.height = 20.0 * 10.0;
+        assert_eq!(
+            terminal_visible_lines(&layout),
+            8,
+            "ten rows of space, less the header and the input line"
+        );
+
+        layout.bottom_panel.height = 20.0 * 30.0;
+        assert_eq!(terminal_visible_lines(&layout), 28, "a taller panel shows more");
+    }
+
+    #[test]
+    fn a_terminal_panel_too_small_for_its_own_chrome_still_shows_a_line() {
+        // Dragged shut to nothing, the arithmetic must not underflow into a
+        // huge count or report zero visible lines.
+        let mut layout = layout();
+        layout.metrics.line_height = 20.0;
+        layout.bottom_panel.height = 0.0;
+        assert_eq!(terminal_visible_lines(&layout), 1);
+        layout.bottom_panel.height = 20.0;
+        assert_eq!(terminal_visible_lines(&layout), 1);
+    }
+
+    #[test]
+    fn the_terminal_takes_the_wheel_even_while_it_holds_the_keyboard() {
+        // Scrolling back through output must not require clicking out of the
+        // terminal first -- and `InputFocus::Terminal` otherwise falls into
+        // the "a modal surface owns input" arm, which swallows the wheel.
+        let mut layout = layout();
+        layout.bottom_panel_visible = true;
+        layout.bottom_panel = crate::layout::Rect::new(300.0, 400.0, 500.0, 200.0);
+        let (x, y) = centre(layout.bottom_panel);
+        assert_eq!(
+            wheel_target(&layout, InputFocus::Terminal, x, y),
+            WheelTarget::BottomPanel
+        );
+        assert_eq!(
+            wheel_target(&layout, InputFocus::Editor, x, y),
+            WheelTarget::BottomPanel,
+            "and without having to focus it at all"
+        );
+    }
+
+    #[test]
+    fn pressing_up_on_an_empty_history_does_nothing() {
+        assert_eq!(navigate_terminal_history(&[], None, HistoryDirection::Older), None);
+    }
+
+    #[test]
+    fn up_from_a_live_line_recalls_the_newest_command_first() {
+        // The shell convention this must match: the first Up press shows the
+        // *last* thing run, not the first thing ever run.
+        let history = vec!["git status".to_string(), "cargo build".to_string(), "ls".to_string()];
+        assert_eq!(navigate_terminal_history(&history, None, HistoryDirection::Older), Some(2));
+    }
+
+    #[test]
+    fn repeated_up_walks_toward_the_oldest_entry_and_stops_there() {
+        let history = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        assert_eq!(navigate_terminal_history(&history, Some(2), HistoryDirection::Older), Some(1));
+        assert_eq!(navigate_terminal_history(&history, Some(1), HistoryDirection::Older), Some(0));
+        assert_eq!(
+            navigate_terminal_history(&history, Some(0), HistoryDirection::Older),
+            Some(0),
+            "the oldest entry is the floor, not a place to run off the front of the list"
+        );
+    }
+
+    #[test]
+    fn down_walks_toward_the_newest_entry_then_back_to_the_live_line() {
+        let history = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+        assert_eq!(navigate_terminal_history(&history, Some(0), HistoryDirection::Newer), Some(1));
+        assert_eq!(navigate_terminal_history(&history, Some(1), HistoryDirection::Newer), Some(2));
+        assert_eq!(
+            navigate_terminal_history(&history, Some(2), HistoryDirection::Newer),
+            None,
+            "past the newest entry is the live line, not a wrap back to the oldest"
+        );
+    }
+
+    #[test]
+    fn down_on_a_live_line_that_was_never_recalled_stays_on_it() {
+        // `current: None` with nothing to walk back to must not manufacture
+        // an index -- this is the case `App::terminal_history_down` guards
+        // against actually applying, since here it would otherwise look
+        // identical to "walked past the newest entry".
+        let history = vec!["one".to_string()];
+        assert_eq!(navigate_terminal_history(&history, None, HistoryDirection::Newer), None);
+    }
+
+    #[test]
+    fn clicking_the_search_field_focuses_it_instead_of_the_results_list() {
+        // Regression test for "nothing happens when I click on the search
+        // button". Making the results list live while the query is still
+        // being typed put `active_list` in `Some(SearchResults)`, which
+        // brought the sidebar's click branch to life across the whole panel
+        // -- including the search field itself. Clicking the field claimed
+        // list focus, so every keystroke after that went to the results
+        // instead of the box the caret was blinking in.
+        assert_eq!(sidebar_click(1, 3, true), SidebarClick::SearchField, "the query field");
+        assert_eq!(sidebar_click(2, 3, true), SidebarClick::SearchField, "the replace field");
+        assert_eq!(sidebar_click(0, 3, true), SidebarClick::SearchField, "the title row");
+    }
+
+    #[test]
+    fn clicking_past_the_search_header_still_picks_a_result() {
+        // The fix must not swallow clicks on the results themselves.
+        assert_eq!(sidebar_click(3, 3, true), SidebarClick::Row(0));
+        assert_eq!(sidebar_click(7, 3, true), SidebarClick::Row(4));
+    }
+
+    #[test]
+    fn an_ordinary_panels_title_row_is_not_a_text_field() {
+        // The explorer and git panels have a caption, not an input: clicking
+        // it must not try to focus something that does not exist.
+        assert_eq!(sidebar_click(0, 1, false), SidebarClick::Header);
+        assert_eq!(sidebar_click(1, 1, false), SidebarClick::Row(0));
+        assert_eq!(sidebar_click(4, 1, false), SidebarClick::Row(3));
+    }
+
+    #[test]
+    fn results_for_a_query_already_typed_past_are_not_shown() {
+        // The failure this prevents: type "needle", and the walk dispatched
+        // for "nee" three keystrokes ago lands first and paints its hits
+        // under a field that says "needle". Both are real results; only one
+        // of them is for what the user is looking at.
+        assert!(search_result_is_current("needle", Some("needle")));
+        assert!(!search_result_is_current("nee", Some("needle")), "a stale prefix must not show");
+        assert!(
+            !search_result_is_current("needles", Some("needle")),
+            "nor a query the user has since backspaced past"
+        );
+    }
+
+    #[test]
+    fn a_dismissed_search_field_still_shows_whatever_last_completed() {
+        // The field is gone but the results panel is still up: there is no
+        // "current query" to disagree with, so the last result stands.
+        assert!(search_result_is_current("needle", None));
     }
 
     #[test]

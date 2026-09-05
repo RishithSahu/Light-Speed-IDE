@@ -36,6 +36,21 @@ wgpu = "30.0"
 winit = "0.30.12"
 glyphon = "0.12"
 pollster = "0.4"
+# Force-directed graph layout for the dependency view. Chosen over writing
+# one, and over the layered (Sugiyama) layout that came first: a layered
+# layout ranks a dependency graph into a handful of very wide rows, which
+# measured at 12218x210 px for this repository -- eleven screens across, with
+# about seven of seventy-nine files legible at once. A force simulation packs
+# the same graph into one round cluster that fits a window whole.
+#
+# `force_graph` earns its place on weight and licence. Weight: petgraph and
+# four small crates, no proc-macros and no build script, against
+# `graph-explorer-layout`, which pulls serde plus the syn/quote toolchain.
+# Licence: `forceatlas2` is the better-known implementation and was rejected
+# outright -- it is AGPL-3.0-only, which this MIT OR Apache-2.0 workspace
+# cannot take. It hands back node positions and nothing else, so the drawing
+# stays in `app/src/depgraph.rs`.
+force_graph = "0.4"
 
 [profile.release]
 opt-level = 3

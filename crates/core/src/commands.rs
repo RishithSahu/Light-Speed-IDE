@@ -312,6 +312,24 @@ fn view_toggle_git_status(core: &mut EditorCore, _args: CommandArgs) -> Result<(
     Ok(())
 }
 
+fn view_open_settings(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ToggleSettings);
+    Ok(())
+}
+
+fn view_toggle_dependencies(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ToggleDependencyView);
+    Ok(())
+}
+
+fn view_refresh_dependencies(
+    core: &mut EditorCore,
+    _args: CommandArgs,
+) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::RefreshDependencyView);
+    Ok(())
+}
+
 fn view_toggle_terminal(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
     core.request_shell(ShellRequest::ToggleTerminal);
     Ok(())
@@ -381,6 +399,12 @@ pub enum ShellRequest {
     WorkspaceSearch,
     /// Show or hide the git status panel (item 11).
     ToggleGitStatus,
+    /// Show or hide the settings screen.
+    ToggleSettings,
+    /// Show or hide the dependency view, scanning the workspace to build it.
+    ToggleDependencyView,
+    /// Scan the workspace again, replacing whatever was saved for it.
+    RefreshDependencyView,
     /// Show or hide the command runner (item 10).
     ToggleTerminal,
     /// Show or hide the status bar.
@@ -750,6 +774,24 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         display_name: "Toggle Git Status",
         enabled: always,
         execute: view_toggle_git_status,
+    },
+    CommandDescriptor {
+        id: "view.open_settings",
+        display_name: "Settings",
+        enabled: always,
+        execute: view_open_settings,
+    },
+    CommandDescriptor {
+        id: "view.toggle_dependencies",
+        display_name: "Toggle Dependency View",
+        enabled: always,
+        execute: view_toggle_dependencies,
+    },
+    CommandDescriptor {
+        id: "view.refresh_dependencies",
+        display_name: "Rescan Dependencies",
+        enabled: always,
+        execute: view_refresh_dependencies,
     },
     CommandDescriptor {
         id: "view.toggle_terminal",

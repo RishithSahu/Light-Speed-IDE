@@ -28,8 +28,11 @@ use ls_core::{DocumentId, TabPresentation};
 /// The close control's glyph.
 pub const CLOSE_GLYPH: char = '\u{00d7}';
 
-/// Leading padding, in characters.
-const LEAD: usize = 2;
+/// Leading padding before the icon, in characters -- without this the icon
+/// glyph sits flush against the tab's own left edge (and the previous tab's
+/// separator), reading as clipped into the tab beside it rather than inset
+/// within its own.
+const ICON_LEAD: usize = 1;
 /// Characters between the title and the close control: a marker slot, a space,
 /// the close glyph, and one trailing space.
 const MARKER_SLOT: usize = 1;
@@ -58,7 +61,7 @@ pub fn marker(tab: &TabPresentation) -> char {
 /// composed in front of this by the renderer and accounted for separately in
 /// [`geometry`].
 pub fn label(tab: &TabPresentation) -> String {
-    let mut text = String::with_capacity(tab.title.len() + LEAD + MARKER_SLOT + GAP + TRAIL + 1);
+    let mut text = String::with_capacity(tab.title.len() + MARKER_SLOT + GAP + TRAIL + 1);
     text.push(' ');
     text.push_str(&tab.title);
     text.push(marker(tab));
@@ -132,13 +135,14 @@ pub fn geometry(
         // Lapce gives every tab a minimum width regardless of how short its
         // title is, so a one-character filename doesn't produce a sliver of
         // a tab.
-        let natural = icon_width + cell_chars(tab) as f32 * char_width;
+        let natural = ICON_LEAD as f32 * char_width + icon_width + cell_chars(tab) as f32 * char_width;
         let width = natural.max(crate::layout::TAB_MIN_WIDTH * scale);
         let full = Rect::new(x, bar.y, width, bar.height);
 
         // The close control is a square around its glyph, inset so it does not
         // swallow clicks meant for the last character of the title.
-        let glyph_x = x + icon_width + close_offset(tab) as f32 * char_width;
+        let glyph_x =
+            x + ICON_LEAD as f32 * char_width + icon_width + close_offset(tab) as f32 * char_width;
         let side = bar.height.min(char_width * 2.0).max(char_width);
         let close = Rect::new(
             glyph_x - (side - char_width) / 2.0,
@@ -305,7 +309,7 @@ mod tests {
         for tab in three() {
             let width =
                 geometry(bar(), std::slice::from_ref(&tab), 8.0, 14.0, 1.0).tabs[0].full.width;
-            let natural = 14.0 + label(&tab).chars().count() as f32 * 8.0;
+            let natural = ICON_LEAD as f32 * 8.0 + 14.0 + label(&tab).chars().count() as f32 * 8.0;
             assert_eq!(
                 natural.max(crate::layout::TAB_MIN_WIDTH),
                 width,
@@ -323,9 +327,9 @@ mod tests {
         let rects = &geometry.tabs[0];
         let glyph_index =
             rects.label.chars().position(|character| character == CLOSE_GLYPH).expect("drawn");
-        // The icon is shaped before the label, so the glyph's x starts one
-        // icon advance in.
-        let glyph_x = rects.full.x + 14.0 + glyph_index as f32 * 8.0;
+        // The icon is shaped after a one-character leading pad, so the
+        // glyph's x starts a lead plus one icon advance in.
+        let glyph_x = rects.full.x + ICON_LEAD as f32 * 8.0 + 14.0 + glyph_index as f32 * 8.0;
         assert!(
             rects.close.contains(glyph_x + 1.0, rects.close.y + 1.0),
             "the close rectangle must cover the glyph the user is aiming at"
