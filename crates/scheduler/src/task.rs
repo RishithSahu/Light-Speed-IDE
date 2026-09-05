@@ -42,6 +42,9 @@ impl SubsystemId {
     pub const GIT: SubsystemId = SubsystemId("git");
     pub const LANGUAGE: SubsystemId = SubsystemId("language");
     pub const INDEXING: SubsystemId = SubsystemId("indexing");
+    /// A filesystem watch task (ADR-0017): waits for the next change under a
+    /// directory, reports it, and is re-armed by its caller.
+    pub const WATCH: SubsystemId = SubsystemId("watch");
     /// For tests and benchmarks.
     pub const TEST: SubsystemId = SubsystemId("test");
 

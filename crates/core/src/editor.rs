@@ -24,6 +24,7 @@ use crate::persistence::{
 };
 use crate::render::{self, RenderSnapshot, Viewport};
 use crate::selection::{Movement, Selection};
+use crate::watch::WatchedPaths;
 use crate::workspace::{Workspace, WorkspaceId};
 use crate::workspace_search::{self, WorkspaceSearchResult};
 use crate::EffectiveConfig;
@@ -32,7 +33,7 @@ use ls_log::diag::LsError;
 use ls_platform::{CanonicalPath, Clipboard};
 use ls_scheduler::{
     CancellationToken, CompletionOutcome, CostEstimate, ResourceClass, Scheduler, SchedulerConfig,
-    SubsystemId, TaskId, TaskOutcome, TaskProduct, TaskSpec, WorkspaceRef,
+    SubsystemId, TaskFailure, TaskId, TaskOutcome, TaskProduct, TaskSpec, WorkspaceRef,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +41,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const SUBSYSTEM: &str = "core";
+
+/// How often a watch task re-checks its cancellation flag while it waits for
+/// the OS to report a change (docs/adr/ADR-0017-filesystem-change-notification.md).
+/// Short enough that closing a document or the workspace is noticed promptly;
+/// long enough to spend almost all of that time asleep in the kernel rather
+/// than spinning.
+const WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A line/column position (specification section 15: never a byte offset).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -184,6 +192,14 @@ pub struct EditorCore {
     /// search cancels and replaces it rather than letting two walks race.
     pending_search: Option<TaskId>,
     workspace_search_result: Option<WorkspaceSearchResult>,
+    /// The active filesystem watch task for each watched directory, keyed by
+    /// [`CanonicalPath::key`] (ADR-0017). Reconciled by
+    /// [`EditorCore::sync_watchers`] against the workspace root and every
+    /// open document's directory; re-armed by
+    /// [`EditorCore::apply_watch_completion`] using the directory and
+    /// recursion flag carried in the completion itself, so nothing beyond the
+    /// `TaskId` needs to be kept here.
+    watching: HashMap<String, TaskId>,
 }
 
 /// Files opened recently, most-recent first (capped at
@@ -260,6 +276,7 @@ impl EditorCore {
             git_status: None,
             pending_search: None,
             workspace_search_result: None,
+            watching: HashMap::new(),
         }
     }
 
@@ -297,6 +314,7 @@ impl EditorCore {
         let id = WorkspaceId::new(self.workspace.id().get() + 1);
         let display = canonical.display_string();
         self.workspace = Workspace::with_root(id, canonical);
+        self.sync_watchers();
         ls_log::info!(SUBSYSTEM, "workspace_opened", "workspace opened {display}");
         self.events.emit(SUBSYSTEM, EventPayload::WorkspaceOpened { root: display });
         Ok(id)
@@ -599,6 +617,10 @@ impl EditorCore {
                 applied += self.apply_search_completion(completion);
                 continue;
             }
+            if completion.subsystem == SubsystemId::WATCH {
+                applied += self.apply_watch_completion(completion);
+                continue;
+            }
             if completion.subsystem != SubsystemId::DOCUMENT_IO {
                 // Every subsystem that can complete work has a handler above
                 // or here; anything else is a caller mistake worth seeing
@@ -660,6 +682,11 @@ impl EditorCore {
             }
         }
 
+        // Loads, saves and closes can all change which directories matter
+        // (a new path opened, a document closed, a save-as moved one), so
+        // reconcile watches once per drain rather than at every call site.
+        self.sync_watchers();
+
         applied
     }
 
@@ -689,6 +716,196 @@ impl EditorCore {
             }
         }
         0
+    }
+
+    // --- filesystem watching (ADR-0017: replaces the shell's poll) -----------
+
+    /// Applies a completed watch task: refreshes the documents it says
+    /// changed, then re-arms the watch (unless the directory stopped being
+    /// desired, in which case [`EditorCore::sync_watchers`] already cancelled
+    /// it and this completion arrives as [`CompletionOutcome::Cancelled`]).
+    fn apply_watch_completion(&mut self, completion: ls_scheduler::TaskCompletion) -> usize {
+        let Some(key) = self
+            .watching
+            .iter()
+            .find(|(_, &task)| task == completion.task)
+            .map(|(key, _)| key.clone())
+        else {
+            return 0;
+        };
+
+        match completion.outcome {
+            CompletionOutcome::Completed(product) => {
+                let Ok(watched) = product.downcast::<WatchedPaths>() else {
+                    self.watching.remove(&key);
+                    return 0;
+                };
+                let applied = self.apply_watched_paths(&key, &watched);
+                match self.submit_watch(watched.directory.clone(), watched.recursive) {
+                    Ok(task) => {
+                        self.watching.insert(key, task);
+                    }
+                    Err(error) => {
+                        self.watching.remove(&key);
+                        ls_log::warn!(
+                            SUBSYSTEM,
+                            "watch_not_rearmed",
+                            "could not keep watching {}: {error}",
+                            watched.directory.display()
+                        );
+                    }
+                }
+                applied
+            }
+            CompletionOutcome::Cancelled => 0,
+            CompletionOutcome::Failed(failure) => {
+                self.watching.remove(&key);
+                ls_log::warn!(SUBSYSTEM, "watch_failed", "filesystem watch failed: {failure}");
+                0
+            }
+        }
+    }
+
+    /// Refreshes every open document a completed watch says changed.
+    ///
+    /// An empty `changed` list means the OS notification buffer overflowed:
+    /// every open document under the watched directory is re-checked instead
+    /// of trusting emptiness to mean nothing happened.
+    fn apply_watched_paths(&mut self, dir_key: &str, watched: &WatchedPaths) -> usize {
+        let mut applied = 0;
+
+        if watched.changed.is_empty() {
+            let candidates: Vec<DocumentId> = self
+                .documents
+                .iter()
+                .filter_map(|(id, document)| {
+                    let path = document.path()?;
+                    let under = if watched.recursive {
+                        self.workspace.root().is_some_and(|root| path.relative_to(root).is_some())
+                    } else {
+                        path.parent().is_some_and(|parent| parent.key() == dir_key)
+                    };
+                    under.then_some(*id)
+                })
+                .collect();
+            for id in candidates {
+                if self.refresh_external_state(id).is_some() {
+                    applied += 1;
+                }
+            }
+            return applied;
+        }
+
+        for name in &watched.changed {
+            let full = watched.directory.join(name);
+            let Ok(canonical) = CanonicalPath::unverified(&full) else { continue };
+            let Some(&id) = self.by_path.get(canonical.key()) else { continue };
+            if self.refresh_external_state(id).is_some() {
+                applied += 1;
+            }
+        }
+        applied
+    }
+
+    /// The directories that should have an active watch right now: the
+    /// workspace root, watched recursively, plus the parent directory of
+    /// every open document that path does not already fall under (watched
+    /// directly, since the recursive workspace watch already covers it).
+    fn desired_watch_directories(&self) -> HashMap<String, (PathBuf, bool)> {
+        let mut desired = HashMap::new();
+        if let Some(root) = self.workspace.root() {
+            desired.insert(root.key().to_string(), (root.as_path().to_path_buf(), true));
+        }
+        for document in self.documents.values() {
+            let Some(path) = document.path() else { continue };
+            if let Some(root) = self.workspace.root() {
+                if path.relative_to(root).is_some() {
+                    continue;
+                }
+            }
+            let Some(parent) = path.parent() else { continue };
+            desired
+                .entry(parent.key().to_string())
+                .or_insert_with(|| (parent.as_path().to_path_buf(), false));
+        }
+        desired
+    }
+
+    /// Reconciles active watches against [`EditorCore::desired_watch_directories`]:
+    /// cancels ones no longer needed, starts ones newly needed. Idempotent, so
+    /// callers do not need to reason about what changed -- only that something
+    /// might have (specification section 25; ADR-0017).
+    fn sync_watchers(&mut self) {
+        let desired = self.desired_watch_directories();
+
+        let stale: Vec<String> =
+            self.watching.keys().filter(|key| !desired.contains_key(*key)).cloned().collect();
+        for key in stale {
+            if let Some(task) = self.watching.remove(&key) {
+                self.scheduler.cancel(task);
+            }
+        }
+
+        for (key, (directory, recursive)) in desired {
+            if self.watching.contains_key(&key) {
+                continue;
+            }
+            match self.submit_watch(directory.clone(), recursive) {
+                Ok(task) => {
+                    self.watching.insert(key, task);
+                }
+                Err(error) => {
+                    ls_log::warn!(
+                        SUBSYSTEM,
+                        "watch_not_started",
+                        "could not watch {}: {error}",
+                        directory.display()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Submits one bounded wait for a change under `directory` as a
+    /// [`SubsystemId::WATCH`] task. The task body owns exactly one directory
+    /// handle for its own lifetime -- there is no thread of its own
+    /// (ADR-0017; architecture test `no_subsystem_creates_its_own_workers`).
+    fn submit_watch(
+        &mut self,
+        directory: PathBuf,
+        recursive: bool,
+    ) -> Result<TaskId, ls_scheduler::SubmitError> {
+        let spec = TaskSpec::new(
+            SubsystemId::WATCH,
+            self.scheduler.base_priority(SubsystemId::WATCH),
+            ResourceClass::Io,
+        )
+        .with_workspace(WorkspaceRef(self.workspace.id().get()));
+
+        self.scheduler.submit(
+            spec,
+            Box::new(move |cancellation| {
+                let outcome = ls_platform::watch::wait_for_change(
+                    &directory,
+                    recursive,
+                    WATCH_POLL_INTERVAL,
+                    &|| cancellation.is_cancelled(),
+                );
+                match outcome {
+                    Ok(ls_platform::watch::WatchOutcome::Changed(changed)) => {
+                        TaskOutcome::Completed(TaskProduct::new(WatchedPaths {
+                            directory,
+                            recursive,
+                            changed,
+                        }))
+                    }
+                    Ok(ls_platform::watch::WatchOutcome::Cancelled) => TaskOutcome::Cancelled,
+                    Err(error) => {
+                        TaskOutcome::Failed(TaskFailure::new("watch.failed", error.to_string()))
+                    }
+                }
+            }),
+        )
     }
 
     fn document_for_task(&self, task: TaskId) -> Option<DocumentId> {
@@ -959,6 +1176,7 @@ impl EditorCore {
                     .copied();
             }
         }
+        self.sync_watchers();
         self.events.emit(SUBSYSTEM, EventPayload::DocumentClosed { document: id });
         Ok(())
     }
@@ -1787,9 +2005,13 @@ impl EditorCore {
         }
     }
 
-    /// Compares a document against the file on disk. The Foundation Stage
-    /// replaces the manual call with a filesystem watcher; the state machine it
-    /// drives already exists (specification section 25).
+    /// Compares a document against the file on disk.
+    ///
+    /// Called from [`EditorCore::apply_watched_paths`] whenever a filesystem
+    /// watch task reports a change (ADR-0017). Stays public and keeps taking a
+    /// `DocumentId` and returning a state because tests exercise it directly,
+    /// which is exactly the shape an event-driven caller needs too
+    /// (specification section 25).
     pub fn refresh_external_state(&mut self, id: DocumentId) -> Option<ExternalState> {
         let path = self.documents.get(&id)?.path()?.as_path().to_path_buf();
         let stamp = self.workspace.stamp(&path).ok();

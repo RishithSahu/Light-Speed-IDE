@@ -42,16 +42,6 @@ const WHEEL_LINES: f32 = 3.0;
 /// loop that never sleeps.
 const CARET_BLINK: Duration = Duration::from_millis(500);
 
-/// How often open documents are checked against disk.
-///
-/// **Explicitly temporary (docs/adr/ADR-0017-filesystem-change-notification.md).**
-/// A poll, not a native filesystem watcher (ReadDirectoryChangesW / inotify):
-/// cheap today (one `stat` per open tab every 1.5s, riding the same
-/// timer-driven-redraw mechanism the caret already proved out) but not the
-/// target architecture. Do not read this as "polling is the design" -- read
-/// the ADR before assuming this can stay forever.
-const EXTERNAL_WATCH_INTERVAL: Duration = Duration::from_millis(1500);
-
 /// A double click has to be two clicks close together in time and space.
 const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(400);
 const DOUBLE_CLICK_SLOP: f32 = 4.0;
@@ -346,10 +336,10 @@ pub struct LightSpeed {
     window_title: String,
     /// Path the diagnostics commands act on: the last file that was opened.
     diagnostics_path: Option<PathBuf>,
-    /// When open documents are next checked against disk.
-    next_watch_check: Instant,
     /// External state as of the last check, so a transition (not just "still
-    /// changed") is what triggers a status message.
+    /// changed") is what triggers a status message (docs/adr/ADR-0017: the
+    /// checks themselves now arrive from `EditorCore`'s filesystem watch
+    /// completions, not a shell-side timer).
     last_external_state: HashMap<DocumentId, ls_core::ExternalState>,
     /// Where the recent-files list is persisted, if the platform gives us
     /// somewhere standard to put it. `None` just means the feature is
@@ -479,7 +469,6 @@ impl LightSpeed {
             window_title: String::new(),
             diagnostics_path: None,
             recent_files_path,
-            next_watch_check: Instant::now() + EXTERNAL_WATCH_INTERVAL,
             last_external_state: HashMap::new(),
             active_list: None,
             file_tree_root: None,
@@ -498,18 +487,21 @@ impl LightSpeed {
         }
     }
 
-    /// Checks every open document against disk, on a timer.
+    /// Turns document external-state transitions into a status message.
     ///
-    /// Runs from `about_to_wait`, the same place the caret ticks, so it costs
-    /// nothing while the window is idle beyond the wakeup itself.
-    fn poll_external_changes(&mut self) {
-        if Instant::now() < self.next_watch_check {
-            return;
-        }
-        self.next_watch_check = Instant::now() + EXTERNAL_WATCH_INTERVAL;
-
+    /// Runs from `pump_background_work`, after `EditorCore` has applied
+    /// whatever completed -- which, since ADR-0017, includes filesystem watch
+    /// completions that already called `refresh_external_state` for every
+    /// document a watch reported changed. This function does not itself
+    /// detect anything: it reads the state the core already settled and
+    /// reports only the tabs whose state actually transitioned, the same as
+    /// the interim poll it replaces did.
+    fn sync_external_state_indicators(&mut self) {
         for id in self.core.tabs().to_vec() {
-            let Some(state) = self.core.refresh_external_state(id) else { continue };
+            let Some(state) = self.core.document(id).map(|document| document.external_state())
+            else {
+                continue;
+            };
             let previous = self.last_external_state.insert(id, state);
             if previous == Some(state) {
                 continue;
@@ -535,7 +527,6 @@ impl LightSpeed {
                 ls_core::ExternalState::Unchanged => {}
             }
         }
-        self.request_redraw();
     }
 
     /// The File menu's dynamic tail: recently opened files, from core state.
@@ -602,6 +593,7 @@ impl LightSpeed {
             }
         }
 
+        self.sync_external_state_indicators();
         self.after_state_change();
     }
 
@@ -1767,15 +1759,10 @@ impl LightSpeed {
 
     /// When the loop should wake next, if anything is on a timer.
     fn next_wakeup(&self) -> Option<Instant> {
-        // The caret and the disk-change poll are the only timers; everything
-        // else is event-driven. Whichever fires first is when the loop wakes.
-        let caret =
-            (self.core.active().is_some() && self.prompt.is_none()).then_some(self.caret_deadline);
-        let watch = (!self.core.tabs().is_empty()).then_some(self.next_watch_check);
-        match (caret, watch) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // The caret is the only timer left; external-change detection is
+        // event-driven since ADR-0017 (a scheduler-admitted filesystem watch,
+        // not a poll), so it no longer needs a wakeup of its own.
+        (self.core.active().is_some() && self.prompt.is_none()).then_some(self.caret_deadline)
     }
 
     /// Window title, from authoritative document state.
@@ -2217,7 +2204,6 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
         if self.tick_caret() {
             self.request_redraw();
         }
-        self.poll_external_changes();
         match self.next_wakeup() {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             None => event_loop.set_control_flow(ControlFlow::Wait),

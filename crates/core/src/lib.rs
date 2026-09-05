@@ -24,10 +24,9 @@
 //! replacement, viewport and snapshots, tabs, configuration, logging hooks,
 //! command registry, event model, performance instrumentation.
 //!
-//! Absent by design (Foundation Stage): syntax highlighting, workspace search,
-//! Git, terminal, language services, the filesystem watcher and the task
-//! scheduler. Their contracts are documented in the specification; this crate
-//! does not pretend to implement them.
+//! Absent by design (Foundation Stage): syntax highlighting, terminal and
+//! language services. Their contracts are documented in the specification;
+//! this crate does not pretend to implement them.
 
 pub mod commands;
 pub mod config;
@@ -45,6 +44,7 @@ pub mod persistence;
 pub mod render;
 pub mod search;
 pub mod selection;
+pub mod watch;
 pub mod workspace;
 pub mod workspace_search;
 
