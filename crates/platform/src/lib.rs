@@ -17,6 +17,7 @@ pub mod fsops;
 pub mod paths;
 pub mod process;
 pub mod recents;
+pub mod watch;
 pub mod settings_file;
 pub mod terminal_log;
 

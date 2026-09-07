@@ -1,6 +1,7 @@
 # ADR-0017: Filesystem change notification
 
-**Status:** Accepted (interim, explicitly temporary)
+**Status:** Implemented (Windows). Linux/macOS parity is open -- see
+Reconsideration criteria.
 **Date:** 2026-09-01
 
 ## Question
@@ -94,14 +95,38 @@ is that writing-down. A future session picking up ADR-driven work should read
 "Accepted (interim, explicitly temporary)" at the top of this document as a
 standing task, not as a closed decision.
 
-## Consequences
+## Consequences (as shipped)
 
-* `app/src/app.rs`'s `poll_external_changes` and `EXTERNAL_WATCH_INTERVAL`
-  carry a doc comment pointing at this ADR.
-* No new dependency, no new thread, no allow-list change for the interim.
-* `EditorCore::refresh_external_state`'s public shape does not need to change
-  when the watcher lands: it already takes a `DocumentId` and returns a state,
-  which is exactly what an event-driven caller needs too.
+* `ls_platform::watch::wait_for_change` (`crates/platform/src/watch.rs`) owns
+  exactly one `ReadDirectoryChangesW` handle for one bounded wait, checking a
+  `cancelled` callback roughly every 250ms rather than blocking forever. That
+  bound is what lets the watcher be an ordinary one-shot scheduler task
+  instead of needing a dedicated thread: `no_subsystem_creates_its_own_workers`
+  (`tests/tests/architecture.rs`) still passes with no allow-list change.
+* `EditorCore` submits one `SubsystemId::WATCH` / `ResourceClass::Io` task per
+  watched directory -- the workspace root, recursively, plus the parent
+  directory of any open document outside it, non-recursively -- and re-arms
+  each task from its own completion (`EditorCore::apply_watch_completion`,
+  `crates/core/src/editor.rs`). `EditorCore::sync_watchers` reconciles the set
+  against open documents and the workspace root after every completions drain
+  and after opening a workspace or closing a document.
+* `EditorCore::refresh_external_state`'s public shape did not need to change:
+  it already took a `DocumentId` and returned a state, and
+  `apply_watched_paths` calls it exactly the way the shell's poll used to.
+* The shell's poll (`app/src/app.rs`'s `poll_external_changes` and
+  `EXTERNAL_WATCH_INTERVAL`) is gone. `sync_external_state_indicators` reads
+  `Document::external_state()` (already settled by the core) and turns a
+  transition into a status message; it runs from `pump_background_work`
+  instead of a timer, and `next_wakeup` no longer carries a watch deadline.
+* One new dependency-free primitive, no new thread, one new
+  `windows-sys` feature (`Win32_System_IO`, for `OVERLAPPED` and
+  `GetOverlappedResultEx`).
+* A watcher occupies one `ResourceClass::Io` admission slot (of two, by
+  default) for as long as a workspace or an out-of-workspace file stays open.
+  That is a real, accepted cost: it leaves one slot free for actual document
+  I/O rather than two, which the "concurrent seeks make a disk slower, not
+  faster" budget rationale already treats as an acceptable default even
+  before this ADR.
 
 ## Reconsideration criteria
 
