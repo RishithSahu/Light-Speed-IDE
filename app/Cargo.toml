@@ -20,3 +20,4 @@ wgpu.workspace = true
 winit.workspace = true
 glyphon.workspace = true
 pollster.workspace = true
+force_graph.workspace = true

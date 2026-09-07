@@ -51,24 +51,47 @@ pub fn open_folder(
     platform::show_folder(owner, title, initial_dir)
 }
 
+/// [`open_folder`], run on a thread of its own, with the answer delivered to
+/// `on_done` when the user finally picks or cancels.
+///
+/// # Why this is not just `open_folder` on the calling thread
+///
+/// The module doc above claims a dialog can run on the interactive thread
+/// because "the user is waiting on them by definition". Measurement says
+/// otherwise: building the picker costs about 150ms cold and 30ms warm (see
+/// `picker_setup_phase_timings`), but `IFileOpenDialog::Show` itself can take
+/// *seconds* before anything appears, while the shell populates its namespace
+/// -- Quick Access, cloud providers, mapped drives that may be disconnected.
+/// None of that is this code's work and none of it can be made faster from
+/// here.
+///
+/// What it does mean is that the editor was frozen for the whole of it: no
+/// repaint, no caret, no scrolling, an application that looks hung for as
+/// long as Windows takes to draw its own dialog. This runs the picker
+/// somewhere else so the editor keeps running, which is the same reason the
+/// terminal and the LSP client get threads of their own -- a blocking OS
+/// handle with no shape as a scheduler task.
+///
+/// The dialog is deliberately shown *without* disabling the editor: it is no
+/// longer modal to it. Picking a folder while the window behind stays live is
+/// the tradeoff for the window behind staying live at all.
+pub fn open_folder_async(
+    title: &str,
+    initial_dir: Option<&Path>,
+    on_done: impl FnOnce(Result<Option<PathBuf>, PlatformError>) + Send + 'static,
+) {
+    platform::show_folder_async(title, initial_dir, on_done)
+}
+
 #[cfg(windows)]
 mod platform {
     use super::{PlatformError, DEFAULT_FILTERS};
     use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
-    use windows_sys::Win32::Foundation::{HWND, LPARAM};
-    use windows_sys::Win32::System::Com::{
-        CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED,
-    };
     use windows_sys::Win32::UI::Controls::Dialogs::{
         CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OFN_EXPLORER, OFN_FILEMUSTEXIST,
         OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
-    use windows_sys::Win32::UI::Shell::{
-        SHBrowseForFolderW, SHGetPathFromIDListW, BFFM_INITIALIZED, BFFM_SETSELECTIONW,
-        BIF_NEWDIALOGSTYLE, BIF_RETURNONLYFSDIRS, BROWSEINFOW,
-    };
-    use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
 
     pub enum Mode {
         Open,
@@ -162,10 +185,11 @@ mod platform {
         Ok(Some(PathBuf::from(String::from_utf16_lossy(&file_buffer[..length]))))
     }
 
-    /// A `CoInitializeEx` call, undone on drop only if this call is the one
-    /// that actually put the thread into an apartment. A second call on an
-    /// already-initialized thread returns `S_FALSE`, and pairing that with
-    /// `CoUninitialize` would tear down whatever initialized COM first --
+    /// A `CoInitializeEx` call, undone on drop for every success code
+    /// (`S_OK` *and* `S_FALSE` -- the documented contract is one
+    /// `CoUninitialize` per successful `CoInitializeEx`, including a
+    /// redundant call on an already-initialized thread) and left alone on
+    /// failure, so this never tears down whatever initialized COM first --
     /// winit's own OLE setup for drag-and-drop, on this thread.
     struct ComGuard(bool);
 
@@ -173,85 +197,143 @@ mod platform {
         fn drop(&mut self) {
             if self.0 {
                 // SAFETY: only called when this guard's own CoInitializeEx
-                // returned S_OK, so this thread's apartment is ours to leave.
-                unsafe { CoUninitialize() };
+                // succeeded, which is the documented precondition.
+                unsafe { windows::Win32::System::Com::CoUninitialize() };
             }
         }
     }
 
     fn init_com() -> ComGuard {
-        const S_OK: i32 = 0;
-        // SAFETY: no preconditions; a non-null-reserved argument is invalid,
-        // and `null()` is what the API documents for it.
-        let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
-        ComGuard(hr == S_OK)
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        // SAFETY: no preconditions.
+        let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        ComGuard(hr.is_ok())
     }
 
+    /// Runs [`show_folder`] on its own thread with its own STA apartment.
+    ///
+    /// No owner window is passed: the owner belongs to the event-loop thread,
+    /// and handing a cross-thread `HWND` to a modal dialog attaches the two
+    /// threads' input queues, which reintroduces exactly the stall this is
+    /// here to avoid. The cost is that the picker is not owned by the editor
+    /// window (it can fall behind it); the benefit is that the editor still
+    /// paints while the shell takes its time.
+    pub fn show_folder_async(
+        title: &str,
+        initial_dir: Option<&Path>,
+        on_done: impl FnOnce(Result<Option<PathBuf>, PlatformError>) + Send + 'static,
+    ) {
+        let title = title.to_string();
+        let initial_dir = initial_dir.map(|dir| dir.to_path_buf());
+        let spawned = std::thread::Builder::new()
+            .name("folder-picker".to_string())
+            .spawn(move || {
+                let result = show_folder(None, &title, initial_dir.as_deref());
+                on_done(result);
+            });
+        if let Err(error) = spawned {
+            ls_log::warn!(
+                "platform",
+                "picker_thread_failed",
+                "could not start the folder picker thread: {error}"
+            );
+        }
+    }
+
+    /// The modern, Explorer-style folder picker. `SHBrowseForFolderW` (the
+    /// classic tree-view dialog) is not used here: `windows-sys` does not
+    /// expose `IFileOpenDialog` at all (it only generates the flat C ABI,
+    /// and this interface's vtable is absent from its Shell bindings), which
+    /// is what `IFileOpenDialog` + `FOS_PICKFOLDERS` needs -- the same
+    /// dialog `File > Open...` already uses, just configured to pick a
+    /// folder instead of a file, matching Explorer everywhere else in the
+    /// shell.
     pub fn show_folder(
         owner: Option<isize>,
         title: &str,
         initial_dir: Option<&Path>,
     ) -> Result<Option<PathBuf>, PlatformError> {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+        use windows::Win32::UI::Shell::{
+            FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
+            FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+        };
+
         let _com = init_com();
 
-        let title_w = wide(title);
-        let initial_dir_w: Option<Vec<u16>> = initial_dir
-            .map(|dir| dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect());
+        // SAFETY: `FileOpenDialog`'s CLSID and `IFileOpenDialog`'s IID are
+        // the standard shell ones; `CoCreateInstance` reports failure
+        // through its `Result` rather than an invalid object.
+        let dialog: IFileOpenDialog =
+            unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }
+                .map_err(|error| dialog_error("could not create the folder picker", &error))?;
 
-        let mut display_name = [0u16; 260];
-        let mut bi: BROWSEINFOW = unsafe { std::mem::zeroed() };
-        bi.hwndOwner = owner.unwrap_or(0) as *mut std::ffi::c_void;
-        bi.pszDisplayName = display_name.as_mut_ptr();
-        bi.lpszTitle = title_w.as_ptr();
-        bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
-        if let Some(dir_w) = &initial_dir_w {
-            bi.lpfn = Some(set_initial_selection);
-            bi.lParam = dir_w.as_ptr() as isize;
-        }
+        // SAFETY: every `IFileOpenDialog` call below follows the documented
+        // COM calling convention (a live `&self` on the interface just
+        // created), and every string handed in (`HSTRING`) owns its buffer
+        // for the call's duration.
+        unsafe {
+            let options = dialog.GetOptions().map_err(|error| {
+                dialog_error("could not read the folder picker's options", &error)
+            })?;
+            dialog
+                .SetOptions(options | FOS_PICKFOLDERS)
+                .map_err(|error| dialog_error("could not configure the folder picker", &error))?;
+            let _ = dialog.SetTitle(&HSTRING::from(title));
 
-        // SAFETY: every pointer in `bi` refers to a buffer that outlives the
-        // call (`title_w` and `initial_dir_w` live until the end of this
-        // function, after `SHBrowseForFolderW` has returned).
-        let pidl = unsafe { SHBrowseForFolderW(&bi) };
-        if pidl.is_null() {
-            return Ok(None); // cancelled
-        }
+            if let Some(dir) = initial_dir {
+                // A folder that no longer exists (renamed, deleted, on an
+                // unplugged drive) just means the dialog opens at its own
+                // default location instead -- not a reason to fail the
+                // whole picker.
+                if let Ok(item) =
+                    SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(dir), None)
+                {
+                    let _ = dialog.SetFolder(&item);
+                }
+            }
 
-        let mut path_buffer: Vec<u16> = vec![0; PATH_BUFFER];
-        // SAFETY: `pidl` was just returned by `SHBrowseForFolderW` and
-        // `path_buffer` has room for the longest path the legacy shell API
-        // can produce into it.
-        let ok = unsafe { SHGetPathFromIDListW(pidl, path_buffer.as_mut_ptr()) };
-        // SAFETY: `pidl` was allocated by the shell with `CoTaskMemAlloc`,
-        // per the documented contract of `SHBrowseForFolderW`.
-        unsafe { CoTaskMemFree(pidl as *const std::ffi::c_void) };
+            let hwnd = owner
+                .filter(|&handle| handle != 0)
+                .map(|handle| HWND(handle as *mut std::ffi::c_void));
+            match dialog.Show(hwnd) {
+                Ok(()) => {}
+                Err(error)
+                    if error.code() == windows::core::HRESULT::from_win32(ERROR_CANCELLED.0) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(dialog_error("the folder picker failed", &error)),
+            }
 
-        if ok == 0 {
-            return Ok(None);
+            let result: IShellItem = dialog.GetResult().map_err(|error| {
+                dialog_error("the folder picker closed without a result", &error)
+            })?;
+            let display_name = result
+                .GetDisplayName(SIGDN_FILESYSPATH)
+                .map_err(|error| dialog_error("could not read the chosen folder's path", &error))?;
+            let path = display_name.to_string();
+            windows::Win32::System::Com::CoTaskMemFree(Some(display_name.as_ptr() as *const _));
+
+            let path = path.map_err(|_| {
+                PlatformError::new(
+                    "dialog.failed",
+                    "the chosen folder's path was not valid UTF-16",
+                    ls_log::diag::Recoverability::Recoverable,
+                )
+            })?;
+            Ok(Some(PathBuf::from(path)))
         }
-        let length = path_buffer.iter().position(|&c| c == 0).unwrap_or(0);
-        if length == 0 {
-            return Ok(None);
-        }
-        Ok(Some(PathBuf::from(String::from_utf16_lossy(&path_buffer[..length]))))
     }
 
-    /// Seeds the folder tree's initial selection once the dialog signals it
-    /// is ready (`BFFM_INITIALIZED`), from the wide string stashed in
-    /// `BROWSEINFOW::lParam` and handed back here as `lpdata`.
-    unsafe extern "system" fn set_initial_selection(
-        hwnd: HWND,
-        msg: u32,
-        _lparam: LPARAM,
-        lpdata: LPARAM,
-    ) -> i32 {
-        if msg == BFFM_INITIALIZED {
-            // SAFETY: `hwnd` is the live dialog handle the shell just passed
-            // us; `lpdata` is the null-terminated wide string we stashed in
-            // `BROWSEINFOW::lParam`, still alive for the dialog's lifetime.
-            unsafe { SendMessageW(hwnd, BFFM_SETSELECTIONW, 1, lpdata) };
-        }
-        0
+    fn dialog_error(context: &str, error: &windows::core::Error) -> PlatformError {
+        PlatformError::new(
+            "dialog.failed",
+            format!("{context}: {error}"),
+            ls_log::diag::Recoverability::Recoverable,
+        )
     }
 }
 
@@ -288,6 +370,16 @@ mod platform {
             "native folder dialogs are implemented for Windows only in Stage 1",
         ))
     }
+
+    pub fn show_folder_async(
+        _title: &str,
+        _initial_dir: Option<&Path>,
+        on_done: impl FnOnce(Result<Option<PathBuf>, PlatformError>) + Send + 'static,
+    ) {
+        // Answered inline rather than on a thread: there is no dialog to wait
+        // for, so there is nothing to avoid blocking on.
+        on_done(show_folder(None, "", None));
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +393,77 @@ mod tests {
             assert!(!label.is_empty());
             assert!(pattern.starts_with('*'));
             assert!(!label.contains('\0') && !pattern.contains('\0'));
+        }
+    }
+
+    /// Times each phase of building the folder picker, short of showing it.
+    ///
+    /// Exists because "the picker takes seconds to appear" is a report that
+    /// cannot be acted on without knowing *which* part is slow: this code's
+    /// COM setup, or the shell's own work inside `Show`. Everything up to
+    /// `Show` is timed here; if that total is small, the delay is the shell
+    /// populating its namespace (network drives, cloud providers) and no
+    /// amount of rearranging these calls will help.
+    ///
+    /// `cargo test -p ls-platform --release -- --ignored --nocapture picker_setup`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "timing measurement, not a correctness check"]
+    fn picker_setup_phase_timings() {
+        use std::time::Instant;
+        use windows::core::HSTRING;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+        };
+        use windows::Win32::UI::Shell::{
+            FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
+            FOS_PICKFOLDERS,
+        };
+
+        let here = std::env::current_dir().unwrap();
+        // Twice: the shell caches a great deal on first use, and "slow once"
+        // is a different bug from "slow every time".
+        for attempt in 1..=2 {
+            let start = Instant::now();
+            let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            let com = start.elapsed();
+
+            let start = Instant::now();
+            let dialog: IFileOpenDialog =
+                unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) }.unwrap();
+            let create = start.elapsed();
+
+            let start = Instant::now();
+            unsafe {
+                let options = dialog.GetOptions().unwrap();
+                dialog.SetOptions(options | FOS_PICKFOLDERS).unwrap();
+                let _ = dialog.SetTitle(&HSTRING::from("Open Folder"));
+            }
+            let configure = start.elapsed();
+
+            let start = Instant::now();
+            let item =
+                unsafe { SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(here.as_path()), None) };
+            let parse = start.elapsed();
+
+            let start = Instant::now();
+            if let Ok(item) = item {
+                unsafe {
+                    let _ = dialog.SetFolder(&item);
+                }
+            }
+            let set_folder = start.elapsed();
+
+            println!(
+                "attempt {attempt}: CoInitializeEx {com:?} (hr ok={}), CoCreateInstance {create:?}, \
+                 configure {configure:?}, SHCreateItemFromParsingName {parse:?}, SetFolder {set_folder:?}",
+                hr.is_ok()
+            );
+
+            drop(dialog);
+            if hr.is_ok() {
+                unsafe { windows::Win32::System::Com::CoUninitialize() };
+            }
         }
     }
 }

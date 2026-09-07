@@ -74,6 +74,11 @@ fn config_for(language: Language) -> Option<LanguageConfig> {
             block_comment: Some(("/*", "*/")),
             keywords: JS_KEYWORDS,
         }),
+        Language::Go => Some(LanguageConfig {
+            line_comment: &["//"],
+            block_comment: Some(("/*", "*/")),
+            keywords: GO_KEYWORDS,
+        }),
         Language::Python => Some(LanguageConfig {
             line_comment: &["#"],
             block_comment: None,
@@ -96,6 +101,42 @@ const RUST_KEYWORDS: &[&str] = &[
     "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
     "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
     "unsafe", "use", "where", "while",
+];
+
+/// Go's 25 keywords, plus the predeclared identifiers a reader scans for the
+/// same way (`nil`, the boolean literals, `iota`). Go deliberately has no
+/// `class`/`public`/`template`, so this is not the C-family list with
+/// additions -- it is a shorter list of its own.
+const GO_KEYWORDS: &[&str] = &[
+    "break",
+    "case",
+    "chan",
+    "const",
+    "continue",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "false",
+    "for",
+    "func",
+    "go",
+    "goto",
+    "if",
+    "import",
+    "interface",
+    "iota",
+    "map",
+    "nil",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "true",
+    "type",
+    "var",
 ];
 
 const C_FAMILY_KEYWORDS: &[&str] = &[
@@ -344,13 +385,28 @@ pub fn tokenize_line(text: &str, language: Language, state: LexState) -> (Vec<To
 }
 
 /// The character index of `marker` at or after `from`, if it occurs.
+///
+/// The subtraction below has to be checked, not saturating. On a line shorter
+/// than the marker, `saturating_sub` bottoms out at 0 and produces the range
+/// `0..=0` -- one iteration, which then slices `chars[0..2]` out of a line
+/// with fewer than two characters and panics. That is not a theoretical
+/// edge: `tokenize_line` looks for the block-comment terminator from column 0
+/// of every line while inside one, so *any blank line inside a `/* ... */`
+/// comment* crashed the highlighter, in every C-family language. Found by the
+/// corpus tests in `tests/tests/languages.rs` on the first real repository
+/// they were pointed at.
 fn find_marker(chars: &[char], from: usize, marker: &str) -> Option<usize> {
     let marker_chars: Vec<char> = marker.chars().collect();
-    if marker_chars.is_empty() || from > chars.len() {
+    if marker_chars.is_empty() {
         return None;
     }
-    (from..=chars.len().saturating_sub(marker_chars.len()))
-        .find(|&index| chars[index..index + marker_chars.len()] == marker_chars[..])
+    // `None` when the line is shorter than the marker: it cannot occur, and
+    // there is no valid start index to scan from.
+    let last_start = chars.len().checked_sub(marker_chars.len())?;
+    if from > last_start {
+        return None;
+    }
+    (from..=last_start).find(|&index| chars[index..index + marker_chars.len()] == marker_chars[..])
 }
 
 fn starts_with_at(chars: &[char], index: usize, marker: &str) -> bool {
@@ -371,6 +427,72 @@ mod tests {
             .into_iter()
             .map(|t| (t.start_column_chars, t.end_column_chars, t.kind))
             .collect()
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_block_comment_does_not_panic() {
+        // Regression test for a crash found by the language corpus tests on
+        // real repositories: continuing a `/* ... */` comment onto a line
+        // shorter than the two-character terminator sliced past the end of
+        // that line. A blank line inside a block comment is ordinary in every
+        // C-family language, so this crashed on commonplace source.
+        for language in [
+            Language::Rust,
+            Language::C,
+            Language::Cpp,
+            Language::CSharp,
+            Language::Go,
+            Language::JavaScript,
+            Language::TypeScript,
+        ] {
+            for line in ["", "*", "x", " "] {
+                let (tokens, state) = tokenize_line(line, language, LexState::BlockComment);
+                assert_eq!(
+                    state,
+                    LexState::BlockComment,
+                    "{}: {line:?} does not close the comment, so it stays open",
+                    language.name()
+                );
+                for token in tokens {
+                    assert!(
+                        token.end_column_chars <= line.chars().count(),
+                        "{}: token escapes the line",
+                        language.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_comment_still_closes_on_a_line_that_is_only_the_terminator() {
+        // The fix must not overshoot: a line exactly as long as the marker is
+        // the boundary case the checked subtraction now allows through.
+        let (tokens, state) = tokenize_line("*/", Language::Rust, LexState::BlockComment);
+        assert_eq!(state, LexState::Normal, "the comment ends here");
+        assert_eq!(tokens[0].end_column_chars, 2);
+    }
+
+    #[test]
+    fn a_multi_line_block_comment_with_a_gap_in_it_ends_where_it_should() {
+        // The whole sequence, threaded the way the renderer threads it.
+        let source = ["/* opening", "", "still inside", "*/ after"];
+        let mut state = LexState::Normal;
+        let mut states = Vec::new();
+        for line in source {
+            let (_, next) = tokenize_line(line, Language::C, state);
+            state = next;
+            states.push(state);
+        }
+        assert_eq!(
+            states,
+            vec![
+                LexState::BlockComment,
+                LexState::BlockComment,
+                LexState::BlockComment,
+                LexState::Normal
+            ]
+        );
     }
 
     #[test]

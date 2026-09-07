@@ -63,7 +63,11 @@ fn millis(duration: std::time::Duration) -> String {
 }
 
 /// Builds the panel's rows from live editor, scheduler and process state.
-pub fn lines(core: &EditorCore, process: &ProcessStats) -> Vec<String> {
+pub fn lines(
+    core: &EditorCore,
+    process: &ProcessStats,
+    language_servers: &[ls_core::Language],
+) -> Vec<String> {
     let mut out = Vec::with_capacity(24);
     let scheduler = core.scheduler();
     let snapshot = ls_perf::snapshot();
@@ -107,6 +111,28 @@ pub fn lines(core: &EditorCore, process: &ProcessStats) -> Vec<String> {
             subsystem.name(),
             scheduler.base_priority(*subsystem).get()
         ));
+    }
+
+    out.push(String::new());
+
+    // --- language servers -------------------------------------------------------
+    // Worth its own section because these are the only child processes this
+    // editor causes to exist, and each one routinely outweighs the editor
+    // itself in memory. `process.rss_bytes` above covers this process only,
+    // so without this line the largest thing the session is responsible for
+    // would be invisible in the panel that exists to account for resources.
+    out.push(format!(
+        "Language servers ({} running, at most {})",
+        language_servers.len(),
+        crate::lsp::MAX_SERVERS,
+    ));
+    if language_servers.is_empty() {
+        out.push("  none; one starts on the first document of a language that has one".to_string());
+    }
+    for language in language_servers {
+        let binaries: Vec<&str> =
+            crate::lsp::servers_for(*language).iter().map(|server| server.binary).collect();
+        out.push(format!("  {:<11} {}", language.name(), binaries.join(" | ")));
     }
 
     out.push(String::new());
@@ -164,7 +190,7 @@ mod tests {
     #[test]
     fn the_panel_reports_queue_depth_and_capacity() {
         let core = editor();
-        let lines = lines(&core, &process_stats());
+        let lines = lines(&core, &process_stats(), &[]);
         let queue_line = lines.iter().find(|line| line.contains("queue ")).expect("a queue line");
         assert!(queue_line.contains(&core.scheduler().queue_capacity().to_string()));
     }
@@ -172,7 +198,7 @@ mod tests {
     #[test]
     fn the_panel_lists_every_subsystems_base_priority() {
         let core = editor();
-        let lines = lines(&core, &process_stats());
+        let lines = lines(&core, &process_stats(), &[]);
         for subsystem in SUBSYSTEMS {
             assert!(
                 lines.iter().any(|line| line.contains(subsystem.name())),
@@ -185,7 +211,7 @@ mod tests {
     #[test]
     fn document_io_reports_the_documented_base_priority() {
         let core = editor();
-        let lines = lines(&core, &process_stats());
+        let lines = lines(&core, &process_stats(), &[]);
         let line =
             lines.iter().find(|line| line.contains("document_io")).expect("document_io is listed");
         assert!(line.contains("800"), "amendment section 5's table: DOCUMENT IO is 800");
@@ -194,14 +220,14 @@ mod tests {
     #[test]
     fn an_empty_history_says_so_rather_than_an_empty_section() {
         let core = editor();
-        let lines = lines(&core, &process_stats());
+        let lines = lines(&core, &process_stats(), &[]);
         assert!(lines.iter().any(|line| line.contains("none yet")));
     }
 
     #[test]
     fn process_memory_is_reported_in_megabytes() {
         let core = editor();
-        let lines = lines(&core, &process_stats());
+        let lines = lines(&core, &process_stats(), &[]);
         assert!(lines.iter().any(|line| line.contains("RSS 150 MB")));
     }
 
@@ -219,7 +245,7 @@ mod tests {
         let mut core = editor();
         core.open_document(&path).expect("opened");
 
-        let lines = lines(&core, &process_stats());
+        let lines = lines(&core, &process_stats(), &[]);
         assert!(
             lines.iter().any(|line| line.contains("document_io")),
             "the load that just completed should be in the accounting history"

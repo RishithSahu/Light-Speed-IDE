@@ -9,11 +9,12 @@
 //! highlighting, diagnostics, Git decorations or minimap.
 
 use crate::compose::{self, DrawList, Layer};
+use crate::icons;
 use crate::layout::{FontMetrics, Layout, Rect};
 use crate::menu::{self, MenuGeometry, MenuState};
 use crate::quads::{Quad, QuadRenderer};
 use crate::tabs::TabGeometry;
-use crate::text::{Region, TextEngine, TextRegionPlacement};
+use crate::text::{Region, RichText, TextEngine, TextRegionPlacement};
 use crate::theme::{Color, Theme};
 use ls_core::{DecorationKind, RenderSnapshot};
 use std::sync::Arc;
@@ -65,8 +66,11 @@ pub struct Frame<'a> {
     /// The tab bar's rectangles, the same ones the click handler tests
     /// against. The renderer is given geometry, never asked to invent it.
     pub tabs: &'a TabGeometry,
-    pub status_left: &'a str,
-    pub status_right: &'a str,
+    /// Status bar halves. Rich text, because Lapce's status bar is icons and
+    /// text on one baseline: a branch glyph then a branch name, an error
+    /// glyph then a count.
+    pub status_left: &'a RichText,
+    pub status_right: &'a RichText,
     /// Color for the status line, chosen by severity.
     pub status_color: Color,
     /// Pre-formatted performance overlay rows.
@@ -90,11 +94,82 @@ pub struct Frame<'a> {
     pub caret_visible: bool,
     /// A confirmation strip, when the editor is waiting on an answer.
     pub prompt: Option<&'a str>,
-    /// The docked sidebar's rows (header included), when it is shown.
-    pub sidebar: Option<&'a [String]>,
+    /// The docked sidebar's rows, already composed with their chevrons,
+    /// file-type icons and per-row colors.
+    pub sidebar: Option<&'a RichText>,
     /// Which sidebar row (by index into `sidebar`, header included) is
     /// selected, for the highlight quad.
     pub sidebar_selected_row: Option<usize>,
+    /// Which sidebar row the pointer is over, for a lighter hover highlight.
+    pub sidebar_hovered_row: Option<usize>,
+    /// How far the sidebar's row list is scrolled, in logical pixels -- the
+    /// same amount subtracted from every row's drawn position (text and
+    /// highlight quads alike) so a click still resolves against what the
+    /// pointer is actually over.
+    pub sidebar_scroll_y: f32,
+    /// The command palette's own content (query row + filtered commands),
+    /// and its floating panel rectangle, when it is open.
+    pub palette: Option<&'a RichText>,
+    pub palette_panel: Option<Rect>,
+    pub palette_selected: Option<usize>,
+    pub palette_hovered: Option<usize>,
+    /// The activity bar's icon column, one icon per cell.
+    pub activity: &'a RichText,
+    pub activity_active: Option<usize>,
+    pub activity_hovered: Option<usize>,
+    /// Rows for the docked bottom panel's content, when it is shown.
+    pub bottom_panel: Option<&'a [String]>,
+    /// The bottom panel's own icon rail.
+    pub bottom_panel_rail: &'a RichText,
+    /// The header's three clusters: menu button, command field, actions.
+    pub title_left: &'a RichText,
+    pub title_center: &'a RichText,
+    pub title_right: &'a RichText,
+    /// The breadcrumb trail under the tab bar.
+    pub breadcrumb: &'a RichText,
+    /// The tab row's leading and trailing icon clusters.
+    pub tab_nav: &'a RichText,
+    pub tab_actions: &'a RichText,
+    /// The dependency view, when it has taken over the editor area.
+    pub dependency: Option<DependencyFrame<'a>>,
+    /// The settings screen, when it has.
+    pub settings: Option<SettingsFrame<'a>>,
+}
+
+/// Everything the settings screen needs drawn, already measured.
+pub struct SettingsFrame<'a> {
+    pub screen: &'a crate::settings_ui::Screen,
+    /// The rows of the list, in the order `settings_ui::rows` produced them.
+    pub rows: &'a [crate::settings_ui::Row],
+    /// The settings those rows describe, so a control knows its own kind.
+    pub visible: &'a [&'static ls_core::settings::SettingDescriptor],
+    /// The merged settings, for reading current values.
+    pub values: &'a ls_core::settings::Settings,
+    /// What is in the search box, and whether it has the keyboard.
+    pub query: &'a str,
+    pub query_focused: bool,
+    /// The section picked on the left, if any.
+    pub section: Option<usize>,
+    /// The field being typed into, and its draft.
+    pub editing: Option<(&'static str, &'a str)>,
+    /// How far the list is scrolled, in rows.
+    pub scroll_rows: usize,
+    /// Which file is being edited.
+    pub workspace_scope: bool,
+}
+
+/// The dependency view's contribution to a frame: a fitted graph, where the
+/// reader has panned and zoomed to, and the message to show instead when
+/// there is no graph yet. The scene's coordinates start at the graph's own
+/// top-left; the view is what puts it on screen.
+pub struct DependencyFrame<'a> {
+    pub scene: Option<&'a crate::depgraph::Scene>,
+    /// Where the reader has panned and zoomed to.
+    pub view: crate::depgraph::View,
+    /// The node under the pointer, drawn with a ring and its edges picked
+    /// out.
+    pub traced: Option<usize>,
+    pub placeholder: &'a str,
 }
 
 pub struct Renderer {
@@ -109,10 +184,14 @@ pub struct Renderer {
     /// Scratch buffers reused every frame so drawing allocates nothing steady-state.
     editor_text: String,
     gutter_text: String,
-    tab_text: String,
+    tab_rich: RichText,
     overlay_text: String,
-    sidebar_text: String,
-    menu_text: String,
+
+    bottom_panel_text: String,
+    /// Where the dependency view's label grid is drawn, worked out while its
+    /// text is built and used when it is placed.
+    dependency_origin: (f32, f32),
+    settings_rich: RichText,
     dropdown_text: String,
     dropdown_disabled_text: String,
 }
@@ -237,13 +316,21 @@ impl Renderer {
             window,
             editor_text: String::new(),
             gutter_text: String::new(),
-            tab_text: String::new(),
+            tab_rich: RichText::new(),
             overlay_text: String::new(),
-            sidebar_text: String::new(),
-            menu_text: String::new(),
+
+            bottom_panel_text: String::new(),
+            dependency_origin: (0.0, 0.0),
+            settings_rich: RichText::new(),
             dropdown_text: String::new(),
             dropdown_disabled_text: String::new(),
         })
+    }
+
+    /// Changes the font the whole window is drawn with, reporting whether
+    /// anything moved.
+    pub fn set_font(&mut self, family: &str, font_size: f32, line_height_ratio: f32) -> bool {
+        self.text.set_font(family, font_size, line_height_ratio)
     }
 
     pub fn metrics(&self) -> FontMetrics {
@@ -312,6 +399,16 @@ impl Renderer {
             overlay_panel: self.overlay_panel(frame),
             sidebar_panel: layout.sidebar_visible.then_some(layout.sidebar),
             sidebar_selected_row: frame.sidebar_selected_row,
+            sidebar_hovered_row: frame.sidebar_hovered_row,
+            sidebar_scroll_y: frame.sidebar_scroll_y,
+            palette_panel: frame.palette_panel,
+            palette_selected: frame.palette_selected,
+            palette_hovered: frame.palette_hovered,
+
+            activity_active: frame.activity_active,
+            activity_hovered: frame.activity_hovered,
+            bottom_panel: layout.bottom_panel_visible.then_some(layout.bottom_panel),
+            bottom_panel_rail: layout.bottom_panel_visible.then_some(layout.bottom_panel_rail),
         });
         self.add_editor_layer(frame, &mut draw);
 
@@ -406,7 +503,7 @@ impl Renderer {
         // Byte ranges within `editor_text`, for syntax highlighting: one
         // shaped buffer holds the whole visible slice, so a token's position
         // has to be tracked as the lines that come before it are appended.
-        let mut syntax_spans: Vec<(usize, usize, Color)> = Vec::new();
+        let mut syntax_spans: Vec<crate::text::Span> = Vec::new();
 
         match frame.snapshot {
             Some(snapshot) => {
@@ -428,7 +525,11 @@ impl Renderer {
                             + Self::byte_for_column(&line.text, decoration.start_column_chars);
                         let end = line_start
                             + Self::byte_for_column(&line.text, decoration.end_column_chars);
-                        syntax_spans.push((start, end, frame.theme.syntax_color(kind)));
+                        syntax_spans.push(crate::text::Span::text(
+                            start,
+                            end,
+                            frame.theme.syntax_color(kind),
+                        ));
                     }
                     if layout.show_line_numbers {
                         use std::fmt::Write;
@@ -461,6 +562,40 @@ impl Renderer {
                 &syntax_spans,
             );
         }
+        // The dependency view's labels: one shaped buffer holding only the
+        // grid rows the pane can show, so a graph taller than the window
+        // does not cost a buffer taller than the window either.
+        if let Some(dependency) = &frame.dependency {
+            let grid = dependency.scene.map(|scene| {
+                crate::depgraph::label_rows(
+                    scene,
+                    layout.text,
+                    dependency.view,
+                    crate::depgraph::GridMetrics {
+                        digit_width: layout.metrics.digit_width,
+                        line_height: layout.metrics.line_height,
+                    },
+                    dependency.traced,
+                )
+            });
+            let text = match &grid {
+                Some(grid) => grid.text.clone(),
+                None => dependency.placeholder.to_string(),
+            };
+            self.dependency_origin =
+                grid.map(|grid| grid.origin).unwrap_or((layout.text.x, layout.text.y));
+            self.text.set_text(
+                Region::DependencyGraph,
+                &text,
+                layout.text.width.max(1.0) + 4096.0,
+                layout.text.height.max(layout.metrics.line_height),
+            );
+        }
+
+        if let Some(settings) = &frame.settings {
+            self.build_settings_text(frame, settings);
+        }
+
         if layout.show_line_numbers {
             self.text.set_text(
                 Region::Gutter,
@@ -470,40 +605,101 @@ impl Renderer {
             );
         }
 
-        // Each label is exactly as wide as the rectangle it is drawn in, so
-        // the row reads as separate tabs without the text and the plates being
-        // measured two different ways.
-        self.tab_text.clear();
+        // Each tab is a file-type icon followed by a label exactly as wide as
+        // the rest of its rectangle, so the row reads as separate tabs
+        // without the text and the plates being measured two different ways.
+        self.tab_rich.clear();
         for tab in &frame.tabs.tabs {
-            self.tab_text.push_str(&tab.label);
+            let label_color = if tab.active { frame.theme.text } else { frame.theme.dim_text };
+            // A bare space ahead of the icon (accounted for in
+            // `tabs::ICON_LEAD`) so the glyph sits inset within its own tab
+            // rather than flush against the border shared with the one
+            // before it.
+            self.tab_rich.plain(" ");
+            self.tab_rich.icon(tab.icon, tab.icon_color);
+            self.tab_rich.colored(&tab.label, label_color);
         }
-        self.text.set_text(
+        self.text.set_rich_text(
             Region::Tabs,
-            &self.tab_text,
+            &self.tab_rich.text,
             layout.tab_bar.width.max(1.0),
             layout.tab_bar.height,
+            frame.theme.tab_text,
+            &self.tab_rich.spans,
         );
 
-        // Menu titles are drawn as one row. Each label is padded to exactly
-        // the width of its own rectangle (`menu::title_label`), so the
-        // highlight for one title cannot bleed into the glyphs of the next --
-        // that mismatch is what made the File highlight overlap into Edit.
-        self.menu_text.clear();
-        for entry in menu::MENUS {
-            self.menu_text.push_str(&menu::title_label(entry));
-        }
-        self.text.set_text(
-            Region::Menu,
-            &self.menu_text,
-            layout.menu_bar.width.max(1.0),
-            layout.menu_bar.height,
+        // The header's three clusters, each its own region because each is
+        // positioned independently across the row rather than flowing from a
+        // single origin. The icon-only ones (left button, right actions, tab
+        // nav/actions) go through `set_icon_cluster` so each is sized and
+        // centered against its own button rect rather than the shared,
+        // much-smaller UI text metrics.
+        let title_left_font = icons::cell_icon_font_size(layout.title_menu_button.height);
+        self.text.set_icon_cluster(
+            Region::TitleLeft,
+            &frame.title_left.text,
+            layout.title_menu_button.width.max(1.0),
+            layout.title_menu_button.height.max(1.0),
+            frame.theme.activity_icon_active,
+            &frame.title_left.spans,
+            title_left_font,
+            layout.title_menu_button.height,
+        );
+        self.text.set_rich_text(
+            Region::TitleCenter,
+            &frame.title_center.text,
+            layout.title_search.width.max(1.0),
+            layout.title_search.height.max(layout.metrics.line_height),
+            frame.theme.dim_text,
+            &frame.title_center.spans,
+        );
+        let title_right_font = icons::cell_icon_font_size(layout.title_actions.height);
+        self.text.set_icon_cluster(
+            Region::TitleRight,
+            &frame.title_right.text,
+            layout.title_actions.width.max(1.0),
+            layout.title_actions.height.max(1.0),
+            frame.theme.activity_icon_active,
+            &frame.title_right.spans,
+            title_right_font,
+            layout.title_actions.height,
+        );
+        self.text.set_rich_text(
+            Region::Breadcrumb,
+            &frame.breadcrumb.text,
+            layout.breadcrumb.width.max(1.0),
+            layout.breadcrumb.height.max(layout.metrics.line_height),
+            frame.theme.dim_text,
+            &frame.breadcrumb.spans,
+        );
+        let tab_nav_font = icons::cell_icon_font_size(layout.tab_nav.height);
+        self.text.set_icon_cluster(
+            Region::TabNav,
+            &frame.tab_nav.text,
+            layout.tab_nav.width.max(1.0),
+            layout.tab_nav.height.max(1.0),
+            frame.theme.activity_icon_inactive,
+            &frame.tab_nav.spans,
+            tab_nav_font,
+            layout.tab_nav.height,
+        );
+        let tab_actions_font = icons::cell_icon_font_size(layout.tab_actions.height);
+        self.text.set_icon_cluster(
+            Region::TabActions,
+            &frame.tab_actions.text,
+            layout.tab_actions.width.max(1.0),
+            layout.tab_actions.height.max(1.0),
+            frame.theme.activity_icon_inactive,
+            &frame.tab_actions.spans,
+            tab_actions_font,
+            layout.tab_actions.height,
         );
 
         self.dropdown_text.clear();
         self.dropdown_disabled_text.clear();
-        if let Some(open) = frame.menu.open {
-            let items = menu::MENUS[open].items;
-            let recent = if open == menu::FILE_MENU_INDEX { frame.recent_files } else { &[] };
+        if frame.menu.open.is_some() {
+            let items = menu::all_items();
+            let recent = frame.recent_files;
             let columns = frame
                 .menu_geometry
                 .dropdown
@@ -550,6 +746,19 @@ impl Renderer {
             dropdown_size.1.max(layout.metrics.line_height),
         );
 
+        let empty_palette = RichText::new();
+        let palette = frame.palette.unwrap_or(&empty_palette);
+        if let Some(panel) = frame.palette_panel {
+            self.text.set_rich_text(
+                Region::CommandPalette,
+                &palette.text,
+                panel.width.max(1.0),
+                panel.height.max(layout.metrics.line_height),
+                frame.theme.text,
+                &palette.spans,
+            );
+        }
+
         self.text.set_text(
             Region::Prompt,
             frame.prompt.unwrap_or(""),
@@ -557,17 +766,21 @@ impl Renderer {
             layout.metrics.line_height * 2.0,
         );
 
-        self.text.set_text(
+        self.text.set_rich_text(
             Region::Status,
-            frame.status_left,
+            &frame.status_left.text,
             layout.status_bar.width.max(1.0),
             layout.status_bar.height,
+            frame.status_color,
+            &frame.status_left.spans,
         );
-        self.text.set_text(
+        self.text.set_rich_text(
             Region::StatusRight,
-            frame.status_right,
+            &frame.status_right.text,
             layout.status_bar.width.max(1.0),
             layout.status_bar.height,
+            frame.theme.dim_text,
+            &frame.status_right.spans,
         );
 
         self.overlay_text.clear();
@@ -588,20 +801,68 @@ impl Renderer {
             overlay_height.max(layout.metrics.line_height),
         );
 
-        self.sidebar_text.clear();
-        if let Some(lines) = frame.sidebar {
+        let empty = RichText::new();
+        let sidebar = frame.sidebar.unwrap_or(&empty);
+        // cosmic-text's `shape_until_scroll` only lays out (and `layout_runs`
+        // only ever returns) lines within one buffer-height's worth of its
+        // internal scroll position -- so a buffer sized to the *panel's*
+        // visible height, rather than its full content, silently never shapes
+        // rows past that point at all. Scrolling by shifting `origin_y` at
+        // draw time (see `compose::chrome`) can only move that already-fixed
+        // window around; it can never reveal a row that was never shaped.
+        // Sizing the buffer to the content's real height fixes that, and
+        // `clip: panel` (in `compose::chrome`) still crops the drawn result
+        // to the panel's actual visible rectangle.
+        let sidebar_lines = sidebar.text.matches('\n').count() + 1;
+        let sidebar_content_height =
+            (sidebar_lines as f32 * layout.metrics.line_height).max(layout.sidebar.height);
+        self.text.set_rich_text(
+            Region::Sidebar,
+            &sidebar.text,
+            layout.sidebar.width.max(1.0),
+            sidebar_content_height.max(layout.metrics.line_height),
+            frame.theme.text,
+            &sidebar.spans,
+        );
+
+        let activity_font = icons::cell_icon_font_size(layout.activity_bar.width);
+        self.text.set_icon_cluster(
+            Region::ActivityBar,
+            &frame.activity.text,
+            layout.activity_bar.width.max(1.0),
+            layout.activity_bar.height.max(1.0),
+            frame.theme.activity_icon_active,
+            &frame.activity.spans,
+            activity_font,
+            layout.activity_bar.width,
+        );
+
+        self.bottom_panel_text.clear();
+        if let Some(lines) = frame.bottom_panel {
             for (index, line) in lines.iter().enumerate() {
                 if index > 0 {
-                    self.sidebar_text.push('\n');
+                    self.bottom_panel_text.push('\n');
                 }
-                self.sidebar_text.push_str(line);
+                self.bottom_panel_text.push_str(line);
             }
         }
         self.text.set_text(
-            Region::Sidebar,
-            &self.sidebar_text,
-            layout.sidebar.width.max(1.0),
-            layout.sidebar.height.max(layout.metrics.line_height),
+            Region::BottomPanel,
+            &self.bottom_panel_text,
+            layout.bottom_panel.width.max(1.0),
+            layout.bottom_panel.height.max(layout.metrics.line_height),
+        );
+
+        let rail_font = icons::cell_icon_font_size(layout.bottom_panel_rail.width);
+        self.text.set_icon_cluster(
+            Region::BottomPanelRail,
+            &frame.bottom_panel_rail.text,
+            layout.bottom_panel_rail.width.max(1.0),
+            layout.bottom_panel_rail.height.max(1.0),
+            frame.theme.activity_icon_active,
+            &frame.bottom_panel_rail.spans,
+            rail_font,
+            layout.bottom_panel_rail.width,
         );
     }
 
@@ -653,6 +914,207 @@ impl Renderer {
     /// a caret sits at a measured advance -- which is why it cannot live in the
     /// composer with the rest of the chrome. It all belongs to [`Layer::Base`]:
     /// the editor is what an overlay covers, never the other way round.
+    /// Shapes the settings screen's three regions.
+    ///
+    /// The list is one rich-text buffer rather than a widget per row: it is
+    /// a column of lines, which is what a buffer already is, and colouring
+    /// by role is what the sidebar and the palette already do.
+    fn build_settings_text(&mut self, frame: &Frame<'_>, settings: &SettingsFrame<'_>) {
+        use crate::settings_ui::Row;
+        let theme = frame.theme;
+        let metrics = frame.layout.metrics;
+
+        // The search box.
+        self.settings_rich.clear();
+        self.settings_rich.icon(icons::Icon::Search, theme.dim_text);
+        self.settings_rich.plain(" ");
+        if settings.query.is_empty() {
+            self.settings_rich.colored("Search settings", theme.dim_text);
+        } else {
+            self.settings_rich.colored(settings.query, theme.text);
+        }
+        if settings.query_focused {
+            self.settings_rich.colored("\u{2588}", theme.cursor);
+        }
+        self.text.set_rich_text(
+            Region::SettingsSearch,
+            &self.settings_rich.text.clone(),
+            settings.screen.search.width.max(1.0),
+            settings.screen.search.height.max(metrics.line_height),
+            theme.text,
+            &self.settings_rich.spans.clone(),
+        );
+
+        // The section list, with the two scopes above it.
+        self.settings_rich.clear();
+        let (user_colour, workspace_colour) = if settings.workspace_scope {
+            (theme.dim_text, theme.text)
+        } else {
+            (theme.text, theme.dim_text)
+        };
+        self.settings_rich.colored("User", user_colour);
+        self.settings_rich.plain("  ");
+        self.settings_rich.colored("Workspace", workspace_colour);
+        self.settings_rich.newline();
+        self.settings_rich.newline();
+        for (at, section) in ls_core::settings::SECTIONS.iter().enumerate() {
+            let picked = settings.section == Some(at);
+            let colour = if picked { theme.text } else { theme.dim_text };
+            self.settings_rich.colored(section, colour);
+            self.settings_rich.newline();
+        }
+        self.text.set_rich_text(
+            Region::SettingsCategories,
+            &self.settings_rich.text.clone(),
+            settings.screen.categories.width.max(1.0),
+            settings.screen.categories.height.max(metrics.line_height),
+            theme.dim_text,
+            &self.settings_rich.spans.clone(),
+        );
+
+        // The list itself, from the row the scroll starts at.
+        self.settings_rich.clear();
+        for row in settings.rows.iter().skip(settings.scroll_rows) {
+            match row {
+                Row::Blank => {}
+                Row::Heading(text) => {
+                    self.settings_rich.colored(text, theme.sidebar_folder);
+                }
+                Row::Title(text) => {
+                    self.settings_rich.colored(text, theme.text);
+                }
+                Row::Description(text) => {
+                    self.settings_rich.plain("  ");
+                    self.settings_rich.colored(text, theme.dim_text);
+                }
+                Row::Value(text) => {
+                    // Indented past the control, which is drawn over the
+                    // start of this line.
+                    self.settings_rich.plain("     ");
+                    self.settings_rich.colored(text, theme.text);
+                }
+            }
+            self.settings_rich.newline();
+        }
+        self.text.set_rich_text(
+            Region::SettingsList,
+            &self.settings_rich.text.clone(),
+            settings.screen.list.width.max(1.0) + 4096.0,
+            settings.screen.list.height.max(metrics.line_height),
+            theme.text,
+            &self.settings_rich.spans.clone(),
+        );
+    }
+
+    /// Draws the settings screen: its surfaces, its controls, and its text.
+    fn add_settings_layer(
+        &mut self,
+        frame: &Frame<'_>,
+        settings: &SettingsFrame<'_>,
+        draw: &mut DrawList,
+    ) {
+        use ls_core::settings::SettingKind;
+        let layout = frame.layout;
+        let theme = frame.theme;
+        let screen = settings.screen;
+        let line = layout.metrics.line_height;
+        let digit = layout.metrics.digit_width;
+
+        // The search box sits on its own surface so it reads as a field.
+        draw.push_quad(Layer::Base, Quad::new(screen.search, theme.overlay_background));
+
+        // The section picked on the left gets the sidebar's own selection.
+        if let Some(at) = settings.section {
+            if let Some(row) = screen.category_rows.get(at) {
+                // Two rows below the scope line and its blank.
+                let shifted = Rect::new(row.x, row.y + line * 2.0, row.width, row.height);
+                draw.push_quad(Layer::Base, Quad::new(shifted, theme.sidebar_selected));
+            }
+        }
+
+        for (placement, setting) in screen.placements.iter().zip(settings.visible.iter()) {
+            // Nothing outside the list may be drawn: the pane has no scissor
+            // of its own, so a control scrolled past the top would otherwise
+            // paint over the search box.
+            let control = placement.control;
+            if control.bottom() < screen.list.y || control.y > screen.list.bottom() {
+                continue;
+            }
+            match setting.kind {
+                SettingKind::Bool => {
+                    let on = settings.values.bool(setting.key);
+                    draw.push_quad(Layer::Base, Quad::new(control, theme.overlay_border));
+                    if on {
+                        let inset = control.width * 0.22;
+                        draw.push_quad(
+                            Layer::Base,
+                            Quad::new(
+                                Rect::new(
+                                    control.x + inset,
+                                    control.y + inset,
+                                    control.width - inset * 2.0,
+                                    control.height - inset * 2.0,
+                                ),
+                                theme.cursor,
+                            ),
+                        );
+                    }
+                }
+                SettingKind::Choice(options) => {
+                    let current = settings.values.text(setting.key);
+                    for (option, rect) in options.iter().zip(placement.options.iter()) {
+                        let picked = *option == current;
+                        let colour =
+                            if picked { theme.cursor } else { theme.overlay_background };
+                        draw.push_quad(Layer::Base, Quad::new(*rect, colour));
+                    }
+                }
+                _ => {
+                    let editing = settings
+                        .editing
+                        .is_some_and(|(key, _)| key == setting.key);
+                    let colour =
+                        if editing { theme.overlay_border } else { theme.overlay_background };
+                    draw.push_quad(Layer::Base, Quad::new(control, colour));
+                }
+            }
+            if let Some(reset) = placement.reset {
+                draw.push_quad(Layer::Base, Quad::new(reset, theme.overlay_background));
+            }
+        }
+
+        draw.push_text(
+            Layer::Base,
+            TextRegionPlacement {
+                region: Region::SettingsSearch,
+                origin_x: screen.search.x + digit,
+                origin_y: screen.search.y + (screen.search.height - line) / 2.0,
+                clip: screen.search,
+                color: theme.text,
+            },
+        );
+        draw.push_text(
+            Layer::Base,
+            TextRegionPlacement {
+                region: Region::SettingsCategories,
+                origin_x: screen.categories.x,
+                origin_y: screen.categories.y,
+                clip: screen.categories,
+                color: theme.dim_text,
+            },
+        );
+        draw.push_text(
+            Layer::Base,
+            TextRegionPlacement {
+                region: Region::SettingsList,
+                origin_x: screen.list.x,
+                origin_y: screen.list.y,
+                clip: screen.list,
+                color: theme.text,
+            },
+        );
+    }
+
     fn add_editor_layer(&mut self, frame: &Frame<'_>, draw: &mut DrawList) {
         let layout = frame.layout;
         let theme = frame.theme;
@@ -660,17 +1122,23 @@ impl Renderer {
         let text_top = layout.text.y - frame.scroll_fraction;
         let origin_x = layout.text.x - frame.horizontal_offset;
 
-        draw.push_text(
-            Layer::Base,
-            TextRegionPlacement {
-                region: Region::Editor,
-                origin_x,
-                origin_y: text_top,
-                clip: layout.text,
-                color: if frame.snapshot.is_some() { theme.text } else { theme.dim_text },
-            },
-        );
-        if layout.show_line_numbers && frame.snapshot.is_some() {
+        if frame.dependency.is_none() && frame.settings.is_none() {
+            draw.push_text(
+                Layer::Base,
+                TextRegionPlacement {
+                    region: Region::Editor,
+                    origin_x,
+                    origin_y: text_top,
+                    clip: layout.text,
+                    color: if frame.snapshot.is_some() { theme.text } else { theme.dim_text },
+                },
+            );
+        }
+        if layout.show_line_numbers
+            && frame.snapshot.is_some()
+            && frame.dependency.is_none()
+            && frame.settings.is_none()
+        {
             draw.push_text(
                 Layer::Base,
                 TextRegionPlacement {
@@ -694,6 +1162,42 @@ impl Renderer {
                     (layout.status_bar.right() - right_width - 10.0 * layout.scale)
                         .max(layout.status_bar.x);
             }
+        }
+
+        // The settings screen stands in for the document, so none of the
+        // caret, selection or decoration work below applies to it either.
+        if let Some(settings) = &frame.settings {
+            self.add_settings_layer(frame, settings, draw);
+            return;
+        }
+
+        // The dependency view stands in for the document, so none of the
+        // caret, selection or decoration work below applies to it.
+        if let Some(dependency) = &frame.dependency {
+            if let Some(scene) = dependency.scene {
+                draw.base_quads.extend(crate::depgraph::pane_quads(
+                    scene,
+                    layout.text,
+                    dependency.view,
+                    theme,
+                    dependency.traced,
+                ));
+            }
+            // The label grid is pinned to the graph rather than to the pane,
+            // so it is drawn at the origin `label_rows` chose: that origin
+            // carries the pan's remainder within one cell, which is what
+            // keeps the names from shivering as the reader drags.
+            draw.push_text(
+                Layer::Base,
+                TextRegionPlacement {
+                    region: Region::DependencyGraph,
+                    origin_x: self.dependency_origin.0,
+                    origin_y: self.dependency_origin.1,
+                    clip: layout.text,
+                    color: theme.text,
+                },
+            );
+            return;
         }
 
         let Some(snapshot) = frame.snapshot else { return };

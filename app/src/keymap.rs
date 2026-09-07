@@ -127,6 +127,8 @@ fn resolve_control_character(text: &str, shift: bool) -> Binding {
         "f" => Binding::command("edit.find"),
         "e" if shift => Binding::command("view.toggle_file_tree"),
         "g" if shift => Binding::command("view.toggle_git_status"),
+        "d" if shift => Binding::command("view.toggle_dependencies"),
+        "r" if shift => Binding::command("view.refresh_dependencies"),
         _ => Binding::None,
     }
 }
@@ -175,6 +177,19 @@ pub fn resolve_prompt(key: &Key) -> Option<crate::app::PromptAnswer> {
         },
         _ => None,
     }
+}
+
+/// Whether this key press should open the command palette. Checked ahead of
+/// every focus-specific keyboard handler (see the `WindowEvent::KeyboardInput`
+/// match in `app.rs`), the same way a confirmation prompt takes priority over
+/// everything -- Ctrl+Shift+P has to work regardless of what currently holds
+/// the keyboard, the way it does in Lapce and VS Code alike.
+pub fn is_command_palette_shortcut(key: &Key, modifiers: &Modifiers) -> bool {
+    let state = modifiers.state();
+    if !state.contains(ModifiersState::CONTROL) || !state.contains(ModifiersState::SHIFT) {
+        return false;
+    }
+    matches!(key, Key::Character(text) if text.eq_ignore_ascii_case("p"))
 }
 
 /// Bindings shown in the status bar hint.
@@ -394,5 +409,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ctrl_shift_p_opens_the_command_palette() {
+        let both = modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
+        assert!(is_command_palette_shortcut(&character("p"), &both));
+        assert!(is_command_palette_shortcut(&character("P"), &both), "case-insensitive");
+    }
+
+    #[test]
+    fn plain_p_or_ctrl_p_alone_does_not_open_the_palette() {
+        let none = modifiers(ModifiersState::empty());
+        let ctrl_only = modifiers(ModifiersState::CONTROL);
+        let shift_only = modifiers(ModifiersState::SHIFT);
+        assert!(!is_command_palette_shortcut(&character("p"), &none));
+        assert!(!is_command_palette_shortcut(&character("p"), &ctrl_only));
+        assert!(!is_command_palette_shortcut(&character("p"), &shift_only));
     }
 }

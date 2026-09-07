@@ -235,6 +235,16 @@ pub fn enabled(level: Level) -> bool {
     (level as u8) <= MAX_LEVEL.load(Ordering::Relaxed)
 }
 
+/// The current time as `YYYY-MM-DDThh:mm:ss.mmmZ`, the exact format every
+/// log line already uses. Exposed so other permanent, human-readable
+/// records (the terminal panel's transcript, for one) can stamp themselves
+/// the same way instead of each growing its own date arithmetic.
+pub fn timestamp_now() -> String {
+    let mut out = String::with_capacity(24);
+    format_timestamp(SystemTime::now(), &mut out);
+    out
+}
+
 /// Formats and writes a record. Called by the macros; prefer those.
 pub fn emit(record: &LogRecord<'_>) {
     let Some(logger) = LOGGER.get() else { return };

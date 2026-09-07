@@ -9,16 +9,66 @@ use crate::layout::Rect;
 use crate::theme::Color;
 use std::borrow::Cow;
 
+/// What a quad's rectangle actually paints.
+///
+/// Both are the same instanced rectangle on the GPU; the difference is one
+/// number handed to the fragment shader, which discards the corners for an
+/// ellipse. Adding a second pipeline for circles would have meant a second
+/// buffer, a second draw call and a second sort order for a shape that is
+/// still, geometrically, a rectangle with some pixels thrown away.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Shape {
+    Rectangle,
+    /// The ellipse inscribed in the rectangle -- a circle when it is square.
+    /// Used by the dependency graph's nodes (`app::depgraph`).
+    Ellipse,
+}
+
 /// One rectangle to fill.
 #[derive(Copy, Clone, Debug)]
 pub struct Quad {
     pub rect: Rect,
     pub color: Color,
+    pub shape: Shape,
+    /// Rotation about the rectangle's own centre, in radians. Zero for all
+    /// the window's chrome, which is axis-aligned by construction; non-zero
+    /// only for graph edges, which are thin rectangles pointed at wherever
+    /// the next node happens to be.
+    pub rotation: f32,
 }
 
 impl Quad {
     pub fn new(rect: Rect, color: Color) -> Self {
-        Quad { rect, color }
+        Quad { rect, color, shape: Shape::Rectangle, rotation: 0.0 }
+    }
+
+    /// The ellipse inscribed in `rect`.
+    pub fn ellipse(rect: Rect, color: Color) -> Self {
+        Quad { rect, color, shape: Shape::Ellipse, rotation: 0.0 }
+    }
+
+    /// A line of `thickness` pixels from `start` to `end`.
+    ///
+    /// Still one instanced rectangle: as long as it can be rotated, a line
+    /// is just a long thin one. The alternative -- stepping a series of
+    /// axis-aligned squares along the diagonal -- would have meant hundreds
+    /// of instances per edge to draw something the GPU can do with one.
+    pub fn line(start: (f32, f32), end: (f32, f32), thickness: f32, color: Color) -> Self {
+        let dx = end.0 - start.0;
+        let dy = end.1 - start.1;
+        let length = (dx * dx + dy * dy).sqrt();
+        let centre = ((start.0 + end.0) / 2.0, (start.1 + end.1) / 2.0);
+        Quad {
+            rect: Rect::new(
+                centre.0 - length / 2.0,
+                centre.1 - thickness / 2.0,
+                length,
+                thickness,
+            ),
+            color,
+            shape: Shape::Rectangle,
+            rotation: dy.atan2(dx),
+        }
     }
 }
 
@@ -27,8 +77,12 @@ fn is_visible(quad: &Quad) -> bool {
     quad.rect.width > 0.0 && quad.rect.height > 0.0 && quad.color.srgb[3] != 0
 }
 
-/// Bytes per instance: `vec4` rect + `vec4` color.
-const INSTANCE_SIZE: u64 = 32;
+/// Bytes per instance: `vec4` rect + `vec4` color + `vec4` shape params.
+///
+/// The shape word is a full `vec4` rather than a lone `f32` because a vertex
+/// buffer's stride has to keep every attribute at its natural alignment, and
+/// three floats of padding cost nothing next to the draw call they avoid.
+const INSTANCE_SIZE: u64 = 48;
 
 const SHADER: &str = r#"
 struct Uniforms {
@@ -41,6 +95,12 @@ struct Uniforms {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) color: vec4<f32>,
+    // Where this pixel sits inside its own rectangle, 0..1 on both axes.
+    // Only the ellipse path reads it.
+    @location(1) local: vec2<f32>,
+    // 0 = rectangle, 1 = ellipse. Flat: it is per-instance, not something to
+    // interpolate across the triangle.
+    @location(2) @interpolate(flat) shape: f32,
 };
 
 @vertex
@@ -48,6 +108,7 @@ fn vs_main(
     @builtin(vertex_index) vertex_index: u32,
     @location(0) rect: vec4<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) shape: vec4<f32>,
 ) -> VertexOutput {
     var corners = array<vec2<f32>, 6>(
         vec2<f32>(0.0, 0.0),
@@ -58,7 +119,20 @@ fn vs_main(
         vec2<f32>(1.0, 1.0),
     );
     let corner = corners[vertex_index];
-    let pixel = rect.xy + corner * rect.zw;
+    var pixel = rect.xy + corner * rect.zw;
+    // shape.y is the rotation about this rectangle's own centre. Every piece
+    // of window chrome passes zero; only graph edges do not.
+    let angle = shape.y;
+    if (angle != 0.0) {
+        let centre = rect.xy + rect.zw * 0.5;
+        let offset = pixel - centre;
+        let cosine = cos(angle);
+        let sine = sin(angle);
+        pixel = centre + vec2<f32>(
+            offset.x * cosine - offset.y * sine,
+            offset.x * sine + offset.y * cosine,
+        );
+    }
     let ndc = vec2<f32>(
         pixel.x / uniforms.screen.x * 2.0 - 1.0,
         1.0 - pixel.y / uniforms.screen.y * 2.0,
@@ -67,11 +141,28 @@ fn vs_main(
     var out: VertexOutput;
     out.position = vec4<f32>(ndc, 0.0, 1.0);
     out.color = color;
+    out.local = corner;
+    out.shape = shape.x;
     return out;
 }
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+    if (input.shape > 0.5) {
+        // Distance from the rectangle's centre, in units where the inscribed
+        // ellipse's edge is exactly 1. Feathered over roughly a pixel's worth
+        // of that distance instead of a hard cutoff, so node circles do not
+        // come out with staircase edges -- there is no multisampling on this
+        // pipeline to smooth them afterwards.
+        let offset = (input.local - vec2<f32>(0.5, 0.5)) * 2.0;
+        let distance = length(offset);
+        let feather = fwidth(distance);
+        let alpha = 1.0 - smoothstep(1.0 - feather, 1.0, distance);
+        if (alpha <= 0.0) {
+            discard;
+        }
+        return vec4<f32>(input.color.rgb, input.color.a * alpha);
+    }
     return input.color;
 }
 "#;
@@ -149,6 +240,11 @@ impl QuadRenderer {
                             offset: 16,
                             shader_location: 1,
                         },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x4,
+                            offset: 32,
+                            shader_location: 2,
+                        },
                     ],
                 })],
             },
@@ -213,6 +309,10 @@ impl QuadRenderer {
             if !is_visible(quad) {
                 continue;
             }
+            let shape = match quad.shape {
+                Shape::Rectangle => 0.0,
+                Shape::Ellipse => 1.0,
+            };
             let values = [
                 quad.rect.x,
                 quad.rect.y,
@@ -222,6 +322,10 @@ impl QuadRenderer {
                 quad.color.linear[1],
                 quad.color.linear[2],
                 quad.color.linear[3],
+                shape,
+                quad.rotation,
+                0.0,
+                0.0,
             ];
             self.staging.extend_from_slice(bytes_of_f32(&values));
         }
@@ -299,7 +403,50 @@ mod tests {
 
     #[test]
     fn instance_size_matches_the_shader_layout() {
-        // Four floats of rect plus four of color.
-        assert_eq!(INSTANCE_SIZE, 8 * std::mem::size_of::<f32>() as u64);
+        // Four floats of rect, four of color, four of shape parameters.
+        assert_eq!(INSTANCE_SIZE, 12 * std::mem::size_of::<f32>() as u64);
+    }
+
+    #[test]
+    fn a_line_spans_its_endpoints_and_points_at_them() {
+        // A horizontal line: length is the span, and no rotation is needed.
+        let flat = Quad::line((10.0, 50.0), (110.0, 50.0), 2.0, Color::rgb(255, 0, 0));
+        assert!((flat.rect.width - 100.0).abs() < 0.01, "width is the distance covered");
+        assert!((flat.rect.height - 2.0).abs() < 0.01, "height is the thickness");
+        assert!(flat.rotation.abs() < 0.001, "a horizontal line needs no rotation");
+
+        // A 45-degree line: the rectangle is still `length` long, and the
+        // rotation is what puts its ends on the two points.
+        let diagonal = Quad::line((0.0, 0.0), (100.0, 100.0), 2.0, Color::rgb(255, 0, 0));
+        assert!((diagonal.rect.width - 141.42).abs() < 0.1, "the diagonal's true length");
+        assert!(
+            (diagonal.rotation - std::f32::consts::FRAC_PI_4).abs() < 0.001,
+            "45 degrees, in radians"
+        );
+        // Centred on the midpoint, which is what the shader rotates about.
+        let centre_x = diagonal.rect.x + diagonal.rect.width / 2.0;
+        let centre_y = diagonal.rect.y + diagonal.rect.height / 2.0;
+        assert!((centre_x - 50.0).abs() < 0.01 && (centre_y - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_zero_length_line_is_dropped_rather_than_drawn_as_a_dot() {
+        let degenerate = Quad::line((10.0, 10.0), (10.0, 10.0), 2.0, Color::rgb(255, 0, 0));
+        assert!(!is_visible(&degenerate), "nothing to draw between a point and itself");
+    }
+
+    #[test]
+    fn a_rectangle_and_an_ellipse_differ_only_in_their_shape_word() {
+        // Both go through one pipeline and one buffer; if these ever stopped
+        // sharing a geometry the "one draw call for everything that is not
+        // text" property in this module's own docs would quietly be false.
+        let rect = Rect::new(10.0, 20.0, 30.0, 40.0);
+        let color = Color::rgb(1, 2, 3);
+        let rectangle = Quad::new(rect, color);
+        let ellipse = Quad::ellipse(rect, color);
+        assert_eq!(rectangle.shape, Shape::Rectangle);
+        assert_eq!(ellipse.shape, Shape::Ellipse);
+        assert_eq!(rectangle.rect.width, ellipse.rect.width);
+        assert_eq!(rectangle.rect.height, ellipse.rect.height);
     }
 }

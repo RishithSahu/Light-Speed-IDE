@@ -41,6 +41,15 @@ const WORKER_CREATION_ALLOW_LIST: &[&str] = &[
     // JSON-RPC stream blocks for the process's whole lifetime, which has no
     // shape as a scheduler task either.
     "app/src/lsp.rs",
+    // And again for the native folder picker. `IFileOpenDialog::Show` blocks
+    // until a human answers it, which is not a bounded unit of work the
+    // scheduler could admit, estimate or cancel. It ran on the event-loop
+    // thread until measurement showed the shell taking *seconds* to put the
+    // dialog on screen (populating Quick Access, cloud providers, mapped
+    // drives -- none of it this program's work), during which the editor did
+    // not repaint at all. The thread here only shows the dialog and hands the
+    // chosen path back through the event loop; nothing is interpreted off it.
+    "crates/platform/src/dialog.rs",
 ];
 
 const SHELL_ROOT: &str = "app/src";
@@ -80,6 +89,38 @@ fn no_subsystem_creates_its_own_workers() {
     );
 }
 
+#[test]
+fn every_child_process_is_spawned_without_a_console_window() {
+    // A GUI process on Windows has no console, so spawning a console
+    // application through a bare `Command::new` makes Windows allocate one
+    // and *show* it. That is not cosmetic: `git status` flashed a black
+    // console box on screen on every Source Control refresh, and opening the
+    // terminal panel put a separate `cmd.exe` window next to the editor
+    // showing the same session the panel was already showing.
+    //
+    // `ls_platform::command` applies `CREATE_NO_WINDOW` and is the only place
+    // allowed to construct a `Command`, so a new spawn site cannot
+    // reintroduce the window by writing the obvious thing.
+    const HELPER: &str = "crates/platform/src/process.rs";
+    let mut violations = Vec::new();
+    for path in source_files(LIBRARY_ROOTS).iter().chain(source_files(&[SHELL_ROOT]).iter()) {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        if normalized.ends_with(HELPER) {
+            continue;
+        }
+        let source = source_without_tests(path);
+        if source.contains("Command::new") {
+            violations.push(normalized);
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "child processes must be spawned through `ls_platform::command`, \
+         which suppresses the console window:\n{}",
+        violations.join("\n")
+    );
+}
+
 /// Normalizes separators so the allow-list reads the same on every platform.
 fn is_allow_listed(path: &std::path::Path) -> bool {
     let normalized = path.to_string_lossy().replace('\\', "/");
@@ -94,7 +135,12 @@ fn the_worker_allow_list_is_exactly_the_scheduler() {
     // exemption.
     assert_eq!(
         WORKER_CREATION_ALLOW_LIST,
-        &["crates/scheduler/src/worker.rs", "app/src/terminal.rs", "app/src/lsp.rs"],
+        &[
+            "crates/scheduler/src/worker.rs",
+            "app/src/terminal.rs",
+            "app/src/lsp.rs",
+            "crates/platform/src/dialog.rs",
+        ],
         "the allow-list may only contain what this test itself reviews"
     );
 
