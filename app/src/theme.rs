@@ -122,6 +122,8 @@ pub struct Theme {
     /// as a normal selection on top of this) still reads as "the one you're
     /// on".
     pub search_match: Color,
+    /// The pair of brackets the caret currently sits next to.
+    pub bracket_match: Color,
     pub syntax_keyword: Color,
     pub syntax_string: Color,
     pub syntax_comment: Color,
@@ -156,6 +158,10 @@ pub struct Theme {
     pub warning: Color,
     pub error: Color,
     pub ok: Color,
+    /// An LSP "Information"-severity diagnostic. Warning and Error diagnostics
+    /// reuse `warning`/`error` above; Hint reuses `dim_text` -- a hint is
+    /// meant to barely register.
+    pub diagnostic_info: Color,
     pub scrollbar: Color,
     /// The activity bar: the narrow icon rail (Explorer / Search / Source
     /// Control / ...) at the very left edge, Lapce's `activity.*`.
@@ -198,6 +204,17 @@ impl Theme {
         }
     }
 
+    /// The color a diagnostic's underline and gutter dot are drawn in,
+    /// keyed off its severity.
+    pub fn diagnostic_color(&self, severity: ls_core::DiagnosticSeverity) -> Color {
+        match severity {
+            ls_core::DiagnosticSeverity::Error => self.error,
+            ls_core::DiagnosticSeverity::Warning => self.warning,
+            ls_core::DiagnosticSeverity::Information => self.diagnostic_info,
+            ls_core::DiagnosticSeverity::Hint => self.dim_text,
+        }
+    }
+
     pub fn sidebar_row_color(&self, kind: SidebarRowKind) -> Color {
         match kind {
             SidebarRowKind::Header => self.dim_text,
@@ -234,6 +251,7 @@ impl Theme {
             current_line: Color::rgb(0x2C, 0x31, 0x3C), // editor.current_line
             selection: GREY,                            // editor.selection
             search_match: Color::rgba(0xE5, 0xC0, 0x7B, 0x60),
+            bracket_match: Color::rgba(0x8A, 0xB1, 0xE0, 0x70),
             // Syntax roles from `[color-theme.syntax]`.
             syntax_keyword: PURPLE,
             syntax_string: GREEN,
@@ -267,6 +285,7 @@ impl Theme {
             warning: YELLOW, // lapce.warn
             error: RED,      // lapce.error
             ok: GREEN,
+            diagnostic_info: CARET,
             scrollbar: Color::rgba(0x3E, 0x44, 0x51, 0xBB), // lapce.scroll_bar
             activity_background: SECONDARY_BACKGROUND,      // activity.background
             activity_current: BLACK,                        // activity.current

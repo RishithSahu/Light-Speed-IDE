@@ -66,9 +66,14 @@ pub enum Region {
     SettingsCategories,
     /// Its scrolling list of settings.
     SettingsList,
+    /// The single Settings cell pinned to the bottom of the activity bar.
+    ActivitySettings,
+    /// A Markdown document's rendered form (`view.toggle_markdown_preview`),
+    /// standing in for `Region::Editor` the same way `DependencyGraph` does.
+    MarkdownPreview,
 }
 
-const REGION_COUNT: usize = 24;
+const REGION_COUNT: usize = 26;
 
 fn region_index(region: Region) -> usize {
     match region {
@@ -96,6 +101,8 @@ fn region_index(region: Region) -> usize {
         Region::SettingsSearch => 21,
         Region::SettingsCategories => 22,
         Region::SettingsList => 23,
+        Region::ActivitySettings => 24,
+        Region::MarkdownPreview => 25,
     }
 }
 

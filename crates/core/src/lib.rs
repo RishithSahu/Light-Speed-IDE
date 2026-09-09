@@ -29,6 +29,7 @@
 //! this crate does not pretend to implement them.
 
 pub mod commands;
+pub mod commit_graph;
 pub mod config;
 pub mod dependency_graph;
 pub mod settings;
@@ -38,12 +39,15 @@ pub mod encoding;
 pub mod error;
 pub mod events;
 pub mod git;
+pub mod gitignore;
 pub mod highlight;
 pub mod history;
 pub mod language;
 pub mod loading;
 pub mod persistence;
+pub mod regex_lite;
 pub mod render;
+pub mod runners;
 pub mod search;
 pub mod selection;
 pub mod watch;
@@ -51,6 +55,7 @@ pub mod workspace;
 pub mod workspace_search;
 
 pub use commands::{CommandArgs, CommandDescriptor, ShellRequest};
+pub use commit_graph::{lane_count, lanes, GraphRow};
 pub use config::{AppearanceConfig, EditorConfig, EffectiveConfig, PerformanceConfig};
 pub use document::{
     ContentRevision, ContentState, DiskStamp, Document, DocumentId, DocumentSettings, EditResult,
@@ -74,6 +79,7 @@ pub use render::{
     build_snapshot, CursorPresentation, Decoration, DecorationKind, Diagnostic, DiagnosticSeverity,
     DocumentPresentation, Invalidation, RenderLine, RenderSnapshot, SelectionSpan, Viewport,
 };
+pub use runners::RunLanguage;
 pub use selection::{Movement, MovementContext, Selection, SelectionSet};
 pub use workspace::{EntryKind, FileEntry, Workspace, WorkspaceId};
 

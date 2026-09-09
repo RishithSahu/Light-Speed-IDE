@@ -78,6 +78,15 @@ use std::sync::{Arc, Mutex};
 /// supports echoing one back -- optional per the LSP spec), and the list.
 type DiagnosticsByPath = Vec<(PathBuf, Option<u64>, Vec<Diagnostic>)>;
 
+/// Where `textDocument/definition` says a symbol is declared.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DefinitionLocation {
+    pub path: PathBuf,
+    /// 0-based, matching every other line index this client deals in.
+    pub line: usize,
+    pub column_chars: usize,
+}
+
 /// One candidate language server: what to run, and what the protocol calls
 /// files of this kind.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -182,6 +191,16 @@ pub struct LspClient {
     /// other end is reading anything at all.
     outgoing: std::sync::mpsc::Sender<String>,
     diagnostics: Arc<Mutex<DiagnosticsByPath>>,
+    /// Every `textDocument/definition` response that has arrived and not
+    /// yet been drained, `None` when the server answered but found nothing.
+    definitions: Arc<Mutex<Vec<Option<DefinitionLocation>>>>,
+    /// Request ids `read_loop` should treat as a definition response rather
+    /// than silently discard -- the *first* real response tracking this
+    /// prototype client has (see the module doc's "no response handling at
+    /// all"): every other request/response pair (`initialize`, the ones
+    /// `didOpen`/`didChange` never send) still goes unmatched, on purpose,
+    /// since nothing here needs their results yet.
+    pending_definitions: Arc<Mutex<std::collections::HashSet<u64>>>,
     next_id: u64,
 }
 
@@ -215,11 +234,15 @@ impl LspClient {
         let stdin = child.stdin.take()?;
         let stdout = child.stdout.take()?;
         let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let definitions = Arc::new(Mutex::new(Vec::new()));
+        let pending_definitions = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
         let reader_diagnostics = diagnostics.clone();
+        let reader_definitions = definitions.clone();
+        let reader_pending = pending_definitions.clone();
         std::thread::Builder::new()
             .name("lsp-reader".to_string())
-            .spawn(move || read_loop(stdout, reader_diagnostics, wake))
+            .spawn(move || read_loop(stdout, reader_diagnostics, reader_definitions, reader_pending, wake))
             .ok()?;
 
         let (outgoing, incoming) = std::sync::mpsc::channel::<String>();
@@ -228,7 +251,8 @@ impl LspClient {
             .spawn(move || write_loop(stdin, incoming))
             .ok()?;
 
-        let mut client = LspClient { child, outgoing, diagnostics, next_id: 1 };
+        let mut client =
+            LspClient { child, outgoing, diagnostics, definitions, pending_definitions, next_id: 1 };
         client.send_request(
             "initialize",
             Value::object([
@@ -296,11 +320,41 @@ impl LspClient {
         std::mem::take(&mut self.diagnostics.lock().unwrap())
     }
 
+    /// Asks where the symbol at `line`/`column_chars` (0-based, matching
+    /// `Document`'s own cursor coordinates) in `path` is declared --
+    /// `textDocument/definition`. The answer arrives later, off
+    /// `drain_definitions`, once the server responds.
+    pub fn request_definition(&mut self, path: &Path, line: usize, column_chars: usize) {
+        let id = self.send_request(
+            "textDocument/definition",
+            Value::object([
+                ("textDocument", Value::object([("uri", Value::String(uri_for(path)))])),
+                (
+                    "position",
+                    Value::object([
+                        ("line", Value::Number(line as f64)),
+                        ("character", Value::Number(column_chars as f64)),
+                    ]),
+                ),
+            ]),
+        );
+        self.pending_definitions.lock().unwrap().insert(id);
+    }
+
+    /// Every `textDocument/definition` response that has arrived since the
+    /// last drain. `None` entries are servers that answered "nothing here"
+    /// (an empty result, or a position with no symbol) -- worth telling the
+    /// user apart from a request still in flight, which simply is not in
+    /// this list yet.
+    pub fn drain_definitions(&self) -> Vec<Option<DefinitionLocation>> {
+        std::mem::take(&mut self.definitions.lock().unwrap())
+    }
+
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    fn send_request(&mut self, method: &str, params: Value) {
+    fn send_request(&mut self, method: &str, params: Value) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         self.write_message(Value::object([
@@ -309,6 +363,7 @@ impl LspClient {
             ("method", Value::String(method.to_string())),
             ("params", params),
         ]));
+        id
     }
 
     fn send_notification(&mut self, method: &str, params: Value) {
@@ -422,6 +477,19 @@ impl LspManager {
         updates
     }
 
+    /// Every `textDocument/definition` response any running server has
+    /// produced since the last drain, across every language -- a caller
+    /// with only one request in flight at a time (the ordinary "go to
+    /// definition" gesture) does not need to know which server it came
+    /// from, only where to jump.
+    pub fn drain_definitions(&self) -> Vec<Option<DefinitionLocation>> {
+        let mut updates = Vec::new();
+        for client in self.clients.values() {
+            updates.extend(client.drain_definitions());
+        }
+        updates
+    }
+
     pub fn is_empty(&self) -> bool {
         self.clients.is_empty()
     }
@@ -498,6 +566,28 @@ fn parse_publish_diagnostics(value: &Value) -> Option<(PathBuf, Option<u64>, Vec
     Some((path, version, diagnostics))
 }
 
+/// Parses a `textDocument/definition` response's `result` -- `Location |
+/// Location[] | null` (this client never advertises `linkSupport`, so a
+/// well-behaved server never sends `LocationLink[]` instead). Several
+/// locations means several declarations (an interface and an impl, say);
+/// the first is what "go to definition" always meant before there was a
+/// list to disambiguate, and disambiguating is a real feature this
+/// prototype does not attempt.
+fn parse_definition_result(result: Option<&Value>) -> Option<DefinitionLocation> {
+    let result = result?;
+    let location = match result.as_array() {
+        Some(locations) => locations.first()?,
+        None => result,
+    };
+    let uri = location.get("uri")?.as_str()?;
+    let start = location.get("range")?.get("start")?;
+    Some(DefinitionLocation {
+        path: path_from_uri(uri)?,
+        line: start.get("line")?.as_usize()?,
+        column_chars: start.get("character")?.as_usize()?,
+    })
+}
+
 /// Drains `incoming` and writes each already-framed message to `stdin`,
 /// blocking on this thread rather than the caller's whenever the server is
 /// not reading -- which is exactly the case a broken or slow-to-start server
@@ -512,7 +602,13 @@ fn write_loop(mut stdin: ChildStdin, incoming: std::sync::mpsc::Receiver<String>
     }
 }
 
-fn read_loop(stdout: impl Read, diagnostics: Arc<Mutex<DiagnosticsByPath>>, wake: impl Fn()) {
+fn read_loop(
+    stdout: impl Read,
+    diagnostics: Arc<Mutex<DiagnosticsByPath>>,
+    definitions: Arc<Mutex<Vec<Option<DefinitionLocation>>>>,
+    pending_definitions: Arc<Mutex<std::collections::HashSet<u64>>>,
+    wake: impl Fn(),
+) {
     let mut reader = BufReader::new(stdout);
     loop {
         let Some(body) = read_one_message(&mut reader) else { return };
@@ -520,7 +616,20 @@ fn read_loop(stdout: impl Read, diagnostics: Arc<Mutex<DiagnosticsByPath>>, wake
         if let Some(entry) = parse_publish_diagnostics(&value) {
             diagnostics.lock().unwrap().push(entry);
             wake();
+            continue;
         }
+        // A response, not a notification: has an `id`, no `method`. Only
+        // one this client tracks the meaning of -- everything else (the
+        // `initialize` response chief among them) is read off the pipe,
+        // framing intact, and simply not matched to anything.
+        let Some(id) = value.get("id").and_then(Value::as_f64).map(|id| id as u64) else {
+            continue;
+        };
+        if !pending_definitions.lock().unwrap().remove(&id) {
+            continue;
+        }
+        definitions.lock().unwrap().push(parse_definition_result(value.get("result")));
+        wake();
     }
 }
 
@@ -614,6 +723,43 @@ mod tests {
     fn a_non_diagnostics_message_is_not_mistaken_for_one() {
         let value = crate::json::parse(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).unwrap();
         assert!(parse_publish_diagnostics(&value).is_none());
+    }
+
+    #[test]
+    fn a_single_location_result_parses() {
+        let value = crate::json::parse(
+            r#"{"uri": "file:///C:/proj/src/main.rs", "range": {"start": {"line": 4, "character": 8}, "end": {"line": 4, "character": 12}}}"#,
+        )
+        .unwrap();
+        let location = parse_definition_result(Some(&value)).unwrap();
+        assert_eq!(location.path.to_string_lossy().replace('\\', "/"), "C:/proj/src/main.rs");
+        assert_eq!(location.line, 4);
+        assert_eq!(location.column_chars, 8);
+    }
+
+    #[test]
+    fn a_location_array_result_takes_the_first_entry() {
+        let value = crate::json::parse(
+            r#"[
+                {"uri": "file:///C:/proj/src/a.rs", "range": {"start": {"line": 1, "character": 0}, "end": {"line": 1, "character": 1}}},
+                {"uri": "file:///C:/proj/src/b.rs", "range": {"start": {"line": 2, "character": 0}, "end": {"line": 2, "character": 1}}}
+            ]"#,
+        )
+        .unwrap();
+        let location = parse_definition_result(Some(&value)).unwrap();
+        assert_eq!(location.path.to_string_lossy().replace('\\', "/"), "C:/proj/src/a.rs");
+    }
+
+    #[test]
+    fn a_null_result_is_no_definition_found_not_a_parse_failure() {
+        let value = crate::json::parse("null").unwrap();
+        assert!(parse_definition_result(Some(&value)).is_none());
+    }
+
+    #[test]
+    fn an_empty_location_array_is_no_definition_found() {
+        let value = crate::json::parse("[]").unwrap();
+        assert!(parse_definition_result(Some(&value)).is_none());
     }
 
     #[test]

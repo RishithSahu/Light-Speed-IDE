@@ -45,6 +45,9 @@ impl SubsystemId {
     /// A filesystem watch task (ADR-0017): waits for the next change under a
     /// directory, reports it, and is re-armed by its caller.
     pub const WATCH: SubsystemId = SubsystemId("watch");
+    /// Probes whether a language's run toolchain (`rustc`, `python`, ...) is
+    /// on `PATH`, for the Run panel.
+    pub const TOOLCHAIN: SubsystemId = SubsystemId("toolchain");
     /// For tests and benchmarks.
     pub const TEST: SubsystemId = SubsystemId("test");
 

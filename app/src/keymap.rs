@@ -121,6 +121,7 @@ fn resolve_control_character(text: &str, shift: bool) -> Binding {
         "y" => Binding::command("edit.redo"),
         "c" => Binding::command("edit.copy"),
         "x" => Binding::command("edit.cut"),
+        "v" if shift => Binding::command("view.toggle_markdown_preview"),
         "v" => Binding::command("edit.paste"),
         "a" => Binding::command("edit.select_all"),
         "f" if shift => Binding::command("view.workspace_search"),
@@ -129,6 +130,11 @@ fn resolve_control_character(text: &str, shift: bool) -> Binding {
         "g" if shift => Binding::command("view.toggle_git_status"),
         "d" if shift => Binding::command("view.toggle_dependencies"),
         "r" if shift => Binding::command("view.refresh_dependencies"),
+        // "+"/"_" are what Shift produces on the "="/"-" keys on a US
+        // layout; both spellings zoom the same direction Ctrl+scroll does.
+        "=" | "+" => Binding::command("view.zoom_in"),
+        "-" | "_" => Binding::command("view.zoom_out"),
+        "0" => Binding::command("view.reset_zoom"),
         _ => Binding::None,
     }
 }
@@ -236,6 +242,11 @@ mod tests {
             command_of(resolve(&character("w"), &control_shift)),
             Some("file.close_all_clean_tabs")
         );
+        assert_eq!(command_of(resolve(&character("v"), &control)), Some("edit.paste"));
+        assert_eq!(
+            command_of(resolve(&character("v"), &control_shift)),
+            Some("view.toggle_markdown_preview")
+        );
     }
 
     #[test]
@@ -258,13 +269,26 @@ mod tests {
     #[test]
     fn ctrl_0_and_ctrl_shift_digit_are_not_tab_jumps() {
         let control = modifiers(ModifiersState::CONTROL);
-        assert_eq!(resolve(&character("0"), &control), Binding::None);
+        // Ctrl+0 is not a tab jump -- it resets the zoom instead, the usual
+        // meaning of "0" alongside "+"/"-" everywhere else it appears.
+        assert_eq!(resolve(&character("0"), &control), Binding::command("view.reset_zoom"));
 
         let control_shift = modifiers(ModifiersState::CONTROL | ModifiersState::SHIFT);
         assert_ne!(
             resolve(&character("1"), &control_shift),
             Binding::Command("view.go_to_tab", CommandArgs::Index(1))
         );
+    }
+
+    #[test]
+    fn ctrl_plus_and_minus_zoom_the_font_either_way_shift_spells_them() {
+        let control = modifiers(ModifiersState::CONTROL);
+        // "=" is what the key produces unshifted; "+" is the same physical
+        // key with Shift held, on a US layout. Both mean the same thing.
+        assert_eq!(resolve(&character("="), &control), Binding::command("view.zoom_in"));
+        assert_eq!(resolve(&character("+"), &control), Binding::command("view.zoom_in"));
+        assert_eq!(resolve(&character("-"), &control), Binding::command("view.zoom_out"));
+        assert_eq!(resolve(&character("_"), &control), Binding::command("view.zoom_out"));
     }
 
     #[test]

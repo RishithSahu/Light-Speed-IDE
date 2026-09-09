@@ -50,6 +50,18 @@ const MAX_FILES: usize = 4_000;
 pub struct Edge {
     pub from: PathBuf,
     pub to: PathBuf,
+    /// 1-based line, in `from`, where the reference that produced this edge
+    /// was written -- the `use`, `mod`, `import`, or `#include` line. What
+    /// lets a click on the edge in the dependency view jump straight to the
+    /// statement that caused it, rather than just opening the file.
+    pub line: usize,
+    /// The reference itself, as written -- `models.User`, `./widget`,
+    /// `crate::parser` -- whatever `extract_references` cleaned out of the
+    /// `use`/`import`/`#include` line before resolving it to `to`. Drawn as
+    /// the edge's own label in the dependency view, so a line between two
+    /// files says what is actually being pulled across it rather than
+    /// leaving that to a click-through.
+    pub label: String,
 }
 
 /// Every source file found, and every resolved reference between them.
@@ -83,10 +95,11 @@ impl DependencyGraph {
 ///
 /// Returns what the source literally names (`"./widget"`, `"parser"`,
 /// `"raster.h"`); turning those into paths is [`resolve`]'s problem.
-pub fn extract_references(text: &str, language: Language) -> Vec<String> {
+pub fn extract_references(text: &str, language: Language) -> Vec<(String, usize)> {
     let mut found = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
+    for (index, raw_line) in text.lines().enumerate() {
+        let line_number = index + 1;
+        let line = raw_line.trim();
         match language {
             Language::Rust => {
                 // `mod parser;` names a sibling file directly.
@@ -95,7 +108,7 @@ pub fn extract_references(text: &str, language: Language) -> Vec<String> {
                     .or_else(|| line.strip_prefix("pub mod "))
                     .and_then(|rest| rest.strip_suffix(';'));
                 if let Some(name) = module {
-                    push_clean(&mut found, name);
+                    push_clean(&mut found, name, line_number);
                     continue;
                 }
                 // `use crate::parser::Token;` is the edge that actually
@@ -113,7 +126,7 @@ pub fn extract_references(text: &str, language: Language) -> Vec<String> {
                     .map(|rest| rest.trim_end_matches(';'));
                 if let Some(path) = used {
                     for name in rust_use_modules(path) {
-                        push_clean(&mut found, &name);
+                        push_clean(&mut found, &name, line_number);
                     }
                 }
             }
@@ -129,18 +142,18 @@ pub fn extract_references(text: &str, language: Language) -> Vec<String> {
                             for name in imported.split(',') {
                                 let name = name.split(" as ").next().unwrap_or(name).trim();
                                 if !name.is_empty() {
-                                    push_clean(&mut found, &format!("{module}{name}"));
+                                    push_clean(&mut found, &format!("{module}{name}"), line_number);
                                 }
                             }
                         } else {
-                            push_clean(&mut found, module);
+                            push_clean(&mut found, module, line_number);
                         }
                     }
                 } else if let Some(rest) = line.strip_prefix("import ") {
                     // `import a, b` names two modules.
                     for part in rest.split(',') {
                         let part = part.split(" as ").next().unwrap_or(part);
-                        push_clean(&mut found, part);
+                        push_clean(&mut found, part, line_number);
                     }
                 }
             }
@@ -149,12 +162,12 @@ pub fn extract_references(text: &str, language: Language) -> Vec<String> {
                 // quoted specifier, which is the only part that matters.
                 if line.starts_with("import ") || line.contains("require(") {
                     if let Some(specifier) = quoted(line) {
-                        push_clean(&mut found, &specifier);
+                        push_clean(&mut found, &specifier, line_number);
                     }
                 } else if let Some(rest) = line.strip_prefix("export ") {
                     if rest.contains(" from ") {
                         if let Some(specifier) = quoted(line) {
-                            push_clean(&mut found, &specifier);
+                            push_clean(&mut found, &specifier, line_number);
                         }
                     }
                 }
@@ -164,7 +177,7 @@ pub fn extract_references(text: &str, language: Language) -> Vec<String> {
                 // definition and will never be a file in this workspace.
                 if line.starts_with("#include") {
                     if let Some(specifier) = quoted(line) {
-                        push_clean(&mut found, &specifier);
+                        push_clean(&mut found, &specifier, line_number);
                     }
                 }
             }
@@ -179,10 +192,13 @@ pub fn extract_references(text: &str, language: Language) -> Vec<String> {
     found
 }
 
-fn push_clean(found: &mut Vec<String>, raw: &str) {
+fn push_clean(found: &mut Vec<(String, usize)>, raw: &str, line: usize) {
     let cleaned = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == ';');
-    if !cleaned.is_empty() && !found.iter().any(|existing| existing == cleaned) {
-        found.push(cleaned.to_string());
+    // Kept on the *name*, not the (name, line) pair: several `use` lines
+    // can name the same module, and the first one written is the more
+    // useful line to jump to than the last.
+    if !cleaned.is_empty() && !found.iter().any(|(existing, _)| existing == cleaned) {
+        found.push((cleaned.to_string(), line));
     }
 }
 
@@ -318,7 +334,7 @@ pub fn build(root: &Path) -> DependencyGraph {
         let Ok(text) = std::fs::read_to_string(root.join(relative)) else { continue };
         buffer.push_str(&text);
 
-        for reference in extract_references(&buffer, language) {
+        for (reference, line) in extract_references(&buffer, language) {
             let Some(target) = resolve(root, relative, &reference, language) else { continue };
             if &target == relative {
                 // A file importing itself is either a parse artefact or a
@@ -326,9 +342,18 @@ pub fn build(root: &Path) -> DependencyGraph {
                 // an edge worth drawing.
                 continue;
             }
-            let edge = Edge { from: relative.clone(), to: target };
-            if !graph.edges.contains(&edge) {
-                graph.edges.push(edge);
+            // Identity is (from, to), not (from, to, line): two references
+            // to the same file from the same file are one edge to draw, and
+            // keeping the first line found is what a reader expects when
+            // they click it.
+            let already_have = graph.edges.iter().any(|edge| edge.from == *relative && edge.to == target);
+            if !already_have {
+                graph.edges.push(Edge {
+                    from: relative.clone(),
+                    to: target,
+                    line,
+                    label: reference.clone(),
+                });
             }
         }
     }
@@ -404,10 +429,29 @@ mod tests {
         path
     }
 
+    /// Just the names, for tests that only care what was found -- line
+    /// numbers are covered separately by `each_reference_keeps_the_line_it_was_written_on`.
+    fn names(refs: Vec<(String, usize)>) -> Vec<String> {
+        refs.into_iter().map(|(name, _)| name).collect()
+    }
+
     #[test]
     fn rust_module_declarations_are_references() {
         let refs = extract_references("mod parser;\npub mod lexer;\nfn main() {}\n", Language::Rust);
-        assert_eq!(refs, vec!["parser", "lexer"]);
+        assert_eq!(names(refs), vec!["parser", "lexer"]);
+    }
+
+    #[test]
+    fn each_reference_keeps_the_line_it_was_written_on() {
+        // What a click on an edge in the dependency view jumps to.
+        let refs = extract_references("fn a() {}\nmod parser;\nmod lexer;\n", Language::Rust);
+        assert_eq!(refs, vec![("parser".to_string(), 2), ("lexer".to_string(), 3)]);
+    }
+
+    #[test]
+    fn a_repeated_reference_keeps_the_first_line_it_appeared_on() {
+        let refs = extract_references("use crate::parser;\nuse crate::parser::Token;\n", Language::Rust);
+        assert_eq!(refs, vec![("parser".to_string(), 1)]);
     }
 
     #[test]
@@ -418,13 +462,13 @@ mod tests {
             "use crate::parser::Thing;\nuse super::lexer::Token;\nuse self::inner::X;\n",
             Language::Rust,
         );
-        assert_eq!(refs, vec!["parser", "lexer", "inner"]);
+        assert_eq!(names(refs), vec!["parser", "lexer", "inner"]);
     }
 
     #[test]
     fn a_braced_use_names_every_module_in_the_group() {
         let refs = extract_references("use crate::{layout, theme::Color};\n", Language::Rust);
-        assert_eq!(refs, vec!["layout", "theme"]);
+        assert_eq!(names(refs), vec!["layout", "theme"]);
     }
 
     #[test]
@@ -432,7 +476,7 @@ mod tests {
         // Harmless by construction: `resolve` only returns a path for a file
         // that exists, so `std` and a dependency crate produce no edge.
         let refs = extract_references("use std::fmt;\nuse ls_core::editor::X;\n", Language::Rust);
-        assert_eq!(refs, vec!["std", "ls_core"]);
+        assert_eq!(names(refs), vec!["std", "ls_core"]);
         let root = std::env::temp_dir();
         assert!(resolve(&root, Path::new("a.rs"), "std", Language::Rust).is_none());
     }
@@ -443,7 +487,7 @@ mod tests {
             "from .models import User\nimport helpers\nfrom ..shared import x\n",
             Language::Python,
         );
-        assert_eq!(refs, vec![".models", "helpers", "..shared"]);
+        assert_eq!(names(refs), vec![".models", "helpers", "..shared"]);
     }
 
     #[test]
@@ -452,14 +496,14 @@ mod tests {
             "import Widget from './widget';\nconst y = require(\"./util\");\n",
             Language::JavaScript,
         );
-        assert_eq!(refs, vec!["./widget", "./util"]);
+        assert_eq!(names(refs), vec!["./widget", "./util"]);
     }
 
     #[test]
     fn c_quoted_includes_are_found_and_system_headers_are_not() {
         let refs =
             extract_references("#include \"raster.h\"\n#include <stdio.h>\n", Language::C);
-        assert_eq!(refs, vec!["raster.h"], "a system header can never be a workspace file");
+        assert_eq!(names(refs), vec!["raster.h"], "a system header can never be a workspace file");
     }
 
     #[test]
@@ -517,14 +561,18 @@ mod tests {
 
         let graph = build(&root);
         assert_eq!(graph.files.len(), 4);
-        assert!(graph.edges.contains(&Edge {
-            from: PathBuf::from("main.rs"),
-            to: PathBuf::from("parser.rs")
-        }));
-        assert!(graph.edges.contains(&Edge {
-            from: PathBuf::from("parser.rs"),
-            to: PathBuf::from("token.rs")
-        }));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == Path::new("main.rs") && edge.to == Path::new("parser.rs") && edge.line == 1)
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.from == Path::new("parser.rs") && edge.to == Path::new("token.rs") && edge.line == 1)
+        );
 
         // `main.rs` is imported by nothing: it is the root of the picture.
         assert_eq!(graph.roots(), vec![&PathBuf::from("main.rs")]);

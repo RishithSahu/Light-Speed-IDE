@@ -100,6 +100,32 @@ fn covers(outer: Rect, inner: Rect) -> bool {
         && outer.bottom() >= inner.bottom() - 0.5
 }
 
+/// One commit row's place in the Source Control panel's graph, in screen
+/// terms: `app.rs` turns `ls_core::commit_graph::lanes`' lane/edge output
+/// (column indices) into this (pixel positions), so `compose_frame` only
+/// ever does the drawing, never the layout math.
+#[derive(Clone, Debug)]
+pub struct SidebarGraphRow {
+    /// This commit's own lane, as a column index (0 is the leftmost).
+    pub lane: usize,
+    /// Segments to draw from this row down to the next, `(from_lane,
+    /// to_lane)` -- see `ls_core::commit_graph::GraphRow::edges`.
+    pub edges: Vec<(usize, usize)>,
+    /// The dot's color -- a hash of the commit's own hash, so distinct
+    /// lineages read apart by color even where two lanes run side by side.
+    pub color: Color,
+}
+
+/// The Source Control panel's full commit graph for one frame: where it
+/// starts (in the same absolute row numbering `sidebar_selected_row` uses),
+/// with one [`SidebarGraphRow`] per commit, in the same order the commit
+/// rows themselves are drawn in.
+#[derive(Clone, Debug)]
+pub struct SidebarGraph {
+    pub first_row: usize,
+    pub rows: Vec<SidebarGraphRow>,
+}
+
 /// Everything the chrome needs to lay itself out.
 ///
 /// Deliberately not a borrow of the shell: composition is a function of the
@@ -130,12 +156,27 @@ pub struct Chrome<'a> {
     pub sidebar_hovered_row: Option<usize>,
     /// How far the sidebar's row list is scrolled, in logical pixels.
     pub sidebar_scroll_y: f32,
+    /// The Source Control panel's commit-history graph, when it is showing
+    /// one: real branch/merge lane topology (`ls_core::commit_graph::lanes`)
+    /// rather than a single straight line, so a fork or a merge actually
+    /// reads as one on screen.
+    pub sidebar_graph: Option<SidebarGraph>,
     /// Which activity item is the current panel, if any -- drawn "cut into"
     /// the editor rather than highlighted on top of it, matching Lapce.
     pub activity_active: Option<usize>,
     /// Which activity item the pointer is over, for hover feedback distinct
     /// from the active one.
     pub activity_hovered: Option<usize>,
+    /// Whether the Settings screen is open -- drawn the same "cut into the
+    /// editor" way as an active item in the scrolling list above it, on its
+    /// own bottom-pinned cell.
+    pub activity_settings_active: bool,
+    pub activity_settings_hovered: bool,
+    /// Whether the pointer is over the title bar's Play button
+    /// (`layout.title_actions`) -- its own flag, the same way
+    /// `activity_settings_hovered` is, since it is a single button with no
+    /// list of rows to resolve a hovered index against.
+    pub title_actions_hovered: bool,
     /// The docked bottom panel's content area, when it is shown.
     pub bottom_panel: Option<Rect>,
     /// The bottom panel's own icon rail, to the left of its content.
@@ -216,6 +257,9 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
             color: theme.dim_text,
         },
     );
+    if input.title_actions_hovered {
+        list.push_quad(Layer::Base, Quad::new(layout.title_actions, theme.panel_hovered));
+    }
     list.push_text(
         Layer::Base,
         TextRegionPlacement {
@@ -298,6 +342,27 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
             },
         );
     }
+
+    // Settings' own cell, pinned to the bottom of the rail rather than part
+    // of the scrolling list above -- the same "cut into the editor" active
+    // look, its own hover, its own icon region so growing the top list can
+    // never shift or collide with it.
+    if input.activity_settings_hovered && !input.activity_settings_active {
+        list.push_quad(Layer::Base, Quad::new(layout.activity_settings, theme.panel_hovered));
+    }
+    if input.activity_settings_active {
+        list.push_quad(Layer::Base, Quad::new(layout.activity_settings, theme.activity_current));
+    }
+    list.push_text(
+        Layer::Base,
+        TextRegionPlacement {
+            region: Region::ActivitySettings,
+            origin_x: layout.activity_settings.x,
+            origin_y: layout.activity_settings.y,
+            clip: layout.activity_settings,
+            color: theme.activity_icon_active,
+        },
+    );
 
     // The bottom panel (currently just the terminal) docks the same way the
     // sidebar does: a real base-layer surface with its own icon rail, not an
@@ -391,6 +456,51 @@ pub fn chrome(input: &Chrome<'_>) -> DrawList {
                     theme.cursor,
                 ),
             );
+        }
+        // The commit graph: real lane topology (see
+        // `ls_core::commit_graph::lanes`) rather than one straight line, so
+        // a fork or a merge actually reads as one. Drawn after the
+        // hover/selection highlights, in the same Base quad pass, so the
+        // dots and their connecting lines sit on top of a highlighted row
+        // rather than getting painted over by it.
+        if let Some(graph) = &input.sidebar_graph {
+            // Exactly one icon-width per lane -- matching, pixel for pixel,
+            // the number of `rich.icon_space()` blanks `app.rs` reserves
+            // per `ListRow::icon_spaces` before the row's own label. Any
+            // other step would drift out of alignment with that reserved
+            // margin as the lane count grows, leaving text overlapping the
+            // graph (a straight character-space approximation was tried
+            // first and did exactly that).
+            let lane_step = layout.metrics.icon_width;
+            let lane_x = |lane: usize| panel.x + 8.0 * scale + layout.metrics.icon_width * 1.5 + lane as f32 * lane_step;
+            let row_centre_y = |row: usize| {
+                panel.y + (row as f32 + 0.5) * layout.metrics.line_height - input.sidebar_scroll_y
+            };
+            let line_thickness = 1.5 * scale;
+            for (i, row) in graph.rows.iter().enumerate() {
+                let this_row = graph.first_row + i;
+                let y = row_centre_y(this_row);
+                for &(from, to) in &row.edges {
+                    let next_y = row_centre_y(this_row + 1);
+                    list.push_quad(
+                        Layer::Base,
+                        Quad::line((lane_x(from), y), (lane_x(to), next_y), line_thickness, theme.sidebar_border),
+                    );
+                }
+            }
+            // Dots drawn in a second pass over every edge, so a lane
+            // crossing under a later commit's dot never paints on top of
+            // it.
+            for (i, row) in graph.rows.iter().enumerate() {
+                let this_row = graph.first_row + i;
+                let y = row_centre_y(this_row);
+                let radius = layout.metrics.icon_width * 0.3;
+                let x = lane_x(row.lane);
+                list.push_quad(
+                    Layer::Base,
+                    Quad::ellipse(Rect::new(x - radius, y - radius, radius * 2.0, radius * 2.0), row.color),
+                );
+            }
         }
         list.push_text(
             Layer::Base,
@@ -720,9 +830,13 @@ mod tests {
             sidebar_selected_row: None,
             sidebar_hovered_row: None,
             sidebar_scroll_y: 0.0,
+            sidebar_graph: None,
 
             activity_active: None,
             activity_hovered: None,
+            activity_settings_active: false,
+            activity_settings_hovered: false,
+            title_actions_hovered: false,
             bottom_panel: None,
             bottom_panel_rail: None,
             palette_panel: None,
@@ -867,9 +981,13 @@ mod tests {
             sidebar_selected_row: Some(1),
             sidebar_hovered_row: None,
             sidebar_scroll_y: 0.0,
+            sidebar_graph: None,
 
             activity_active: None,
             activity_hovered: None,
+            activity_settings_active: false,
+            activity_settings_hovered: false,
+            title_actions_hovered: false,
             bottom_panel: None,
             bottom_panel_rail: None,
             palette_panel: None,
@@ -947,9 +1065,13 @@ mod tests {
             sidebar_selected_row: None,
             sidebar_hovered_row: None,
             sidebar_scroll_y: 0.0,
+            sidebar_graph: None,
 
             activity_active: None,
             activity_hovered: None,
+            activity_settings_active: false,
+            activity_settings_hovered: false,
+            title_actions_hovered: false,
             bottom_panel: None,
             bottom_panel_rail: None,
             palette_panel: None,

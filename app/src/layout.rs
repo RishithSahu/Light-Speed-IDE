@@ -148,6 +148,12 @@ pub struct Layout {
     /// Control / ...), always at the far left, always full body height even
     /// when the bottom panel is open.
     pub activity_bar: Rect,
+    /// A single cell pinned to the bottom of the activity bar, for Settings
+    /// -- the one item that is never part of the scrolling top list, the
+    /// same place VS Code and JetBrains both put it. Bigger than the old
+    /// title-bar gear (a whole square activity-bar cell, not an 18px title
+    /// button) and always in the same place regardless of window width.
+    pub activity_settings: Rect,
     pub sidebar: Rect,
     pub gutter: Rect,
     pub text: Rect,
@@ -207,7 +213,8 @@ impl Layout {
             search_width,
             (header_height - 10.0 * scale).max(1.0),
         );
-        let actions_width = (button * 2.0 + 12.0 * scale).min(width);
+        // Just Run now: Settings moved to the activity bar's bottom cell.
+        let actions_width = (button + 12.0 * scale).min(width);
         let title_actions = Rect::new(
             (width - actions_width - 8.0 * scale).max(0.0),
             menu_bar.y + 4.0 * scale,
@@ -233,6 +240,16 @@ impl Layout {
         };
 
         let activity_bar = Rect::new(0.0, body_top, activity_width, full_body_height);
+        // One square cell, anchored to the bottom of the rail rather than
+        // indexed into the scrolling top list, so it never moves as items
+        // are added above it and is never confused with them by
+        // `icon_rail_hit`.
+        let activity_settings = Rect::new(
+            activity_bar.x,
+            activity_bar.bottom() - activity_width,
+            activity_bar.width,
+            activity_width,
+        );
         let sidebar = Rect::new(activity_bar.right(), body_top, sidebar_width, full_body_height);
 
         let column_x = sidebar.right();
@@ -305,6 +322,7 @@ impl Layout {
             tab_bar,
             breadcrumb,
             activity_bar,
+            activity_settings,
             sidebar,
             gutter,
             text,
@@ -622,6 +640,28 @@ mod tests {
         assert_eq!(clamp_sidebar_width(10.0), SIDEBAR_MIN_WIDTH);
         assert_eq!(clamp_sidebar_width(10_000.0), SIDEBAR_MAX_WIDTH);
         assert_eq!(clamp_sidebar_width(300.0), 300.0);
+    }
+
+    #[test]
+    fn the_settings_cell_is_a_square_pinned_to_the_bottom_of_the_activity_bar() {
+        // It moved off the title bar's tiny gear onto its own full-size cell
+        // here, and has to stay put at the bottom regardless of window size
+        // or how many items sit above it in the scrolling list.
+        let layout = compute(1000.0, 700.0, 1.0, metrics(), 4, true);
+        assert!((layout.activity_settings.width - ACTIVITY_WIDTH).abs() < 0.5);
+        assert!((layout.activity_settings.height - ACTIVITY_WIDTH).abs() < 0.5, "a square cell");
+        assert_eq!(layout.activity_settings.x, layout.activity_bar.x);
+        assert!((layout.activity_settings.bottom() - layout.activity_bar.bottom()).abs() < 0.5);
+
+        let taller = compute(1000.0, 1400.0, 1.0, metrics(), 4, true);
+        assert!(
+            (taller.activity_settings.bottom() - taller.activity_bar.bottom()).abs() < 0.5,
+            "still pinned to the bottom of a taller window"
+        );
+        assert!(
+            taller.activity_settings.y > layout.activity_settings.y,
+            "moved down with the taller rail rather than staying at a fixed pixel"
+        );
     }
 
     #[test]

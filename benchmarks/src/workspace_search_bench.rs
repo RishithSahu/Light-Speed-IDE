@@ -60,7 +60,12 @@ fn run_workload(root: &Path, file_count: usize, sampler: &mut ProcessSampler) ->
 
     // --- the interactive part: what requesting a search costs the caller ---
     let (task, request_cost) = time(|| {
-        editor.request_workspace_search("findme_marker_token".to_string()).expect("admitted")
+        editor
+            .request_workspace_search(
+                "findme_marker_token".to_string(),
+                ls_core::workspace_search::SearchOptions::default(),
+            )
+            .expect("admitted")
     });
     let _ = task;
 

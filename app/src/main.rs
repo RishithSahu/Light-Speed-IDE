@@ -20,6 +20,7 @@ mod json;
 mod keymap;
 mod layout;
 mod lsp;
+mod markdown;
 mod menu;
 mod palette;
 mod quads;

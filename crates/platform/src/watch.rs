@@ -93,7 +93,7 @@ mod windows_impl {
 
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
-            if self.0 != std::ptr::null_mut() {
+            if !self.0.is_null() {
                 // SAFETY: `self.0` is a handle this module opened and does not
                 // share with anyone else, so nothing else can be using it.
                 unsafe {
@@ -150,8 +150,7 @@ mod windows_impl {
         }
         let event = OwnedHandle(raw_event);
 
-        let mut overlapped = OVERLAPPED::default();
-        overlapped.hEvent = event.0;
+        let mut overlapped = OVERLAPPED { hEvent: event.0, ..Default::default() };
         let mut buffer = vec![0u8; BUFFER_LEN];
         let mut queued_bytes: u32 = 0;
 

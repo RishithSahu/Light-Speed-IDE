@@ -66,6 +66,64 @@ pub fn open_session_at(path: &Path) -> Option<File> {
     Some(file)
 }
 
+/// Every command line ever recorded to the permanent transcript, oldest
+/// first, capped at `max` entries -- this is what lets Up-arrow recall reach
+/// back across every past session of this app's terminal, not only the
+/// current process's lifetime. `Terminal::send_line` writes each one as
+/// `"> {line}"`; this is the inverse read.
+pub fn read_history(max: usize) -> Vec<String> {
+    let Some(path) = default_path() else { return Vec::new() };
+    read_history_at(&path, max)
+}
+
+fn read_history_at(path: &Path, max: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    let lines = text.lines().filter_map(|line| line.strip_prefix("> ").map(str::to_string));
+    capped(lines, max)
+}
+
+/// The last `max` of an iterator of lines, oldest first -- shared by
+/// [`read_history`] (which first strips the `"> "` marker) and
+/// [`read_external_shell_history`] (whose lines need no stripping).
+fn capped(lines: impl Iterator<Item = String>, max: usize) -> Vec<String> {
+    let mut lines: Vec<String> = lines.collect();
+    if lines.len() > max {
+        let cut = lines.len() - max;
+        lines.drain(..cut);
+    }
+    lines
+}
+
+/// PowerShell's own command history (written by the PSReadLine module every
+/// real PowerShell window already uses), so "commands run before" is not
+/// scoped to this app -- a command typed in an ordinary PowerShell window
+/// shows up here too. Windows-only: PSReadLine, and this history file, are a
+/// Windows PowerShell/`pwsh` concept.
+#[cfg(windows)]
+pub fn read_external_shell_history(max: usize) -> Vec<String> {
+    let Some(path) = external_shell_history_path() else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    capped(text.lines().map(str::to_string), max)
+}
+
+#[cfg(not(windows))]
+pub fn read_external_shell_history(_max: usize) -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn external_shell_history_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(
+        PathBuf::from(appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("PowerShell")
+            .join("PSReadLine")
+            .join("ConsoleHost_history.txt"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +185,28 @@ mod tests {
         assert!(content.contains("> echo probe"), "the command line is missing: {content:?}");
         assert!(content.contains("probe"), "the output is missing: {content:?}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reading_history_back_extracts_only_the_command_lines() {
+        let path = scratch_path("history");
+        std::fs::write(&path, "> git status\nOn branch main\n> cargo build\nCompiling...\n").unwrap();
+        assert_eq!(read_history_at(&path, 10), vec!["git status".to_string(), "cargo build".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reading_history_caps_to_the_most_recent_entries() {
+        let path = scratch_path("history-cap");
+        let content = (0..5).map(|n| format!("> cmd{n}\n")).collect::<String>();
+        std::fs::write(&path, content).unwrap();
+        assert_eq!(read_history_at(&path, 2), vec!["cmd3".to_string(), "cmd4".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_history_file_reads_as_empty_not_an_error() {
+        let path = scratch_path("missing");
+        assert_eq!(read_history_at(&path, 10), Vec::<String>::new());
     }
 }

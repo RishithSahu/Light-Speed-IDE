@@ -1,12 +1,24 @@
-//! Read-only Git status (item 11: status only, no graph, no staging, no
-//! commit -- those stay explicitly out of scope).
+//! Git status, history, and commit support (item 11, since extended: status
+//! was originally read-only -- no staging, no commit -- but the Source
+//! Control panel now offers both, so this module parses `git log` too and
+//! `crates/core/src/editor.rs` shells out to `git add`/`git commit`).
 //!
-//! `git status --porcelain=v1 -b` is parsed rather than libgit2 or a
-//! from-scratch pack-file reader: the CLI is already present on any machine
-//! that has Git, parsing its stable machine-readable format is a couple dozen
-//! lines, and it avoids a heavyweight dependency for a read-only status list.
-//! The process itself is bounded, one-shot work, so it runs as an ordinary
-//! scheduler task under `SubsystemId::GIT` -- no new background thread.
+//! `git status --porcelain=v1 -b` and `git log --pretty=format:...` are
+//! parsed rather than using libgit2 or a from-scratch pack-file reader: the
+//! CLI is already present on any machine that has Git, parsing its stable
+//! machine-readable formats is a couple dozen lines each, and it avoids a
+//! heavyweight dependency for what is still fundamentally a thin read/write
+//! wrapper around a handful of `git` subcommands. The process itself is
+//! bounded, one-shot work, so it runs as an ordinary scheduler task under
+//! `SubsystemId::GIT` -- no new background thread.
+//!
+//! Staging is deliberately not per-file: the Commit button stages everything
+//! (`git add -A`) and commits it in one step, the same fallback VS Code's own
+//! Source Control view uses when nothing has been staged by hand. A
+//! checkbox-per-file staging model is a real feature this does not attempt to
+//! be -- it would need its own click-to-toggle UI and a way to represent a
+//! file being staged while a request is still in flight, neither of which
+//! exists here yet.
 
 use std::path::PathBuf;
 
@@ -103,6 +115,67 @@ pub fn parse_porcelain(output: &str) -> GitStatus {
     status
 }
 
+/// One entry from `git log`, as parsed by [`parse_log`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitLogEntry {
+    pub hash: String,
+    pub short_hash: String,
+    pub author: String,
+    pub date: String,
+    pub summary: String,
+    /// This commit's parents, full hashes, in `git`'s own order (first
+    /// parent first). Empty for a root commit, one entry for an ordinary
+    /// commit, two or more for a merge -- exactly the shape
+    /// [`crate::graph::lanes`] needs to lay real branch/merge topology out
+    /// as more than a single straight line.
+    pub parents: Vec<String>,
+}
+
+/// Parses `git log --pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s%x1f%P`
+/// output, one commit per line.
+///
+/// Fields are separated by `\x1f` (ASCII unit separator) rather than a comma
+/// or a space, the same reasoning `parse_porcelain` above has no need for but
+/// this does: a commit summary is free-form text a human wrote, and can
+/// contain either of those without anything stopping it. A control character
+/// no commit message would ever type is the one separator that cannot be
+/// mistaken for content. `%P` (parent hashes) trails every other field
+/// because it is the only one that can itself be empty (a root commit has no
+/// parents) or contain the field separator's counterpart, a plain space --
+/// putting it last means a short line still parses every field before it.
+pub fn parse_log(output: &str) -> Vec<CommitLogEntry> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\u{1f}');
+            let hash = fields.next()?.to_string();
+            let short_hash = fields.next()?.to_string();
+            let author = fields.next()?.to_string();
+            let date = fields.next()?.to_string();
+            let summary = fields.next().unwrap_or_default().to_string();
+            let parents = fields
+                .next()
+                .unwrap_or_default()
+                .split_whitespace()
+                .map(str::to_string)
+                .collect();
+            Some(CommitLogEntry { hash, short_hash, author, date, summary, parents })
+        })
+        .collect()
+}
+
+/// The result of a `git add -A && git commit -m <message>` request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitOutcome {
+    pub success: bool,
+    /// A short status line to show the user: "Committed" on success, or
+    /// `git`'s own stderr (trimmed) on failure -- a merge conflict, nothing
+    /// staged, no user.name/user.email configured, and so on are all real
+    /// reasons this can fail, and are worth showing verbatim rather than
+    /// flattened into a generic "commit failed".
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,5 +223,66 @@ mod tests {
         let status = parse_porcelain("## main\n D gone.txt\nR  old.txt -> new.txt\n");
         assert_eq!(status.files[0].state, GitFileState::Deleted);
         assert_eq!(status.files[1].state, GitFileState::Renamed);
+    }
+
+    #[test]
+    fn a_single_commit_line_is_parsed_into_its_five_fields() {
+        let log = parse_log("abc123full\u{1f}abc123\u{1f}Jane Doe\u{1f}2026-01-05\u{1f}Fix the thing\u{1f}\n");
+        assert_eq!(
+            log,
+            vec![CommitLogEntry {
+                hash: "abc123full".to_string(),
+                short_hash: "abc123".to_string(),
+                author: "Jane Doe".to_string(),
+                date: "2026-01-05".to_string(),
+                summary: "Fix the thing".to_string(),
+                parents: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_field_missing_entirely_still_parses_as_an_empty_parent_list() {
+        // A short, malformed line (older data, a truncated pipe read) must
+        // not panic just because %P never showed up at all.
+        let log = parse_log("h\u{1f}s\u{1f}A\u{1f}2026-01-01\u{1f}no parents field\n");
+        assert_eq!(log[0].parents, Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_merge_commits_two_parents_are_both_parsed() {
+        let log =
+            parse_log("h\u{1f}s\u{1f}A\u{1f}2026-01-01\u{1f}Merge branch 'x'\u{1f}p1full p2full\n");
+        assert_eq!(log[0].parents, vec!["p1full".to_string(), "p2full".to_string()]);
+    }
+
+    #[test]
+    fn multiple_commits_are_parsed_in_order() {
+        let log = parse_log(
+            "h2\u{1f}s2\u{1f}A\u{1f}2026-01-02\u{1f}second\nh1\u{1f}s1\u{1f}A\u{1f}2026-01-01\u{1f}first\n",
+        );
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].summary, "second", "git log lists newest first, unchanged here");
+        assert_eq!(log[1].summary, "first");
+    }
+
+    #[test]
+    fn a_summary_containing_the_word_comma_is_kept_intact() {
+        // The whole reason the parser splits on the unit separator instead
+        // of a comma or a space: a real commit message can contain either.
+        let log = parse_log("h\u{1f}s\u{1f}A\u{1f}2026-01-01\u{1f}fix: a, b, and c\n");
+        assert_eq!(log[0].summary, "fix: a, b, and c");
+    }
+
+    #[test]
+    fn empty_log_output_parses_to_no_commits() {
+        assert_eq!(parse_log(""), Vec::new());
+    }
+
+    #[test]
+    fn a_malformed_line_missing_fields_is_skipped_rather_than_panicking() {
+        let log = parse_log("only\u{1f}two\nh\u{1f}s\u{1f}A\u{1f}2026-01-01\u{1f}ok\n");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].summary, "ok");
     }
 }

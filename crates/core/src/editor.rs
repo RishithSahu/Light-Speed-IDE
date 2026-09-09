@@ -13,7 +13,7 @@ use crate::commands::{self, CommandArgs, ShellRequest};
 use crate::document::{ContentRevision, Document, DocumentId, EditResult, ExternalState};
 use crate::error::{EditorError, OpenDocumentError, PersistenceError, WorkspaceError};
 use crate::events::{Event, EventPayload, EventQueue};
-use crate::git::{self, GitStatus};
+use crate::git::{self, GitCommitOutcome, GitStatus};
 use crate::history::{Edit, EditKind};
 use crate::loading::{
     self, LoadActivity, LoadInjection, LoadRecord, LoadResult, LoadState, PendingLoad,
@@ -23,6 +23,7 @@ use crate::persistence::{
     SaveSnapshot,
 };
 use crate::render::{self, RenderSnapshot, Viewport};
+use crate::runners::RunLanguage;
 use crate::selection::{Movement, Selection};
 use crate::watch::WatchedPaths;
 use crate::workspace::{Workspace, WorkspaceId};
@@ -224,6 +225,23 @@ pub struct EditorCore {
     pending_git_status: Option<TaskId>,
     /// The last status this workspace reported.
     git_status: Option<GitStatus>,
+    /// The one outstanding `git log` task, if a request is in flight.
+    pending_git_log: Option<TaskId>,
+    /// The last commit history this workspace reported.
+    git_log: Option<Vec<git::CommitLogEntry>>,
+    /// The one outstanding `git add`+`git commit` task, if a request is in
+    /// flight.
+    pending_git_commit: Option<TaskId>,
+    /// The most recent commit's result, read once by `pump_background_work`
+    /// (which refreshes status/log from it) and cleared immediately after --
+    /// this is a one-shot notification, not a persistent field to poll.
+    git_commit_result: Option<GitCommitOutcome>,
+    /// One outstanding toolchain-availability probe per language currently
+    /// being checked.
+    pending_toolchain_checks: std::collections::HashMap<RunLanguage, TaskId>,
+    /// Whether each language's run toolchain was found on `PATH`, last time
+    /// it was checked. Absent means never checked, not "not installed".
+    toolchain_status: std::collections::HashMap<RunLanguage, bool>,
     /// The one outstanding workspace search, if a request is in flight. A new
     /// search cancels and replaces it rather than letting two walks race.
     pending_search: Option<TaskId>,
@@ -315,6 +333,12 @@ impl EditorCore {
             find_open: false,
             pending_git_status: None,
             git_status: None,
+            pending_git_log: None,
+            git_log: None,
+            pending_git_commit: None,
+            git_commit_result: None,
+            pending_toolchain_checks: std::collections::HashMap::new(),
+            toolchain_status: std::collections::HashMap::new(),
             pending_search: None,
             pending_dependency_graph: None,
             dependency_graph: None,
@@ -366,7 +390,7 @@ impl EditorCore {
         Ok(id)
     }
 
-    // --- git status (item 11: read-only status, no graph, no staging) --------
+    // --- git status, history, and commit (item 11) ----------------------------
 
     /// Requests a `git status` for the current workspace root. A bounded,
     /// one-shot subprocess, so it runs as an ordinary `SubsystemId::GIT` task
@@ -410,6 +434,117 @@ impl EditorCore {
         Ok(task)
     }
 
+    /// Requests a bounded `git log` for the current workspace root, most
+    /// recent commits first. Same task shape as `request_git_status`.
+    pub fn request_git_log(&mut self) -> Result<TaskId, ls_scheduler::SubmitError> {
+        let Some(root) = self.workspace.root().map(|c| c.as_path().to_path_buf()) else {
+            return Err(ls_scheduler::SubmitError::ShuttingDown);
+        };
+        let spec = TaskSpec::new(
+            SubsystemId::GIT,
+            self.scheduler.base_priority(SubsystemId::GIT),
+            ResourceClass::Process,
+        )
+        .with_workspace(WorkspaceRef(self.workspace.id().get()));
+
+        let task = self.scheduler.submit(
+            spec,
+            Box::new(move |_cancellation| {
+                let output = ls_platform::command("git")
+                    .args([
+                        "log",
+                        "-n",
+                        "50",
+                        "--date=short",
+                        "--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s%x1f%P",
+                    ])
+                    .current_dir(&root)
+                    .output();
+                match output {
+                    Ok(output) if output.status.success() => {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        TaskOutcome::Completed(TaskProduct::new(git::parse_log(&text)))
+                    }
+                    // No commits yet, not a repository, or git is missing:
+                    // an empty history, the same "not a failure" treatment
+                    // `request_git_status` gives a status that could not be
+                    // produced.
+                    _ => TaskOutcome::Completed(TaskProduct::new(Vec::<git::CommitLogEntry>::new())),
+                }
+            }),
+        )?;
+        self.pending_git_log = Some(task);
+        Ok(task)
+    }
+
+    /// Stages every change (`git add -A`) and commits it with `message` in
+    /// one step -- the panel's only staging model; see the module doc
+    /// comment on `crates/core/src/git.rs`.
+    pub fn request_git_commit(
+        &mut self,
+        message: String,
+    ) -> Result<TaskId, ls_scheduler::SubmitError> {
+        let Some(root) = self.workspace.root().map(|c| c.as_path().to_path_buf()) else {
+            return Err(ls_scheduler::SubmitError::ShuttingDown);
+        };
+        let spec = TaskSpec::new(
+            SubsystemId::GIT,
+            self.scheduler.base_priority(SubsystemId::GIT),
+            ResourceClass::Process,
+        )
+        .with_workspace(WorkspaceRef(self.workspace.id().get()));
+
+        let task = self.scheduler.submit(
+            spec,
+            Box::new(move |_cancellation| {
+                let add = ls_platform::command("git").args(["add", "-A"]).current_dir(&root).output();
+                if !matches!(&add, Ok(output) if output.status.success()) {
+                    let detail = match &add {
+                        Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                        Err(error) => error.to_string(),
+                    };
+                    return TaskOutcome::Completed(TaskProduct::new(GitCommitOutcome {
+                        success: false,
+                        message: if detail.is_empty() {
+                            "git add failed".to_string()
+                        } else {
+                            detail
+                        },
+                    }));
+                }
+                let commit = ls_platform::command("git")
+                    .args(["commit", "-m", &message])
+                    .current_dir(&root)
+                    .output();
+                match commit {
+                    Ok(output) if output.status.success() => {
+                        TaskOutcome::Completed(TaskProduct::new(GitCommitOutcome {
+                            success: true,
+                            message: "Committed".to_string(),
+                        }))
+                    }
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        TaskOutcome::Completed(TaskProduct::new(GitCommitOutcome {
+                            success: false,
+                            message: if stderr.is_empty() {
+                                "git commit failed".to_string()
+                            } else {
+                                stderr
+                            },
+                        }))
+                    }
+                    Err(error) => TaskOutcome::Completed(TaskProduct::new(GitCommitOutcome {
+                        success: false,
+                        message: error.to_string(),
+                    })),
+                }
+            }),
+        )?;
+        self.pending_git_commit = Some(task);
+        Ok(task)
+    }
+
     // --- diagnostics (item 9: LSP) --------------------------------------------
 
     /// Replaces the diagnostics for whichever open document has this path,
@@ -432,6 +567,71 @@ impl EditorCore {
         self.pending_git_status.is_some()
     }
 
+    pub fn git_log(&self) -> Option<&Vec<git::CommitLogEntry>> {
+        self.git_log.as_ref()
+    }
+
+    pub fn is_git_log_pending(&self) -> bool {
+        self.pending_git_log.is_some()
+    }
+
+    pub fn is_git_commit_pending(&self) -> bool {
+        self.pending_git_commit.is_some()
+    }
+
+    /// The most recent commit's outcome, if `pump_completions` has applied
+    /// one that has not been read yet. The shell reads and clears this in
+    /// the same step (`clear_git_commit_result`), so it never re-shows a
+    /// stale result on some later, unrelated refresh.
+    pub fn git_commit_result(&self) -> Option<&GitCommitOutcome> {
+        self.git_commit_result.as_ref()
+    }
+
+    pub fn clear_git_commit_result(&mut self) {
+        self.git_commit_result = None;
+    }
+
+    // --- run (item: compile/run a file, install its toolchain) ---------------
+
+    /// Probes whether `language`'s toolchain is on `PATH`, for the Run
+    /// panel. A bounded, one-shot subprocess -- `<binary> --version` --
+    /// exactly the shape `request_git_status` already runs one of.
+    pub fn request_toolchain_check(
+        &mut self,
+        language: RunLanguage,
+    ) -> Result<TaskId, ls_scheduler::SubmitError> {
+        let spec = TaskSpec::new(
+            SubsystemId::TOOLCHAIN,
+            self.scheduler.base_priority(SubsystemId::TOOLCHAIN),
+            ResourceClass::Process,
+        );
+        let binary = language.check_binary();
+        let task = self.scheduler.submit(
+            spec,
+            Box::new(move |_cancellation| {
+                let installed = ls_platform::command(binary)
+                    .arg("--version")
+                    .output()
+                    .map(|output| output.status.success())
+                    .unwrap_or(false);
+                TaskOutcome::Completed(TaskProduct::new(installed))
+            }),
+        )?;
+        self.pending_toolchain_checks.insert(language, task);
+        Ok(task)
+    }
+
+    /// Whether `language`'s toolchain was found, last time it was checked.
+    /// `None` means never checked yet, not "not installed" -- the Run panel
+    /// shows those two states differently.
+    pub fn toolchain_installed(&self, language: RunLanguage) -> Option<bool> {
+        self.toolchain_status.get(&language).copied()
+    }
+
+    pub fn is_toolchain_check_pending(&self, language: RunLanguage) -> bool {
+        self.pending_toolchain_checks.contains_key(&language)
+    }
+
     // --- workspace search (item 7: recursive text search) --------------------
 
     /// Requests a recursive search under the workspace root. A newer request
@@ -440,6 +640,7 @@ impl EditorCore {
     pub fn request_workspace_search(
         &mut self,
         query: String,
+        options: workspace_search::SearchOptions,
     ) -> Result<TaskId, ls_scheduler::SubmitError> {
         if let Some(previous) = self.pending_search.take() {
             self.scheduler.cancel(previous);
@@ -468,7 +669,7 @@ impl EditorCore {
                 // flight is already searching for the wrong thing. Polling
                 // per file bounds the wasted work at one file rather than
                 // one whole workspace.
-                let result = workspace_search::search_cancellable(&root, &query, &|| {
+                let result = workspace_search::search_with_options(&root, &query, options, &|| {
                     cancellation.is_cancelled()
                 });
                 if result.cancelled || cancellation.is_cancelled() {
@@ -753,6 +954,10 @@ impl EditorCore {
                 applied += self.apply_dependency_graph_completion(completion);
                 continue;
             }
+            if completion.subsystem == SubsystemId::TOOLCHAIN {
+                applied += self.apply_toolchain_completion(completion);
+                continue;
+            }
             if completion.subsystem != SubsystemId::DOCUMENT_IO {
                 // Every subsystem that can complete work has a handler above
                 // or here; anything else is a caller mistake worth seeing
@@ -823,13 +1028,52 @@ impl EditorCore {
     }
 
     fn apply_git_completion(&mut self, completion: ls_scheduler::TaskCompletion) -> usize {
-        if self.pending_git_status != Some(completion.task) {
+        if self.pending_git_status == Some(completion.task) {
+            self.pending_git_status = None;
+            if let CompletionOutcome::Completed(product) = completion.outcome {
+                if let Ok(status) = product.downcast::<GitStatus>() {
+                    self.git_status = Some(*status);
+                    return 1;
+                }
+            }
             return 0;
         }
-        self.pending_git_status = None;
+        if self.pending_git_log == Some(completion.task) {
+            self.pending_git_log = None;
+            if let CompletionOutcome::Completed(product) = completion.outcome {
+                if let Ok(log) = product.downcast::<Vec<git::CommitLogEntry>>() {
+                    self.git_log = Some(*log);
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        if self.pending_git_commit == Some(completion.task) {
+            self.pending_git_commit = None;
+            if let CompletionOutcome::Completed(product) = completion.outcome {
+                if let Ok(outcome) = product.downcast::<GitCommitOutcome>() {
+                    self.git_commit_result = Some(*outcome);
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        0
+    }
+
+    fn apply_toolchain_completion(&mut self, completion: ls_scheduler::TaskCompletion) -> usize {
+        let Some(language) = self
+            .pending_toolchain_checks
+            .iter()
+            .find(|(_, task)| **task == completion.task)
+            .map(|(language, _)| *language)
+        else {
+            return 0;
+        };
+        self.pending_toolchain_checks.remove(&language);
         if let CompletionOutcome::Completed(product) = completion.outcome {
-            if let Ok(status) = product.downcast::<GitStatus>() {
-                self.git_status = Some(*status);
+            if let Ok(installed) = product.downcast::<bool>() {
+                self.toolchain_status.insert(language, *installed);
                 return 1;
             }
         }
@@ -1799,6 +2043,14 @@ impl EditorCore {
             );
         }
         Ok(())
+    }
+
+    /// Writes arbitrary text to the system clipboard, bypassing the active
+    /// document entirely -- what a selection outside any document (the
+    /// terminal's own scrollback, say) needs `copy` cannot give it, since
+    /// `copy` only ever reads a document's own selection.
+    pub fn write_clipboard_text(&mut self, text: &str) -> Result<(), EditorError> {
+        self.clipboard.write_text(text).map_err(EditorError::Clipboard)
     }
 
     pub fn paste_from_clipboard(&mut self) -> Result<(), EditorError> {

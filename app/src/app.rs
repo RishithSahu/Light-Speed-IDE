@@ -72,6 +72,22 @@ const DOUBLE_CLICK_SLOP: f32 = 4.0;
 /// to the typing rather than trailing it.
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// How many terminal commands Up/Down recall can reach, whether typed this
+/// session or loaded back from the permanent transcript/PSReadLine history
+/// when the terminal first spawns (`ensure_terminal_spawned`). Bounded the
+/// same way the permanent transcript is not: this list exists for recall, and
+/// ten thousand commands do not need to sit one Up-press away -- the file
+/// `ls_platform::terminal_log` writes to is where the full record lives.
+const MAX_RECALL_HISTORY: usize = 1000;
+
+/// How long after issuing a `winget uninstall` to re-check whether a
+/// language's toolchain is still on `PATH`. Not a completion signal --
+/// `task_terminal` is a plain piped shell with no exit-code channel back to
+/// the app (see `terminal.rs`'s own module doc) -- just a reasonable wait
+/// long enough for winget's usual uninstall to finish so the Run panel's
+/// "installed" status catches up without the user having to reopen it.
+const TOOLCHAIN_RECHECK_DELAY: Duration = Duration::from_secs(6);
+
 /// Which part of the window input is currently addressed to.
 ///
 /// The shell used to have no answer to this question, and two defects came out
@@ -104,6 +120,8 @@ pub enum InputFocus {
     Find,
     /// Typing a workspace-search query.
     SearchQuery,
+    /// Typing the Source Control panel's commit message.
+    CommitMessage,
     /// A navigable list owns the keyboard: the file tree, search results, or
     /// git status. Arrow keys move the selection, Enter acts on it.
     List,
@@ -161,6 +179,7 @@ pub fn wheel_target(layout: &Layout, focus: InputFocus, x: f32, y: f32) -> Wheel
         InputFocus::Menu
         | InputFocus::Prompt
         | InputFocus::SearchQuery
+        | InputFocus::CommitMessage
         | InputFocus::Terminal
         | InputFocus::CommandPalette => WheelTarget::Blocked,
         InputFocus::List => WheelTarget::Chrome,
@@ -192,6 +211,8 @@ pub fn wheel_target(layout: &Layout, focus: InputFocus, x: f32, y: f32) -> Wheel
 fn append_tree_level(
     core: &EditorCore,
     expanded: &std::collections::HashSet<PathBuf>,
+    ignore: &ls_core::gitignore::IgnoreSet,
+    root: &Path,
     dir: &Path,
     depth: usize,
     rows: &mut Vec<ListRow>,
@@ -201,6 +222,15 @@ fn append_tree_level(
     match core.workspace().enumerate_children(dir) {
         Ok(entries) => {
             for entry in entries {
+                // `.gitignore`-aware: `bin/`, `obj/`, `node_modules/`, build
+                // artifacts and the rest of what a project's own ignore
+                // file already says is noise never reach a row at all,
+                // rather than being drawn and then somehow dimmed.
+                let relative = entry.path.strip_prefix(root).unwrap_or(&entry.path);
+                let is_dir = entry.kind == ls_core::EntryKind::Directory;
+                if ignore.is_ignored(relative, is_dir) {
+                    continue;
+                }
                 match entry.kind {
                     ls_core::EntryKind::Directory => {
                         let is_expanded = expanded.contains(&entry.path);
@@ -218,9 +248,11 @@ fn append_tree_level(
                             ),
                             icon_color: None,
                             kind: SidebarRowKind::Directory,
+                            highlight: None,
+                            icon_spaces: 0,
                         });
                         if is_expanded {
-                            append_tree_level(core, expanded, &entry.path, depth + 1, rows);
+                            append_tree_level(core, expanded, ignore, root, &entry.path, depth + 1, rows);
                         }
                     }
                     _ => {
@@ -233,6 +265,8 @@ fn append_tree_level(
                             icon: Some(file_icon.into()),
                             icon_color: Some(file_icon.color()),
                             kind: SidebarRowKind::File,
+                            highlight: None,
+                            icon_spaces: 0,
                         });
                     }
                 }
@@ -279,6 +313,7 @@ pub fn derive_focus(
     list_open: bool,
     terminal_visible: bool,
     command_palette_open: bool,
+    commit_message_open: bool,
 ) -> InputFocus {
     if prompt_open {
         InputFocus::Prompt
@@ -300,6 +335,12 @@ pub fn derive_focus(
     // only stops it from being *re*-entered against the user's own click.
     } else if current == InputFocus::SearchQuery && search_query_open {
         InputFocus::SearchQuery
+    // Same resting treatment for the commit message field, keyed on the
+    // Source Control panel still being the active list rather than on the
+    // message text itself (an empty draft is still a draft you were typing
+    // into, not a reason to be kicked back to the editor).
+    } else if current == InputFocus::CommitMessage && commit_message_open {
+        InputFocus::CommitMessage
     } else if current == InputFocus::List && list_open {
         InputFocus::List
     } else if current == InputFocus::Terminal && terminal_visible {
@@ -399,9 +440,11 @@ pub fn navigate_terminal_history(
 /// What a click on a sidebar row acts on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SidebarClick {
-    /// The Search panel's own header, which is a text field rather than a
-    /// caption: the click belongs to the field, not to the list.
-    SearchField,
+    /// A panel whose own header is interactive (Search's query/replace
+    /// fields and toggles, Source Control's commit-message field and
+    /// button) rather than a plain caption: the click belongs to whichever
+    /// control is in it, not to the list.
+    HeaderField,
     /// List entry `0`-based `index`, below the header.
     Row(usize),
     /// An ordinary panel's title line. Nothing to act on.
@@ -409,21 +452,114 @@ pub enum SidebarClick {
 }
 
 /// Resolves a sidebar click by row, given how many header lines the panel
-/// has and whether it is the Search panel.
+/// has and whether that header is an interactive field block (Search or
+/// Source Control) rather than a plain title line.
 ///
 /// A pure function for the same reason `wheel_target` is, and for a bug worth
-/// pinning down: the Search panel's header is *interactive*, which no other
-/// panel's is. Treating "the click is in the header" as "the click does
+/// pinning down: an interactive header is interactive, which a plain title
+/// line is not. Treating "the click is in the header" as "the click does
 /// nothing to the list, so claim list focus and move on" is what made
 /// clicking the search box silently take the keyboard away from it.
-pub fn sidebar_click(row: usize, header_lines: usize, is_search_panel: bool) -> SidebarClick {
+pub fn sidebar_click(row: usize, header_lines: usize, has_field_header: bool) -> SidebarClick {
     if row >= header_lines {
         return SidebarClick::Row(row - header_lines);
     }
-    if is_search_panel {
-        SidebarClick::SearchField
+    if has_field_header {
+        SidebarClick::HeaderField
     } else {
         SidebarClick::Header
+    }
+}
+
+/// Which specific control inside the Search panel's own three-row header a
+/// click landed on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SearchHeaderClick {
+    /// Index into `[Refresh, ClearAll, NewFile, CollapseAll]` on row 0.
+    TitleIcon(usize),
+    /// Index into `[CaseSensitive, WholeWord, Regex]` on row 1.
+    ToggleIcon(usize),
+    /// The trailing "..." on row 2.
+    ReplaceIcon,
+    /// Anywhere else on row 1: the query text itself.
+    QueryField,
+    /// Anywhere else on row 2: the replace text itself.
+    ReplaceField,
+}
+
+/// Resolves a click at `x` on header row `row` (`0`, `1` or `2`, matching
+/// `push_search_header`'s three rows) to whichever control sits there.
+///
+/// Icons are right-aligned in a strip `count * icon_width` wide, anchored to
+/// the sidebar's own right edge -- the same right-alignment
+/// `push_search_header` draws them with, just computed directly from pixel
+/// widths here instead of rounded through a whole number of monospace
+/// spaces. The two will not disagree by more than a fraction of one
+/// character, which a click is wide enough to forgive.
+///
+/// A pure function for the reason every other row/column resolver in this
+/// module is: the geometry is worth asserting on directly, and getting an
+/// icon's hit box one pixel short of where it is actually drawn is exactly
+/// the kind of bug that is invisible until someone tries to click the edge
+/// of it.
+pub fn search_header_click(
+    row: usize,
+    x: f32,
+    sidebar_right: f32,
+    icon_width: f32,
+) -> SearchHeaderClick {
+    let icon_width = icon_width.max(1.0);
+    let icons_in_row: usize = match row {
+        0 => 4,
+        1 => 3,
+        _ => 1,
+    };
+    let strip_left = sidebar_right - icons_in_row as f32 * icon_width;
+    if x >= strip_left {
+        let index = (((x - strip_left) / icon_width) as usize).min(icons_in_row - 1);
+        return match row {
+            0 => SearchHeaderClick::TitleIcon(index),
+            1 => SearchHeaderClick::ToggleIcon(index),
+            _ => SearchHeaderClick::ReplaceIcon,
+        };
+    }
+    if row == 2 {
+        SearchHeaderClick::ReplaceField
+    } else {
+        SearchHeaderClick::QueryField
+    }
+}
+
+/// Which specific control inside the Source Control panel's own three-row
+/// header (title + Refresh, the commit-message field, the Commit button) a
+/// click landed on. Mirrors `SearchHeaderClick`/`search_header_click`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum GitHeaderClick {
+    /// The Refresh icon on row 0.
+    Refresh,
+    /// Anywhere else on row 0: the "SOURCE CONTROL" caption itself.
+    Title,
+    /// Row 1: the commit-message text.
+    MessageField,
+    /// Row 2, in full: there is only the one control on it.
+    CommitButton,
+}
+
+/// Resolves a click at `x` on header row `row` (`0`, `1` or `2`, matching
+/// `push_git_header`'s three rows) to whichever control sits there.
+pub fn git_header_click(row: usize, x: f32, sidebar_right: f32, icon_width: f32) -> GitHeaderClick {
+    let icon_width = icon_width.max(1.0);
+    match row {
+        0 => {
+            let strip_left = sidebar_right - icon_width;
+            if x >= strip_left {
+                GitHeaderClick::Refresh
+            } else {
+                GitHeaderClick::Title
+            }
+        }
+        1 => GitHeaderClick::MessageField,
+        _ => GitHeaderClick::CommitButton,
     }
 }
 
@@ -442,6 +578,27 @@ pub fn search_result_is_current(result_query: &str, typed: Option<&str>) -> bool
         Some(query) => result_query == query,
         None => true,
     }
+}
+
+/// Splices `replacement` over the first match of `query` in `line` (which
+/// may carry its own trailing newline; a match never reaches into it), or
+/// `None` if `query` was not found under `options` -- Replace All's whole
+/// job, one line at a time, reusing exactly the rule
+/// `ls_core::workspace_search::find_first_match` already uses to say a line
+/// counts as a hit, so a line the panel found is never one this refuses to
+/// touch.
+pub fn replace_first_match(
+    line: &str,
+    options: &ls_core::workspace_search::SearchOptions,
+    query: &str,
+    replacement: &str,
+) -> Option<String> {
+    let (start, end) = ls_core::workspace_search::find_first_match(line, query, *options)?;
+    let mut result = String::with_capacity(line.len() - (end - start) + replacement.len());
+    result.push_str(&line[..start]);
+    result.push_str(replacement);
+    result.push_str(&line[end..]);
+    Some(result)
 }
 
 /// Whether an incoming diagnostics version should replace what is applied.
@@ -505,6 +662,13 @@ enum ListAction {
     /// open -- a real tree, where several branches can be open across the
     /// whole workspace at once, not a single-directory drill-down.
     ToggleDirectory(PathBuf),
+    /// Installs this language's toolchain via winget, or -- if it is already
+    /// installed -- runs the active file with it. Shown by the Run panel.
+    InstallOrRunToolchain(ls_core::RunLanguage),
+    /// Removes this language's toolchain via `winget uninstall`, entirely in
+    /// `task_terminal` -- the row underneath an installed language's own row
+    /// in the Run panel.
+    UninstallToolchain(ls_core::RunLanguage),
 }
 
 /// One row of a navigable list panel. `action: None` marks a row that is
@@ -530,6 +694,19 @@ struct ListRow {
     /// kind instead.
     icon_color: Option<crate::theme::Color>,
     kind: crate::theme::SidebarRowKind,
+    /// A byte range within `label` to draw in the highlight colour instead
+    /// of the row's own -- what marks the word a search actually matched,
+    /// rather than just naming the line it is on.
+    highlight: Option<(usize, usize)>,
+    /// Extra icon-width blanks to reserve before this row's own icon --
+    /// zero for every ordinary row. The Source Control panel's commit graph
+    /// is the one user: a commit sitting in lane N needs N icon-widths of
+    /// clearance so the label never falls under a lane's dot or connecting
+    /// line, and only an icon-width unit (matching `git_graph_rows`' own
+    /// lane spacing pixel for pixel) lines the two up exactly -- a
+    /// character-space approximation (`depth`) was tried first and left the
+    /// text overlapping the graph, since a digit is narrower than an icon.
+    icon_spaces: usize,
 }
 
 impl ListRow {
@@ -543,6 +720,8 @@ impl ListRow {
             icon: None,
             icon_color: None,
             kind: crate::theme::SidebarRowKind::Info,
+            highlight: None,
+            icon_spaces: 0,
         }
     }
 
@@ -557,6 +736,96 @@ impl ListRow {
     }
 }
 
+/// A small fixed palette of distinct, readable-on-dark colors a commit's
+/// graph dot is picked from, keyed off its own hash. With no parent/child
+/// edges drawn (see the doc comment where this is called), color is the only
+/// thing that can make two commits on the same lineage read as related at a
+/// glance -- this at least makes that color deterministic and repeatable
+/// across refreshes, rather than reassigned arbitrarily every time the log
+/// is re-fetched.
+fn commit_graph_color(hash: &str) -> crate::theme::Color {
+    use crate::theme::Color;
+    const PALETTE: [Color; 6] = [
+        Color::rgb(0x4f, 0xc1, 0xff),
+        Color::rgb(0x89, 0xe0, 0x51),
+        Color::rgb(0xf1, 0xe0, 0x5a),
+        Color::rgb(0xf3, 0x4b, 0x7d),
+        Color::rgb(0xa9, 0x7b, 0xff),
+        Color::rgb(0xff, 0xb1, 0x3b),
+    ];
+    // FNV-1a: short, dependency-free, and stable across runs -- all that is
+    // needed here, since this only has to spread commits across a handful of
+    // buckets, not resist any kind of adversarial input.
+    let mut hash_value: u64 = 0xcbf29ce484222325;
+    for byte in hash.as_bytes() {
+        hash_value ^= *byte as u64;
+        hash_value = hash_value.wrapping_mul(0x100000001b3);
+    }
+    PALETTE[(hash_value as usize) % PALETTE.len()]
+}
+
+/// Pushes a sidebar row's label onto `rich`, truncating exactly the way
+/// `sidebar_rows`'s own `truncate` closure does, and drawing whatever part
+/// of `highlight` (a *character* range within `label`) survives that
+/// truncation in `match_color` rather than `base_color`.
+///
+/// A free function, not a closure captured alongside `truncate`, because it
+/// is worth asserting on directly: getting the highlight's clipping wrong at
+/// the truncation boundary is exactly the kind of one-character-off bug that
+/// is easy to write and easy to miss by eye.
+/// Pushes `label` (truncated to `max_chars`, `highlight` marked if given) and
+/// returns the *byte* range the highlighted run landed at within the row's
+/// rendered text -- relative to wherever `rich.text` already stood when this
+/// was called, so the caller can turn it into an absolute row-relative byte
+/// range by adding however many bytes it had already pushed for this row's
+/// own prefix (indentation, chevron, icon). That byte range is what
+/// `Renderer::highlight_spans` needs to look up the match's real, shaped
+/// pixel position for `sidebar_search_highlights` -- a background box over
+/// the match, not the color-only treatment this used before.
+fn push_row_label(
+    rich: &mut crate::text::RichText,
+    label: &str,
+    highlight: Option<(usize, usize)>,
+    max_chars: usize,
+    base_color: crate::theme::Color,
+) -> Option<(usize, usize)> {
+    let total = label.chars().count();
+    let (visible, truncated) =
+        if total <= max_chars { (total, false) } else { (max_chars.saturating_sub(1), true) };
+
+    let slice = |from: usize, to: usize| -> String {
+        if from >= to {
+            return String::new();
+        }
+        label.chars().skip(from).take(to - from).collect()
+    };
+
+    let bounds = highlight
+        .map(|(start, len)| (start.min(visible), (start + len).min(visible)))
+        .filter(|(start, end)| start < end);
+
+    let byte_range = match bounds {
+        Some((start, end)) => {
+            let before = slice(0, start);
+            let matched = slice(start, end);
+            let start_byte = rich.text.len() + before.len();
+            rich.colored(&before, base_color);
+            rich.colored(&matched, base_color);
+            let end_byte = start_byte + matched.len();
+            rich.colored(&slice(end, visible), base_color);
+            Some((start_byte, end_byte))
+        }
+        None => {
+            rich.colored(&slice(0, visible), base_color);
+            None
+        }
+    };
+    if truncated {
+        rich.colored("\u{2026}", base_color);
+    }
+    byte_range
+}
+
 /// Which navigable list is on screen. Items 6, 7 and 11 (file tree, workspace
 /// search, git status) share one mechanism rather than three: each is "a list
 /// of rows, pick one", so they share the input handling and the overlay
@@ -566,11 +835,12 @@ enum ListKind {
     FileTree,
     SearchResults,
     GitStatus,
+    Run,
 }
 
 /// The persistent activity bar's icons, top to bottom -- Explorer, Search,
-/// Source Control, Extensions, Debug, matching Lapce's own default order,
-/// then Dependencies, which is ours.
+/// Source Control, Extensions, Run, matching Lapce's own default order for
+/// the first four, then Dependencies, which is ours.
 const ACTIVITY_ICONS: [crate::icons::Icon; 6] = [
     crate::icons::Icon::Files,
     crate::icons::Icon::Search,
@@ -580,13 +850,17 @@ const ACTIVITY_ICONS: [crate::icons::Icon; 6] = [
     crate::icons::Icon::TypeHierarchy,
 ];
 
-/// Which activity-bar row is wired to a real action. `Extensions` and
-/// `Debug` have no subsystem behind them -- they render dimmed and inert,
-/// present for layout fidelity rather than faking a feature that does not
-/// exist.
+/// Which activity-bar row is wired to a real action. `Extensions` has no
+/// subsystem behind it -- it renders dimmed and inert, present for layout
+/// fidelity rather than faking a feature that does not exist. `Debug`'s
+/// glyph is unchanged (there is no dedicated "run" icon in the bundled
+/// codicon set), but the row it occupies now opens the Run panel: searching
+/// for and installing a language's toolchain, and running the active file
+/// once one is on `PATH`.
 const ACTIVITY_EXPLORER: usize = 0;
 const ACTIVITY_SEARCH: usize = 1;
 const ACTIVITY_SOURCE_CONTROL: usize = 2;
+const ACTIVITY_RUN: usize = 4;
 /// The dependency view. Its scan is expensive enough to be worth not doing
 /// on startup, so it runs on this click and nowhere else.
 const ACTIVITY_DEPENDENCIES: usize = 5;
@@ -600,6 +874,16 @@ pub enum SettingsScope {
     Workspace,
 }
 
+/// What a press or hover in the dependency graph landed on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DependencyHit {
+    Node(usize),
+    /// An edge, by index into `Scene::edges`. Its own colour, thickness and
+    /// hit strip are all separate from a node's, so this is never confused
+    /// with `Node` even though both are a bare index.
+    Edge(usize),
+}
+
 /// A press being held over the dependency graph.
 #[derive(Copy, Clone, Debug)]
 struct DependencyPress {
@@ -608,8 +892,8 @@ struct DependencyPress {
     origin: (f32, f32),
     /// Where the pointer has reached, so each motion pans by its own step.
     at: (f32, f32),
-    /// The node the press started on, if any.
-    node: Option<usize>,
+    /// What the press started on, if anything.
+    hit: Option<DependencyHit>,
 }
 
 /// How much one notch of the wheel zooms the dependency graph. Chosen so a
@@ -638,6 +922,11 @@ pub enum UserEvent {
     /// scrollback. Carries no data itself -- the bytes live in the shared
     /// buffer `Terminal` owns, the same split the completion waker uses.
     TerminalOutput,
+    /// `task_terminal`'s child process produced output; drain it into
+    /// `task_output`. Kept separate from `TerminalOutput` so the two shells
+    /// never share a drain path and cannot cross-contaminate each other's
+    /// scrollback.
+    TaskTerminalOutput,
     /// The LSP server published diagnostics; drain and apply them. Same
     /// split as the two events above: the reader thread only appends to a
     /// shared buffer and wakes the loop.
@@ -722,6 +1011,11 @@ pub struct LightSpeed {
     settings_screen: crate::settings_ui::Screen,
     /// Whether the dependency view has taken over the editor area.
     dependency_view: bool,
+    /// Whether the active document's rendered Markdown form has taken over
+    /// the editor area (`view.toggle_markdown_preview`). Has no visible
+    /// effect on a document that is not Markdown -- see
+    /// `toggle_markdown_preview`'s own doc comment.
+    markdown_preview: bool,
     /// The settled simulation: who imports whom and where each file rests.
     /// Expensive to produce and independent of the window, so this is what
     /// is cached on disk between sessions.
@@ -816,6 +1110,12 @@ pub struct LightSpeed {
     /// Where the file tree is rooted: the workspace root, or the active
     /// document's directory if no workspace has been opened.
     file_tree_root: Option<PathBuf>,
+    /// `<file_tree_root>/.gitignore`, parsed once when the workspace opens
+    /// rather than re-read on every `list_rows()` call -- loading it is the
+    /// one part of showing the explorer that touches disk beyond the
+    /// directory listing itself. Empty (matches nothing but `.git`) when no
+    /// workspace has been opened yet, or its `.gitignore` does not exist.
+    gitignore: ls_core::gitignore::IgnoreSet,
     /// Which directories are expanded. A real tree, not a single-directory
     /// drill-down: several branches across the workspace can be open at
     /// once, exactly as many are collapsed by default (only the root's
@@ -851,9 +1151,41 @@ pub struct LightSpeed {
     bottom_panel_grip_hovered: bool,
     /// Which activity-bar row the pointer is over, if any.
     activity_hovered: Option<usize>,
+    /// Hover state for the Settings cell pinned to the bottom of the
+    /// activity bar -- its own flag rather than an index into
+    /// `ACTIVITY_ICONS`, since it is not part of that list.
+    activity_settings_hovered: bool,
+    /// Whether the pointer is over the title bar's Play button
+    /// (`layout.title_actions`) -- its own flag for the same reason
+    /// `activity_settings_hovered` is one.
+    title_actions_hovered: bool,
     /// The workspace-search query as it is being typed, before Enter submits
     /// it. `None` when the search bar is not open.
     search_query_input: Option<String>,
+    /// The search panel's own toggles -- case-sensitive, whole-word, regex
+    /// -- carried as the same [`ls_core::workspace_search::SearchOptions`]
+    /// the search itself takes, so there is exactly one place that decides
+    /// what these three bits mean.
+    search_options: ls_core::workspace_search::SearchOptions,
+    /// The replace field's text, typed into the same way the query field is.
+    search_replace_input: String,
+    /// While `self.focus` is `InputFocus::SearchQuery`, which of the two
+    /// fields keystrokes actually land in. Kept separate from `focus` itself
+    /// so neither field needed its own `InputFocus` variant, and every place
+    /// that already asks "does the search panel have the keyboard" (wheel
+    /// routing, focus derivation, the palette shortcut) stays exactly as it
+    /// was.
+    search_replace_focused: bool,
+    /// Whether results are grouped by file with only the file name and a
+    /// count shown, or expanded to every matching line -- the CollapseAll
+    /// icon's toggle.
+    search_collapsed: bool,
+    /// The Source Control panel's commit-message field, typed into while
+    /// `self.focus` is `InputFocus::CommitMessage`. Unlike the search
+    /// query/replace pair this gets its own `InputFocus` variant rather than
+    /// a shared-field bool, since it does not share a header with any other
+    /// text field to disambiguate between.
+    commit_message_input: String,
     /// A line to jump to once the file a list row just requested finishes
     /// opening (it may still be loading asynchronously).
     pending_jump: Option<(PathBuf, usize)>,
@@ -879,6 +1211,20 @@ pub struct LightSpeed {
     /// one is a bounded, in-memory list meant for recall inside it, the same
     /// distinction a real shell draws between its history file and what
     /// pressing Up walks through in the current session.
+    /// Text selection within the terminal's *own* rows (its output log and
+    /// input line -- `Region::BottomPanel`), entirely separate from a
+    /// document's selection: `(anchor, current)`, each a `(row, byte)`
+    /// resolved against that frame's `bottom_panel_rows()` by
+    /// `Renderer::terminal_position_at_point`. Neither endpoint is ordered
+    /// relative to the other -- `terminal_selected_text` sorts them out --
+    /// the same "anchor and a moving point" shape a document's own
+    /// mouse-drag selection already has.
+    terminal_selection: Option<((usize, usize), (usize, usize))>,
+    /// Whether the primary button is down and dragging inside the terminal
+    /// panel -- `terminal_selection`'s "current" endpoint moves with the
+    /// pointer only while this is true, the same gate `dragging_selection`
+    /// is for the document.
+    dragging_terminal_selection: bool,
     terminal_command_history: Vec<String>,
     /// Which entry of `terminal_command_history` Up/Down has navigated to,
     /// counting from the oldest. `None` means the input line is live text
@@ -888,6 +1234,24 @@ pub struct LightSpeed {
     /// What was being typed before the first Up press, restored if Down
     /// walks back past the newest history entry to a live line again.
     terminal_history_draft: String,
+    /// A shell dedicated to app-initiated commands (Run/Install from the Run
+    /// panel), entirely separate from `terminal`: the user's own terminal is
+    /// theirs to type into, and a `winget install` or `cargo run` landing in
+    /// the middle of a command they were composing there -- or clearing a
+    /// scrollback they were reading -- is not acceptable just because the
+    /// editor also wanted a shell. Spawned lazily, on the first Run/Install,
+    /// and never shown as a panel of its own; its output surfaces in the Run
+    /// panel instead (`task_output`).
+    task_terminal: Option<crate::terminal::Terminal>,
+    /// Rolling output from `task_terminal`, tail-capped the same way
+    /// `terminal_scrollback` is. Rendered as extra rows at the bottom of the
+    /// Run panel while a run or install is in flight.
+    task_output: String,
+    /// Languages `uninstall_toolchain` has asked winget to remove, and when
+    /// to re-check whether they are still on `PATH` -- `about_to_wait`
+    /// drains due entries every tick, the same "a loop concern, not a frame
+    /// concern" reasoning the caret's own blink timer follows.
+    pending_toolchain_rechecks: Vec<(ls_core::RunLanguage, Instant)>,
     /// The running language servers, one per language, started on demand.
     /// Previously a single shared client, which meant the first recognized
     /// document's server received every later document too, whatever
@@ -981,6 +1345,7 @@ impl LightSpeed {
             settings_search_focused: false,
             settings_screen: crate::settings_ui::Screen::default(),
             dependency_view: false,
+            markdown_preview: false,
             dependency_settled: None,
             dependency_scene: None,
             dependency_view_at: crate::depgraph::View::default(),
@@ -1017,6 +1382,7 @@ impl LightSpeed {
             loading_tab_started: HashMap::new(),
             active_list: None,
             file_tree_root: None,
+            gitignore: ls_core::gitignore::IgnoreSet::default(),
             expanded_dirs: std::collections::HashSet::new(),
             list_selected: 0,
             sidebar_width: crate::layout::SIDEBAR_WIDTH,
@@ -1028,7 +1394,14 @@ impl LightSpeed {
             dragging_bottom_panel: false,
             bottom_panel_grip_hovered: false,
             activity_hovered: None,
+            activity_settings_hovered: false,
+            title_actions_hovered: false,
             search_query_input: None,
+            search_options: ls_core::workspace_search::SearchOptions::default(),
+            search_replace_input: String::new(),
+            search_replace_focused: false,
+            search_collapsed: false,
+            commit_message_input: String::new(),
             pending_jump: None,
             terminal: None,
             terminal_visible: false,
@@ -1036,9 +1409,14 @@ impl LightSpeed {
             terminal_scroll_lines: 0,
             terminal_input: String::new(),
             terminal_cursor: 0,
+            terminal_selection: None,
+            dragging_terminal_selection: false,
             terminal_command_history: Vec::new(),
             terminal_history_index: None,
             terminal_history_draft: String::new(),
+            task_terminal: None,
+            task_output: String::new(),
+            pending_toolchain_rechecks: Vec::new(),
             lsp: crate::lsp::LspManager::default(),
             lsp_opened: std::collections::HashSet::new(),
             lsp_last_persistence: HashMap::new(),
@@ -1168,6 +1546,19 @@ impl LightSpeed {
         // its grace-period clock has done its job.
         let core = &self.core;
         self.loading_tab_started.retain(|id, _| core.is_loading(*id));
+
+        // A finished commit refreshes the status and history lists it just
+        // changed, and surfaces success or failure the same way a save
+        // does -- read once and cleared immediately, so this never re-fires
+        // for the same commit on a later, unrelated completion drain.
+        if let Some(outcome) = self.core.git_commit_result() {
+            let severity = if outcome.success { Severity::Success } else { Severity::Error };
+            self.set_status(outcome.message.clone(), severity);
+            self.core.clear_git_commit_result();
+            let _ = self.core.request_git_status();
+            let _ = self.core.request_git_log();
+        }
+
         self.after_state_change();
     }
 
@@ -1284,6 +1675,10 @@ impl LightSpeed {
                     self.toggle_dependency_view(active);
                 }
                 ShellRequest::ToggleTerminal => self.toggle_terminal(),
+                ShellRequest::ZoomIn => self.adjust_font_size(1),
+                ShellRequest::ZoomOut => self.adjust_font_size(-1),
+                ShellRequest::ResetZoom => self.reset_font_size(),
+                ShellRequest::ToggleMarkdownPreview => self.toggle_markdown_preview(),
                 ShellRequest::ToggleStatusBar => {
                     self.show_status_bar = !self.show_status_bar;
                 }
@@ -1580,7 +1975,7 @@ impl LightSpeed {
     /// count instead of the document's line count.
     fn scroll_sidebar_by_pixels(&mut self, dy: f32) {
         let Some(layout) = self.last_layout else { return };
-        let sidebar_rich = self.sidebar_rows(&layout);
+        let (sidebar_rich, _) = self.sidebar_rows(&layout);
         let total_height =
             (sidebar_rich.text.matches('\n').count() + 1) as f32 * layout.metrics.line_height;
         let max_scroll = (total_height - layout.sidebar.height).max(0.0);
@@ -1660,6 +2055,15 @@ impl LightSpeed {
             return;
         }
 
+        // The title bar's Play button -- decorative until now, per its own
+        // doc comment on `title_right_rich` ("Just Run now"). Runs the
+        // active file's language, installing nothing on its own: that is
+        // what the Run panel (the repurposed Debug activity icon) is for.
+        if layout.title_actions.contains(x, y) {
+            self.run_current_file();
+            return;
+        }
+
         // A second click in the same place selects the word under it; a
         // third selects the line. A fourth stays at "line", rather than
         // growing a click count nothing consumes.
@@ -1709,16 +2113,40 @@ impl LightSpeed {
 
         if layout.bottom_panel_visible && layout.bottom_panel.contains(x, y) {
             self.focus_terminal();
+            if let Some(renderer) = self.renderer.as_ref() {
+                let point = renderer.terminal_position_at_point(&layout, x, y);
+                self.terminal_selection = Some((point, point));
+                self.dragging_terminal_selection = true;
+            }
             return;
         }
 
-        if layout.title_actions.contains(x, y) {
-            // The right-hand cluster is Run and then the gear. Only the gear
-            // does anything today, and it is the second of the two.
-            if x >= layout.title_actions.x + layout.title_actions.width / 2.0 {
-                self.toggle_settings();
-                return;
+        if layout.activity_settings.contains(x, y) {
+            self.toggle_settings();
+            return;
+        }
+
+        if layout.tab_nav.contains(x, y) {
+            // Left half is Previous, right half is Next -- the same
+            // left-icon/right-icon split every other two-icon cluster in
+            // this row uses.
+            let forward = x >= layout.tab_nav.x + layout.tab_nav.width / 2.0;
+            self.activate_adjacent_tab(forward);
+            return;
+        }
+
+        if layout.tab_actions.contains(x, y) {
+            // Right half (Close) is wired to the same "close every tab with
+            // no unsaved changes" command Ctrl+Shift+W already runs -- a
+            // bulk close that never needs a dirty-file prompt of its own.
+            // Left half (Split) stays inert: this editor has no split-pane
+            // view to open, and a button that looks like it does something
+            // it does not would be worse than one that plainly does nothing,
+            // the same call already made for the Extensions activity icon.
+            if x >= layout.tab_actions.x + layout.tab_actions.width / 2.0 {
+                self.run_command("file.close_all_clean_tabs", CommandArgs::None);
             }
+            return;
         }
 
         if layout.tab_bar.contains(x, y) {
@@ -1746,14 +2174,20 @@ impl LightSpeed {
             let row = ((y - layout.sidebar.y + self.sidebar_scroll_y) / layout.metrics.line_height)
                 as usize;
 
-            match sidebar_click(row, header_lines, self.showing_search_panel()) {
-                // The Search panel's header is a text field, not a caption:
-                // clicking it has to put the keyboard *into* it. Claiming
-                // list focus here instead is exactly what made clicking the
-                // search box appear to do nothing -- the panel was open, the
-                // caret was drawn, and every keystroke went to the results.
-                SidebarClick::SearchField => {
-                    self.focus_search_field();
+            let field_header = self.showing_search_panel() || self.showing_git_panel();
+            match sidebar_click(row, header_lines, field_header) {
+                // An interactive header is a set of controls, not a caption:
+                // clicking it has to put the keyboard *into* whichever field
+                // it landed on. Claiming list focus here instead is exactly
+                // what made clicking the search box appear to do nothing --
+                // the panel was open, the caret was drawn, and every
+                // keystroke went to the results.
+                SidebarClick::HeaderField => {
+                    if self.showing_search_panel() {
+                        self.click_search_header(row, x, &layout);
+                    } else {
+                        self.click_git_header(row, x, &layout);
+                    }
                 }
                 SidebarClick::Header => {
                     self.focus_list();
@@ -1771,6 +2205,15 @@ impl LightSpeed {
                     }
                 }
             }
+            return;
+        }
+
+        if layout.text.contains(x, y) && self.modifiers.control_key() {
+            // Ctrl+Click: go to definition, the same gesture VS Code and
+            // every JetBrains IDE use -- checked ahead of the plain-click
+            // path below, so it replaces cursor placement rather than
+            // running alongside it.
+            self.go_to_definition_at(x, y, &layout);
             return;
         }
 
@@ -1848,6 +2291,18 @@ impl LightSpeed {
         };
         if activity_hovered != self.activity_hovered {
             self.activity_hovered = activity_hovered;
+            self.request_redraw();
+        }
+
+        let activity_settings_hovered = !any_grip_hovered && layout.activity_settings.contains(x, y);
+        if activity_settings_hovered != self.activity_settings_hovered {
+            self.activity_settings_hovered = activity_settings_hovered;
+            self.request_redraw();
+        }
+
+        let title_actions_hovered = !any_grip_hovered && layout.title_actions.contains(x, y);
+        if title_actions_hovered != self.title_actions_hovered {
+            self.title_actions_hovered = title_actions_hovered;
             self.request_redraw();
         }
     }
@@ -2123,6 +2578,7 @@ impl LightSpeed {
             self.active_list.is_some(),
             self.terminal_visible,
             self.command_palette_open,
+            self.active_list == Some(ListKind::GitStatus),
         );
     }
 
@@ -2217,6 +2673,21 @@ impl LightSpeed {
         }
     }
 
+    /// Activates the tab before or after the current one, in tab-bar order,
+    /// wrapping past either end -- the tab row's own Previous/Next icons
+    /// (`layout.tab_nav`).
+    fn activate_adjacent_tab(&mut self, forward: bool) {
+        let tabs = self.core.tabs();
+        if tabs.len() < 2 {
+            return;
+        }
+        let Some(active) = self.core.active() else { return };
+        let Some(index) = tabs.iter().position(|&id| id == active) else { return };
+        let next_index = if forward { (index + 1) % tabs.len() } else { (index + tabs.len() - 1) % tabs.len() };
+        let next_id = tabs[next_index];
+        self.activate_tab(next_id);
+    }
+
     /// Makes the caret solid and pushes the next blink out.
     ///
     /// Typing and moving should never blink mid-gesture: the caret is where the
@@ -2308,6 +2779,8 @@ impl LightSpeed {
                             icon: Some(file_icon.into()),
                             icon_color: Some(file_icon.color()),
                             kind: SidebarRowKind::File,
+                            highlight: None,
+                            icon_spaces: 0,
                         }
                         .with_kind(if tab.active {
                             SidebarRowKind::Directory
@@ -2332,41 +2805,200 @@ impl LightSpeed {
                 }
                 rows
             }
-            Some(ListKind::GitStatus) => match self.core.git_status() {
-                Some(status) if status.is_clean() => {
-                    vec![ListRow::message("Working tree clean")]
+            Some(ListKind::GitStatus) => {
+                let mut rows = match self.core.git_status() {
+                    Some(status) if status.is_clean() => {
+                        vec![ListRow::message("Working tree clean")]
+                    }
+                    Some(status) => status
+                        .files
+                        .iter()
+                        .map(|file| {
+                            let full = root.as_ref().map(|r| r.join(&file.path));
+                            let file_icon =
+                                crate::icons::icon_for_file(&file.path.display().to_string());
+                            let mut row = ListRow {
+                                label: format!(
+                                    "{}{}",
+                                    file.path.display(),
+                                    if file.staged { "  (staged)" } else { "" }
+                                ),
+                                action: None,
+                                depth: 0,
+                                chevron: None,
+                                icon: Some(file_icon.into()),
+                                icon_color: Some(file_icon.color()),
+                                kind: SidebarRowKind::File,
+                                highlight: None,
+                                icon_spaces: 0,
+                            };
+                            row.action = full.map(ListAction::OpenFile);
+                            row
+                        })
+                        .collect(),
+                    None if self.core.is_git_status_pending() => {
+                        vec![ListRow::message("Checking git status...")]
+                    }
+                    None => {
+                        vec![ListRow::message("Not a git repository, or git is not installed")]
+                    }
+                };
+                // A read-only history list below the Changes list, the way
+                // VS Code's Source Control Graph view puts one under its own
+                // Changes. `compose.rs` draws the actual graph -- real
+                // branch/merge lanes (`ls_core::commit_graph::lanes`), not a
+                // single straight line -- as quads positioned by lane
+                // (`git_graph_rows`), so this loop leaves each row's own
+                // icon empty and instead reserves one icon-width blank per
+                // lane the graph actually uses (`icon_spaces`), wide enough
+                // that the message column stays clear of every lane's dot
+                // and connecting line -- pixel for pixel, since both this
+                // and `git_graph_rows`' own lane spacing are the same
+                // `layout.metrics.icon_width` unit. The commit message leads
+                // the row and the hash/date trail it: the message is what a
+                // person actually reads a history list to find, and
+                // `push_row_label`'s single ellipsis truncates from the end,
+                // so a long message is never the part that gets cut to make
+                // room for its own metadata.
+                if let Some(log) = self.core.git_log() {
+                    if !log.is_empty() {
+                        rows.push(
+                            ListRow::message("GRAPH")
+                                .with_kind(SidebarRowKind::Header)
+                                .with_icon(crate::icons::Icon::ChevronDown),
+                        );
+                        let lane_count = ls_core::commit_graph::lane_count(&ls_core::commit_graph::lanes(log));
+                        for commit in log {
+                            rows.push(ListRow {
+                                label: format!(
+                                    "{}  {}  {}",
+                                    commit.summary, commit.short_hash, commit.date
+                                ),
+                                action: None,
+                                depth: 0,
+                                chevron: None,
+                                icon: None,
+                                icon_color: None,
+                                kind: SidebarRowKind::File,
+                                highlight: None,
+                                icon_spaces: lane_count,
+                            });
+                        }
+                    }
                 }
-                Some(status) => status
-                    .files
-                    .iter()
-                    .map(|file| {
-                        let full = root.as_ref().map(|r| r.join(&file.path));
-                        let file_icon =
-                            crate::icons::icon_for_file(&file.path.display().to_string());
-                        let mut row = ListRow {
-                            label: format!(
-                                "{}{}",
-                                file.path.display(),
-                                if file.staged { "  (staged)" } else { "" }
-                            ),
-                            action: None,
-                            depth: 0,
+                rows
+            }
+            // Search-and-install: one row per supported language's
+            // toolchain, plus a dedicated top row for the active file when
+            // it is one of them. Every row shares one action
+            // (`InstallOrRunToolchain`): install if the toolchain is
+            // missing, run the active file with it otherwise.
+            Some(ListKind::Run) => {
+                let mut rows = Vec::new();
+                let current = self.core.active_document().and_then(|document| document.path()).and_then(
+                    |path| {
+                        let path = path.as_path().to_path_buf();
+                        ls_core::RunLanguage::from_extension(&path).map(|language| (path, language))
+                    },
+                );
+                if let Some((path, language)) = &current {
+                    let name =
+                        path.file_name().map(|name| name.to_string_lossy().to_string()).unwrap_or_default();
+                    let installed = self.core.toolchain_installed(*language);
+                    let status = match installed {
+                        Some(true) => "ready",
+                        Some(false) => "not installed",
+                        None => "checking...",
+                    };
+                    rows.push(ListRow {
+                        label: format!("Run {name}  ({}, {status})", language.display_name()),
+                        action: Some(ListAction::InstallOrRunToolchain(*language)),
+                        depth: 0,
+                        chevron: None,
+                        icon: Some(crate::icons::Icon::Play.into()),
+                        icon_color: Some(if installed == Some(true) {
+                            self.theme.ok
+                        } else {
+                            self.theme.dim_text
+                        }),
+                        kind: SidebarRowKind::File,
+                        highlight: None,
+                        icon_spaces: 0,
+                    });
+                } else {
+                    rows.push(ListRow::message("Open a runnable file to run it"));
+                }
+                rows.push(
+                    ListRow::message("TOOLCHAINS")
+                        .with_kind(SidebarRowKind::Header)
+                        .with_icon(crate::icons::Icon::ChevronDown),
+                );
+                for language in ls_core::RunLanguage::ALL {
+                    let installed = self.core.toolchain_installed(*language);
+                    let (label, color) = match installed {
+                        Some(true) => (
+                            format!("{}  \u{2713} installed", language.display_name()),
+                            self.theme.ok,
+                        ),
+                        Some(false) => {
+                            (format!("{}  Install", language.display_name()), self.theme.warning)
+                        }
+                        None => (
+                            format!("{}  checking...", language.display_name()),
+                            self.theme.dim_text,
+                        ),
+                    };
+                    rows.push(ListRow {
+                        label,
+                        action: Some(ListAction::InstallOrRunToolchain(*language)),
+                        depth: 0,
+                        chevron: None,
+                        icon: Some(crate::icons::Icon::CircleFilled.into()),
+                        icon_color: Some(color),
+                        kind: SidebarRowKind::File,
+                        highlight: None,
+                        icon_spaces: 0,
+                    });
+                    // One click, entirely in the background (see
+                    // `uninstall_toolchain`) -- only offered once a
+                    // language is actually installed, right under its own
+                    // row the same way a file tree's children nest under
+                    // their directory.
+                    if installed == Some(true) {
+                        rows.push(ListRow {
+                            label: "Uninstall".to_string(),
+                            action: Some(ListAction::UninstallToolchain(*language)),
+                            depth: 1,
                             chevron: None,
-                            icon: Some(file_icon.into()),
-                            icon_color: Some(file_icon.color()),
-                            kind: SidebarRowKind::File,
-                        };
-                        row.action = full.map(ListAction::OpenFile);
-                        row
-                    })
-                    .collect(),
-                None if self.core.is_git_status_pending() => {
-                    vec![ListRow::message("Checking git status...")]
+                            icon: None,
+                            icon_color: Some(self.theme.dim_text),
+                            kind: SidebarRowKind::Info,
+                            highlight: None,
+                            icon_spaces: 0,
+                        });
+                    }
                 }
-                None => {
-                    vec![ListRow::message("Not a git repository, or git is not installed")]
+                if !self.task_output.trim().is_empty() {
+                    rows.push(
+                        ListRow::message("OUTPUT")
+                            .with_kind(SidebarRowKind::Header)
+                            .with_icon(crate::icons::Icon::ChevronDown),
+                    );
+                    // The tail only: this is a status readout for the run
+                    // or install in flight, not a scrollback of its own --
+                    // `task_output` itself already keeps the fuller record.
+                    const VISIBLE_OUTPUT_LINES: usize = 12;
+                    let lines: Vec<&str> = self.task_output.lines().collect();
+                    let start = lines.len().saturating_sub(VISIBLE_OUTPUT_LINES);
+                    for line in &lines[start..] {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        rows.push(ListRow::message(line.to_string()));
+                    }
                 }
-            },
+                rows
+            }
             // Only ever the result for the query in the field right now:
             // `matching_search_result` drops one for an older prefix, so a
             // panel that updates as you type never shows hits for a query
@@ -2379,8 +3011,65 @@ impl LightSpeed {
                 {
                     Vec::new()
                 }
+                Some(result) if result.regex_error.is_some() => {
+                    vec![ListRow::message(format!(
+                        "Pattern error: {}",
+                        result.regex_error.as_deref().unwrap_or_default()
+                    ))]
+                }
                 Some(result) if result.hits.is_empty() => {
                     vec![ListRow::message(format!("No matches for \"{}\"", result.query))]
+                }
+                Some(result) if self.search_collapsed => {
+                    // Grouped by file: one row per file with a count,
+                    // rather than one per matching line -- CollapseAll's own
+                    // toggle. Opens at the first hit in that file, the same
+                    // as clicking the file's own first result would.
+                    let mut order: Vec<&std::path::Path> = Vec::new();
+                    let mut counts: std::collections::HashMap<&std::path::Path, usize> =
+                        Default::default();
+                    let mut first_line: std::collections::HashMap<&std::path::Path, usize> =
+                        Default::default();
+                    for hit in &result.hits {
+                        let path = hit.path.as_path();
+                        *counts.entry(path).or_insert(0) += 1;
+                        first_line.entry(path).or_insert(hit.line_number);
+                        if !order.contains(&path) {
+                            order.push(path);
+                        }
+                    }
+                    let mut rows: Vec<ListRow> = order
+                        .into_iter()
+                        .map(|path| {
+                            let name = path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().to_string())
+                                .unwrap_or_else(|| path.display().to_string());
+                            let file_icon = crate::icons::icon_for_file(&name);
+                            let count = counts[path];
+                            ListRow {
+                                label: format!(
+                                    "{name}  ({count} match{})",
+                                    if count == 1 { "" } else { "es" }
+                                ),
+                                action: Some(ListAction::OpenFileAt(
+                                    path.to_path_buf(),
+                                    first_line[path],
+                                )),
+                                depth: 0,
+                                chevron: None,
+                                icon: Some(file_icon.into()),
+                                icon_color: Some(file_icon.color()),
+                                kind: SidebarRowKind::File,
+                                highlight: None,
+                                icon_spaces: 0,
+                            }
+                        })
+                        .collect();
+                    if result.truncated {
+                        rows.push(ListRow::message("... more results exist; narrow the query"));
+                    }
+                    rows
                 }
                 Some(result) => {
                     let mut rows: Vec<ListRow> = result
@@ -2393,12 +3082,23 @@ impl LightSpeed {
                                 .map(|name| name.to_string_lossy().to_string())
                                 .unwrap_or_else(|| hit.path.display().to_string());
                             let file_icon = crate::icons::icon_for_file(&name);
+                            // `hit.preview` already arrived trimmed
+                            // (`workspace_search::preview_with_match` does
+                            // that), so `match_start`/`match_len` -- byte
+                            // offsets into it -- index it directly, with no
+                            // further adjustment.
+                            let prefix = format!("{name}:{}  ", hit.line_number);
+                            let highlight = (hit.match_len > 0).then(|| {
+                                let before = prefix.chars().count()
+                                    + hit.preview[..hit.match_start].chars().count();
+                                let width = hit.preview
+                                    [hit.match_start..hit.match_start + hit.match_len]
+                                    .chars()
+                                    .count();
+                                (before, width)
+                            });
                             ListRow {
-                                label: format!(
-                                    "{name}:{}  {}",
-                                    hit.line_number,
-                                    hit.preview.trim()
-                                ),
+                                label: format!("{prefix}{}", hit.preview),
                                 action: Some(ListAction::OpenFileAt(
                                     hit.path.clone(),
                                     hit.line_number,
@@ -2408,6 +3108,8 @@ impl LightSpeed {
                                 icon: Some(file_icon.into()),
                                 icon_color: Some(file_icon.color()),
                                 kind: SidebarRowKind::File,
+                                highlight,
+                                icon_spaces: 0,
                             }
                         })
                         .collect();
@@ -2434,7 +3136,12 @@ impl LightSpeed {
     /// into directories the user opened, so this cannot run away on a huge
     /// workspace the way a "expand everything" tree would.
     fn append_tree_level(&self, dir: &Path, depth: usize, rows: &mut Vec<ListRow>) {
-        append_tree_level(&self.core, &self.expanded_dirs, dir, depth, rows);
+        // Relative-path matching needs the root the `.gitignore` itself was
+        // read from, not whichever subdirectory this particular call is
+        // recursing into -- falling back to `dir` only covers the (rare)
+        // case this is reached with no workspace open at all.
+        let root = self.file_tree_root.as_deref().unwrap_or(dir);
+        append_tree_level(&self.core, &self.expanded_dirs, &self.gitignore, root, dir, depth, rows);
     }
 
     /// Opens the file tree, rooted at the workspace root, or at the active
@@ -2506,6 +3213,7 @@ impl LightSpeed {
             self.set_status(error.to_string(), Severity::Error);
             return;
         }
+        self.gitignore = ls_core::gitignore::IgnoreSet::load(&dir);
         self.file_tree_root = Some(dir);
         self.list_selected = 0;
         self.active_list = Some(ListKind::FileTree);
@@ -2542,6 +3250,7 @@ impl LightSpeed {
             self.set_status(error.to_string(), Severity::Error);
             return;
         }
+        let _ = self.core.request_git_log();
         self.active_list = Some(ListKind::GitStatus);
         self.list_selected = 0;
         self.focus_list();
@@ -2581,7 +3290,7 @@ impl LightSpeed {
         if query.is_empty() {
             return;
         }
-        if let Err(error) = self.core.request_workspace_search(query) {
+        if let Err(error) = self.core.request_workspace_search(query, self.search_options) {
             self.set_status(error.to_string(), Severity::Error);
         }
         self.request_redraw();
@@ -2633,20 +3342,221 @@ impl LightSpeed {
             self.request_redraw();
             return;
         }
-        if self.terminal.is_none() {
-            let proxy = self.proxy.clone();
-            match crate::terminal::Terminal::spawn(move || {
-                let _ = proxy.send_event(UserEvent::TerminalOutput);
-            }) {
-                Ok(terminal) => self.terminal = Some(terminal),
-                Err(error) => {
-                    self.set_status(format!("could not start a shell: {error}"), Severity::Error);
-                    return;
-                }
-            }
+        if !self.ensure_terminal_spawned() {
+            return;
         }
         self.terminal_visible = true;
         self.focus_terminal();
+    }
+
+    /// Spawns the shell if one is not already running, applying the
+    /// "Terminal: Shell"/"Terminal: Scrollback" settings to a freshly
+    /// started one. Shared by `toggle_terminal` and `run_current_file` --
+    /// running code needs the same panel open and reporting to, not a
+    /// second, parallel notion of "a shell exists".
+    fn ensure_terminal_spawned(&mut self) -> bool {
+        if self.terminal.is_some() {
+            return true;
+        }
+        let proxy = self.proxy.clone();
+        let shell_preference = self.settings.text("terminal.shell");
+        match crate::terminal::Terminal::spawn(&shell_preference, move || {
+            let _ = proxy.send_event(UserEvent::TerminalOutput);
+        }) {
+            Ok(terminal) => {
+                terminal.set_scrollback(self.settings.integer("terminal.scrollbackBytes") as usize);
+                self.terminal = Some(terminal);
+                // Seeded once, on the very first spawn of this app's
+                // terminal: every command this app's terminal has ever run
+                // (any session, this machine) plus, on Windows, every command
+                // PowerShell's own PSReadLine history remembers from
+                // *ordinary* PowerShell windows -- so Up-arrow recall is not
+                // limited to what was typed since the app opened just now.
+                let mut seeded = ls_platform::terminal_log::read_external_shell_history(
+                    MAX_RECALL_HISTORY,
+                );
+                seeded.extend(ls_platform::terminal_log::read_history(MAX_RECALL_HISTORY));
+                seeded.dedup();
+                if seeded.len() > MAX_RECALL_HISTORY {
+                    let overflow = seeded.len() - MAX_RECALL_HISTORY;
+                    seeded.drain(..overflow);
+                }
+                self.terminal_command_history = seeded;
+                true
+            }
+            Err(error) => {
+                self.set_status(format!("could not start a shell: {error}"), Severity::Error);
+                false
+            }
+        }
+    }
+
+    /// [`ensure_terminal_spawned`]'s counterpart for `task_terminal`: the
+    /// shell app-initiated commands (Run/Install) use instead of the user's
+    /// own terminal. No history seeding here -- winget invocations and run
+    /// commands are not the kind of thing Up-arrow recall in the *user's*
+    /// terminal should ever need to reach.
+    fn ensure_task_terminal_spawned(&mut self) -> bool {
+        if self.task_terminal.is_some() {
+            return true;
+        }
+        let proxy = self.proxy.clone();
+        let shell_preference = self.settings.text("terminal.shell");
+        match crate::terminal::Terminal::spawn(&shell_preference, move || {
+            let _ = proxy.send_event(UserEvent::TaskTerminalOutput);
+        }) {
+            Ok(terminal) => {
+                terminal.set_scrollback(self.settings.integer("terminal.scrollbackBytes") as usize);
+                self.task_terminal = Some(terminal);
+                true
+            }
+            Err(error) => {
+                self.set_status(format!("could not start a shell: {error}"), Severity::Error);
+                false
+            }
+        }
+    }
+
+    /// The title bar's Play button: runs the active document with whichever
+    /// language its extension names, in the dedicated task shell (see
+    /// `task_terminal`), surfacing progress in the Run panel rather than the
+    /// user's own terminal. Refuses (with a status message, not a dialog)
+    /// when there is nothing to run, the file has never been saved, no
+    /// runner exists for its extension, or its toolchain has not been found
+    /// on `PATH` -- the last of those points at the Run panel rather than
+    /// trying and failing on the shell.
+    fn run_current_file(&mut self) {
+        let Some(document) = self.core.active_document() else {
+            self.set_status("Open a file to run it", Severity::Warning);
+            return;
+        };
+        let Some(path) = document.path().map(|p| p.as_path().to_path_buf()) else {
+            self.set_status("Save the file before running it", Severity::Warning);
+            return;
+        };
+        let Some(language) = ls_core::RunLanguage::from_extension(&path) else {
+            self.set_status("No runner for this file type yet", Severity::Warning);
+            return;
+        };
+        if self.core.toolchain_installed(language) != Some(true) {
+            self.set_status(
+                format!(
+                    "{} is not installed -- open Run in the activity bar to install it",
+                    language.display_name()
+                ),
+                Severity::Warning,
+            );
+            let _ = self.core.request_toolchain_check(language);
+            return;
+        }
+        if !self.ensure_task_terminal_spawned() {
+            return;
+        }
+        self.active_list = Some(ListKind::Run);
+        let Some(terminal) = self.task_terminal.as_mut() else { return };
+        for step in language.run_steps(&path) {
+            terminal.send_line(&step);
+        }
+        self.request_redraw();
+    }
+
+    /// Shows or hides the Run panel: search-and-install for a language's
+    /// toolchain. Kicks off a fresh availability check for every language
+    /// each time it opens -- cheap (one short-lived process per language,
+    /// same shape as a `git status` refresh), and installing a toolchain
+    /// happens in the terminal outside this panel entirely, so there is no
+    /// other moment that would naturally invalidate a stale "not installed".
+    fn toggle_run_panel(&mut self) {
+        if self.active_list == Some(ListKind::Run) {
+            self.active_list = None;
+            self.refresh_focus();
+            self.request_redraw();
+            return;
+        }
+        for language in ls_core::RunLanguage::ALL {
+            let _ = self.core.request_toolchain_check(*language);
+        }
+        self.active_list = Some(ListKind::Run);
+        self.list_selected = 0;
+        self.focus_list();
+    }
+
+    /// A Run panel row's click: installs the toolchain via winget if it is
+    /// not already on `PATH`, or runs the active file with it if it is. Both
+    /// go through `task_terminal`, never the user's own terminal -- winget's
+    /// own progress output is exactly the kind of thing a person watching an
+    /// install wants to see, but it belongs in the Run panel that asked for
+    /// it, not spliced into whatever the user was doing in their terminal.
+    fn install_or_run_toolchain(&mut self, language: ls_core::RunLanguage) {
+        let installed = self.core.toolchain_installed(language);
+        if !self.ensure_task_terminal_spawned() {
+            return;
+        }
+        let Some(terminal) = self.task_terminal.as_mut() else { return };
+        if installed == Some(true) {
+            let Some(document) = self.core.active_document() else {
+                self.set_status("Open a file to run it", Severity::Warning);
+                return;
+            };
+            let Some(path) = document.path().map(|p| p.as_path().to_path_buf()) else {
+                self.set_status("Save the file before running it", Severity::Warning);
+                return;
+            };
+            for step in language.run_steps(&path) {
+                terminal.send_line(&step);
+            }
+        } else {
+            terminal.send_line(&format!(
+                "winget install --id {} -e --accept-package-agreements --accept-source-agreements",
+                language.winget_id()
+            ));
+        }
+        self.request_redraw();
+    }
+
+    /// Removes an installed language's toolchain, entirely in the
+    /// background: `winget uninstall` runs in `task_terminal` (never the
+    /// user's own terminal, same reasoning as installing), and the Run
+    /// panel's own "installed" status quietly catches up on its own a few
+    /// seconds later (`pending_toolchain_rechecks`) rather than making the
+    /// user reopen the panel to find out it worked -- "the user should see
+    /// nothing" means no progress bar and no extra click, not that nothing
+    /// ever updates.
+    fn uninstall_toolchain(&mut self, language: ls_core::RunLanguage) {
+        if !self.ensure_task_terminal_spawned() {
+            return;
+        }
+        let Some(terminal) = self.task_terminal.as_mut() else { return };
+        terminal.send_line(&format!(
+            "winget uninstall --id {} -e --accept-source-agreements",
+            language.winget_id()
+        ));
+        self.pending_toolchain_rechecks.push((language, Instant::now() + TOOLCHAIN_RECHECK_DELAY));
+        self.set_status(format!("Removing {}...", language.display_name()), Severity::Warning);
+    }
+
+    /// Drains `task_terminal` into `task_output`, the same tail-capped way
+    /// `drain_terminal_output` maintains `terminal_scrollback` -- except
+    /// there is no separate scroll position to preserve, since the Run panel
+    /// only ever shows the tail of this buffer.
+    fn drain_task_terminal_output(&mut self) {
+        let Some(terminal) = self.task_terminal.as_mut() else { return };
+        let text = terminal.drain_output();
+        if text.is_empty() {
+            return;
+        }
+        self.task_output.push_str(&text);
+        const MAX_TASK_OUTPUT: usize = 16 * 1024;
+        if self.task_output.len() > MAX_TASK_OUTPUT {
+            let cut = self.task_output.len() - MAX_TASK_OUTPUT;
+            let boundary = (cut..self.task_output.len())
+                .find(|&i| self.task_output.is_char_boundary(i))
+                .unwrap_or(cut);
+            self.task_output.drain(..boundary);
+        }
+        if self.active_list == Some(ListKind::Run) {
+            self.request_redraw();
+        }
     }
 
     fn drain_terminal_output(&mut self) {
@@ -2660,7 +3570,13 @@ impl LightSpeed {
         let before = self.terminal_scrollback.lines().count();
 
         self.terminal_scrollback.push_str(&text);
-        let cap = 64 * 1024;
+        // Regression fix: this used to be a hardcoded 64KB regardless of the
+        // "Terminal: Scrollback" setting (`apply_settings` already forwards
+        // it to the reader thread's own buffer, `Terminal.scrollback` --
+        // this is the *second*, separate buffer that holds what is actually
+        // drawn on screen, and it was trimming everything back down to 64KB
+        // before the setting's larger value ever got a chance to show).
+        let cap = self.settings.integer("terminal.scrollbackBytes").max(1) as usize;
         if self.terminal_scrollback.len() > cap {
             let cut = self.terminal_scrollback.len() - cap;
             // Cut on a character boundary, not mid-codepoint.
@@ -2786,13 +3702,82 @@ impl LightSpeed {
             }
             self.core.apply_diagnostics(&path, diagnostics);
         }
+        self.drain_lsp_definitions();
         self.request_redraw();
+    }
+
+    /// Applies whatever `go_to_definition_at` asked for and just arrived.
+    /// Shares `UserEvent::LspDiagnostics`'s wake rather than needing an
+    /// event of its own -- both are "a server produced something, drain
+    /// it", and a single request in flight at a time (the ordinary gesture)
+    /// needs nothing fancier than "jump to whatever showed up".
+    fn drain_lsp_definitions(&mut self) {
+        for location in self.lsp.drain_definitions() {
+            match location {
+                Some(location) => {
+                    self.pending_jump = Some((location.path.clone(), location.line + 1));
+                    self.open_path(location.path);
+                }
+                None => self.set_status("No definition found", Severity::Warning),
+            }
+        }
+    }
+
+    /// Ctrl+Click in the editor: asks the active file's language server
+    /// where the symbol under the pointer is declared. The jump itself
+    /// happens later, off `drain_lsp_definitions`, once the server answers.
+    fn go_to_definition_at(&mut self, x: f32, y: f32, layout: &Layout) {
+        let (Some(renderer), Some(snapshot)) =
+            (self.renderer.as_ref(), self.last_snapshot.as_ref())
+        else {
+            return;
+        };
+        let Some(id) = self.core.active() else { return };
+        let view = self.views.get(&id).copied().unwrap_or_default();
+        let scroll_fraction = view.scroll_y % layout.metrics.line_height;
+        let (line, column) =
+            renderer.position_at_point(layout, snapshot, x, y, scroll_fraction, view.scroll_x);
+        let Some(document) = self.core.document(id) else { return };
+        let Some(path) = document.path().map(|p| p.as_path().to_path_buf()) else {
+            self.set_status("Save the file before jumping to a definition", Severity::Warning);
+            return;
+        };
+        let language = document.language();
+        let root = self
+            .core
+            .workspace()
+            .root()
+            .map(|c| c.as_path().to_path_buf())
+            .or_else(|| path.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let proxy = self.proxy.clone();
+        let Some(client) = self.lsp.client_for(language, &root, move || {
+            let _ = proxy.send_event(UserEvent::LspDiagnostics);
+        }) else {
+            self.set_status("No language server running for this file", Severity::Warning);
+            return;
+        };
+        client.request_definition(&path, line, column);
     }
 
     fn send_terminal_line(&mut self) {
         let line = std::mem::take(&mut self.terminal_input);
         self.terminal_cursor = 0;
         self.record_terminal_history(&line);
+        // `cls`/`clear` are handled locally rather than sent to the shell.
+        // The panel has no real console (stdio is piped, not a ConPTY --
+        // see `terminal.rs`'s module doc), so PowerShell's own `Clear-Host`
+        // fails outright there ("Exception setting CursorPosition: The
+        // handle is invalid"), and `cmd`'s `cls` would only ever clear a
+        // console window nobody can see either way. Clearing the on-screen
+        // scrollback locally is what the user actually wants and is the one
+        // thing that can't fail this way.
+        if matches!(line.trim(), "cls" | "clear") {
+            self.terminal_scrollback.clear();
+            self.terminal_scroll_lines = 0;
+            self.request_redraw();
+            return;
+        }
         if let Some(terminal) = self.terminal.as_mut() {
             if !terminal.is_alive() {
                 self.set_status("The shell has exited", Severity::Warning);
@@ -2828,12 +3813,6 @@ impl LightSpeed {
         if self.terminal_command_history.last().map(String::as_str) != Some(line) {
             self.terminal_command_history.push(line.to_string());
         }
-        // Bounded the same way the permanent transcript is not: this list
-        // exists for in-session recall, and a session that ran ten thousand
-        // commands does not need all of them one Up-press away -- the file
-        // `ls_platform::terminal_log` writes to is where the full record
-        // lives.
-        const MAX_RECALL_HISTORY: usize = 1000;
         if self.terminal_command_history.len() > MAX_RECALL_HISTORY {
             let overflow = self.terminal_command_history.len() - MAX_RECALL_HISTORY;
             self.terminal_command_history.drain(..overflow);
@@ -2914,9 +3893,81 @@ impl LightSpeed {
         self.terminal_cursor = self.terminal_cursor.saturating_sub(1);
     }
 
+    /// Ctrl+Left: jumps a whole word left, the way every real shell's line
+    /// editor does -- past any whitespace immediately to the left of the
+    /// caret, then past the run of non-whitespace before that. A plain
+    /// whitespace split rather than a real tokenizer, since a terminal
+    /// input line is exactly the kind of free-form text that split serves
+    /// (`cursor.word_left` in the editor proper draws the same line between
+    /// "good enough" and "a real word-boundary table").
+    fn terminal_move_word_left(&mut self) {
+        let chars: Vec<char> = self.terminal_input.chars().collect();
+        let mut i = self.terminal_cursor;
+        while i > 0 && chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !chars[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        self.terminal_cursor = i;
+    }
+
+    /// Ctrl+Right: the mirror of `terminal_move_word_left`.
+    fn terminal_move_word_right(&mut self) {
+        let chars: Vec<char> = self.terminal_input.chars().collect();
+        let len = chars.len();
+        let mut i = self.terminal_cursor;
+        while i < len && chars[i].is_whitespace() {
+            i += 1;
+        }
+        while i < len && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        self.terminal_cursor = i;
+    }
+
     fn terminal_move_right(&mut self) {
         let end = self.terminal_input.chars().count();
         self.terminal_cursor = (self.terminal_cursor + 1).min(end);
+    }
+
+    /// Copies `terminal_selection` to the clipboard, re-resolving it against
+    /// the terminal's *current* rows rather than trusting bytes captured
+    /// mid-drag: new output can arrive while a selection sits idle, and a
+    /// stale byte offset landing mid-character (or past the end of a row
+    /// that got trimmed) is worse than a selection that quietly clears if
+    /// the ground moved too far under it.
+    fn copy_terminal_selection(&mut self) {
+        let Some((anchor, current)) = self.terminal_selection else { return };
+        if anchor == current {
+            return;
+        }
+        let Some(layout) = self.last_layout else { return };
+        let (start, end) = if anchor <= current { (anchor, current) } else { (current, anchor) };
+        let rows = self.bottom_panel_rows(&layout);
+        let mut text = String::new();
+        for row in start.0..=end.0 {
+            let Some(line) = rows.get(row) else { break };
+            let from = if row == start.0 { start.1.min(line.len()) } else { 0 };
+            let to = if row == end.0 { end.1.min(line.len()) } else { line.len() };
+            // A byte offset from `terminal_position_at_point` always lands
+            // on a real char boundary (it comes from the shaped glyph run),
+            // but `min(line.len())` above can still clip to one that isn't
+            // if the row shrank since the drag started -- `get` rather than
+            // direct indexing turns that into "skip this row", never a
+            // panic.
+            let Some(slice) = line.get(from.min(to)..from.max(to)) else { continue };
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(slice);
+        }
+        if text.is_empty() {
+            return;
+        }
+        if let Err(error) = self.core.write_clipboard_text(&text) {
+            self.set_status(error.to_string(), Severity::Error);
+        }
     }
 
     /// Rows for the docked bottom panel's terminal content: the visible
@@ -3029,6 +4080,16 @@ impl LightSpeed {
                     self.list_selected = self.list_selected.min(len - 1);
                 }
             }
+            Some(ListAction::InstallOrRunToolchain(language)) => {
+                self.install_or_run_toolchain(language);
+                self.request_redraw();
+                return;
+            }
+            Some(ListAction::UninstallToolchain(language)) => {
+                self.uninstall_toolchain(language);
+                self.request_redraw();
+                return;
+            }
             None => {}
         }
         self.refresh_focus();
@@ -3042,7 +4103,31 @@ impl LightSpeed {
         // not a poll), so it no longer needs a wakeup of its own.
         let caret =
             (self.core.active().is_some() && self.prompt.is_none()).then_some(self.caret_deadline);
-        [caret, self.search_debounce_deadline].into_iter().flatten().min()
+        let next_recheck = self.pending_toolchain_rechecks.iter().map(|&(_, at)| at).min();
+        [caret, self.search_debounce_deadline, next_recheck].into_iter().flatten().min()
+    }
+
+    /// Drains every due entry of `pending_toolchain_rechecks`, re-requesting
+    /// that language's toolchain status -- what makes `uninstall_toolchain`
+    /// "the user should see nothing" rather than "the user has to reopen
+    /// the panel to find out it worked".
+    fn tick_toolchain_rechecks(&mut self) {
+        let now = Instant::now();
+        let due: Vec<ls_core::RunLanguage> = {
+            let mut due = Vec::new();
+            self.pending_toolchain_rechecks.retain(|&(language, at)| {
+                if at <= now {
+                    due.push(language);
+                    false
+                } else {
+                    true
+                }
+            });
+            due
+        };
+        for language in due {
+            let _ = self.core.request_toolchain_check(language);
+        }
     }
 
     /// Window title, from authoritative document state.
@@ -3121,14 +4206,15 @@ impl LightSpeed {
             Some(ListKind::FileTree) => Some(ACTIVITY_EXPLORER),
             Some(ListKind::SearchResults) => Some(ACTIVITY_SEARCH),
             Some(ListKind::GitStatus) => Some(ACTIVITY_SOURCE_CONTROL),
+            Some(ListKind::Run) => Some(ACTIVITY_RUN),
             None => None,
         }
     }
 
     /// Handles a click on activity-bar row `index`. Clicking the item that
     /// is already active closes its panel, the same toggle behavior the
-    /// keyboard shortcuts for these panels already have. Extensions and
-    /// Debug (indices 3 and 4) are inert: there is no subsystem behind them.
+    /// keyboard shortcuts for these panels already have. Extensions (index
+    /// 3) is inert: there is no subsystem behind it.
     fn activate_activity_item(&mut self, index: usize) {
         let already_active = self.activity_active_index() == Some(index);
         // A query left typed-but-unsubmitted is what keeps the Search panel
@@ -3146,6 +4232,13 @@ impl LightSpeed {
         if index != ACTIVITY_DEPENDENCIES {
             self.dependency_view = false;
         }
+        // Settings has its own cell, separate from this list entirely (see
+        // `activity_settings`), so nothing above already closes it -- and
+        // without this, clicking Explorer or Search while Settings was open
+        // left both trying to occupy the editor area and the keyboard at
+        // once: the sidebar would show the newly clicked panel while the
+        // editor area, and every keystroke, stayed pointed at Settings.
+        self.settings_open = false;
         match index {
             ACTIVITY_EXPLORER => self.toggle_file_tree(),
             ACTIVITY_SEARCH => {
@@ -3159,6 +4252,7 @@ impl LightSpeed {
                 }
             }
             ACTIVITY_SOURCE_CONTROL => self.toggle_git_status(),
+            ACTIVITY_RUN => self.toggle_run_panel(),
             ACTIVITY_DEPENDENCIES => self.toggle_dependency_view(already_active),
             _ => {}
         }
@@ -3244,6 +4338,36 @@ impl LightSpeed {
         self.remerge_settings();
         self.apply_settings();
         self.save_settings();
+        self.request_redraw();
+    }
+
+    /// Ctrl+= / Ctrl+- / Ctrl+scroll: nudges `editor.fontSize` by `delta`
+    /// steps. Goes through `write_setting` rather than touching the
+    /// renderer directly -- `apply_settings` is already the one place that
+    /// pushes a font-size change out to it, so a zoom is just a special
+    /// kind of settings edit rather than a second path to the same effect.
+    /// `Settings::set` itself clamps to the descriptor's 6-48 range, so a
+    /// zoom mashed against either end simply stops rather than erroring.
+    fn adjust_font_size(&mut self, delta: i64) {
+        let current = self.settings.integer("editor.fontSize");
+        self.write_setting("editor.fontSize", &(current + delta).to_string());
+    }
+
+    /// Ctrl+0: back to the default size, the same "forget the override"
+    /// mechanics as the Settings screen's own Reset affordance.
+    fn reset_font_size(&mut self) {
+        self.reset_setting("editor.fontSize");
+    }
+
+    /// Ctrl+Shift+V: swaps a Markdown document's raw source for its
+    /// rendered form (`markdown::render`), the same "stand in for the
+    /// document" mechanism `dependency_view` already uses for the
+    /// dependency graph. Toggling on a non-Markdown document is a quiet
+    /// no-op rather than a refusal -- the flag has nothing to show until
+    /// the active document actually is one, the same as `dependency_view`
+    /// drawing nothing over an empty workspace.
+    fn toggle_markdown_preview(&mut self) {
+        self.markdown_preview = !self.markdown_preview;
         self.request_redraw();
     }
 
@@ -3403,6 +4527,14 @@ impl LightSpeed {
                 // them, which is the only way back without a separate row.
                 self.settings_section = if self.settings_section == Some(at) { None } else { Some(at) };
                 self.settings_scroll = 0;
+                self.settings_search_focused = false;
+            }
+            Hit::UserScope => {
+                self.settings_scope = SettingsScope::User;
+                self.settings_search_focused = false;
+            }
+            Hit::WorkspaceScope => {
+                self.settings_scope = SettingsScope::Workspace;
                 self.settings_search_focused = false;
             }
             Hit::Control(key) => {
@@ -3672,10 +4804,16 @@ impl LightSpeed {
             return false;
         }
         let at = self.dependency_view_at;
-        let hit = self
-            .dependency_scene
-            .as_ref()
-            .and_then(|scene| crate::depgraph::hit_test(scene, pane, at, (x, y)));
+        let hit = self.dependency_scene.as_ref().and_then(|scene| {
+            // A node always wins over an edge: nodes draw over the edges
+            // that meet them, so a point inside a circle should never
+            // resolve to the sliver of line right at its own rim.
+            crate::depgraph::hit_test(scene, pane, at, (x, y))
+                .map(DependencyHit::Node)
+                .or_else(|| {
+                    crate::depgraph::edge_hit_test(scene, pane, at, (x, y)).map(DependencyHit::Edge)
+                })
+        });
 
         // Double-clicking the empty canvas puts the whole graph back on
         // screen -- the same gesture every other graph canvas uses to fit,
@@ -3687,8 +4825,7 @@ impl LightSpeed {
             return true;
         }
 
-        self.dependency_press =
-            Some(DependencyPress { origin: (x, y), at: (x, y), node: hit });
+        self.dependency_press = Some(DependencyPress { origin: (x, y), at: (x, y), hit });
         true
     }
 
@@ -3703,19 +4840,30 @@ impl LightSpeed {
         if !crate::depgraph::is_click(press.origin, (x, y)) {
             return;
         }
-        let Some(node) = press.node else { return };
-        let Some(path) = self
-            .dependency_scene
-            .as_ref()
-            .and_then(|scene| scene.nodes.get(node))
-            .map(|node| node.path.clone())
-        else {
-            return;
-        };
+        let Some(hit) = press.hit else { return };
         let Some(root) = self.core.workspace().root().map(|root| root.as_path().to_path_buf())
         else {
             return;
         };
+
+        let (relative, line) = match hit {
+            DependencyHit::Node(node) => {
+                let Some(node) = self.dependency_scene.as_ref().and_then(|scene| scene.nodes.get(node))
+                else {
+                    return;
+                };
+                (node.path.clone(), None)
+            }
+            DependencyHit::Edge(edge) => {
+                let Some((path, line)) =
+                    self.dependency_scene.as_ref().and_then(|scene| scene.edge_source(edge))
+                else {
+                    return;
+                };
+                (path.to_path_buf(), Some(line))
+            }
+        };
+
         // Step out of the way: the graph covers the editor, so opening a file
         // without closing it leaves the reader looking at the picture they
         // just clicked instead of the file they asked for. The graph and
@@ -3724,12 +4872,21 @@ impl LightSpeed {
         self.dependency_view = false;
         self.dependency_hovered = None;
         self.refresh_focus();
-        self.open_path(root.join(path));
+        let target = root.join(&relative);
+        if let Some(line) = line {
+            // An edge opens at the exact statement that caused it -- the
+            // `use`, `mod`, `import`, or `#include` line -- the same
+            // open-then-jump `pending_jump` already does for a search hit.
+            self.pending_jump = Some((target.clone(), line));
+        }
+        self.open_path(target);
     }
 
     /// Drags the graph with the pointer while a press is held.
     fn drag_dependency_view(&mut self, x: f32, y: f32, layout: &Layout) {
         let Some(press) = self.dependency_press else { return };
+        // Neither field this reads (`origin` stays put, `at` is only ever
+        // reset below) cares which kind of hit started the press.
         let Some(scene) = self.dependency_scene.as_ref() else { return };
         let pane = Self::dependency_pane(layout);
         // Moved by the step since the last position, while `origin` stays
@@ -3748,26 +4905,47 @@ impl LightSpeed {
             .dependency_scene
             .as_ref()
             .and_then(|scene| crate::depgraph::hit_test(scene, pane, at, (x, y)));
-        if hovered == self.dependency_hovered {
-            return;
+        if hovered != self.dependency_hovered {
+            self.dependency_hovered = hovered;
+            // The status bar has room for the whole path and the counts,
+            // which no label inside a circle ever will.
+            if let Some((scene, node)) = self.dependency_scene.as_ref().zip(hovered) {
+                if let Some(file) = scene.nodes.get(node) {
+                    let (imports, imported_by) = scene.connections(node);
+                    self.status_message = Some((
+                        format!(
+                            "{}  -  imports {imports}, imported by {imported_by}  (click to open)",
+                            file.path.display()
+                        ),
+                        Instant::now(),
+                        Severity::Success,
+                    ));
+                }
+            }
+            self.request_redraw();
         }
-        self.dependency_hovered = hovered;
-        // The status bar has room for the whole path and the counts, which
-        // no label inside a circle ever will.
-        if let Some((scene, node)) = self.dependency_scene.as_ref().zip(hovered) {
-            if let Some(file) = scene.nodes.get(node) {
-                let (imports, imported_by) = scene.connections(node);
-                self.status_message = Some((
-                    format!(
-                        "{}  -  imports {imports}, imported by {imported_by}  (click to open)",
-                        file.path.display()
-                    ),
-                    Instant::now(),
-                    Severity::Success,
-                ));
+
+        // Nothing traces the edges visually the way a hovered node does --
+        // that would mean threading a second highlight through every
+        // drawing call for one line of status text -- but the status bar
+        // itself can still say what clicking one would do, which is the
+        // whole of what was missing: an edge with no visible effect at all.
+        if hovered.is_none() {
+            let edge_hovered = self
+                .dependency_scene
+                .as_ref()
+                .and_then(|scene| crate::depgraph::edge_hit_test(scene, pane, at, (x, y)));
+            if let Some((scene, edge)) = self.dependency_scene.as_ref().zip(edge_hovered) {
+                if let Some((path, line)) = scene.edge_source(edge) {
+                    self.status_message = Some((
+                        format!("{}:{line}  (click to view the import)", path.display()),
+                        Instant::now(),
+                        Severity::Success,
+                    ));
+                    self.request_redraw();
+                }
             }
         }
-        self.request_redraw();
     }
 
     /// Rows for the docked sidebar, each tagged with what kind of row it is
@@ -3781,7 +4959,13 @@ impl LightSpeed {
     /// width, using its own font metrics -- so a name that fits a wide,
     /// user-dragged panel is never clipped mid-character the way a
     /// fixed-width assumption would.
-    fn sidebar_rows(&self, layout: &Layout) -> crate::text::RichText {
+    /// Returns the sidebar's shaped-text content alongside every search
+    /// match's position within it -- `(row, start_byte, end_byte)`, row
+    /// numbering and byte offsets both relative to this same text, ready for
+    /// `Renderer::highlight_spans` to turn into a real background box the
+    /// way the editor's own text selection is drawn, rather than the
+    /// color-only treatment a match used to get.
+    fn sidebar_rows(&self, layout: &Layout) -> (crate::text::RichText, Vec<(usize, usize, usize)>) {
         use crate::text::RichText;
         use crate::theme::SidebarRowKind;
 
@@ -3803,8 +4987,9 @@ impl LightSpeed {
         };
 
         // The Search panel gets its own header -- title plus action icons, a
-        // real search field, a (decorative, for now) replace field -- drawn
-        // the same whether a query is still being typed or its results are
+        // real search field, and a real replace field (Replace All runs
+        // `replace_all_in_results`) -- drawn the same whether a query is
+        // still being typed or its results are
         // being browsed, the way VS Code's own Search view never collapses
         // those fields away once you start reading results.
         if self.showing_search_panel() {
@@ -3813,19 +4998,24 @@ impl LightSpeed {
             // re-search: the panel updates under the field rather than
             // waiting for the field to be committed.
             self.push_search_header(&mut rich, layout, &truncate);
+        } else if self.showing_git_panel() {
+            self.push_git_header(&mut rich, layout, &truncate);
         } else if let Some(kind) = self.active_list {
             let title = match kind {
                 ListKind::FileTree => "EXPLORER",
-                ListKind::GitStatus => "SOURCE CONTROL",
+                ListKind::Run => "RUN",
+                ListKind::GitStatus => unreachable!("handled by `showing_git_panel` above"),
                 ListKind::SearchResults => unreachable!("handled by `is_search` above"),
             };
             rich.colored(title, self.theme.dim_text);
         } else {
-            return rich;
+            return (rich, Vec::new());
         }
 
+        let mut highlights = Vec::new();
         for row in self.list_rows() {
             rich.newline();
+            let row_index = rich.text.matches('\n').count();
             // Indentation is monospace spaces; the icon columns that follow
             // are icon-width, so every row at the same depth lines up.
             rich.plain(&"  ".repeat(row.depth));
@@ -3834,6 +5024,13 @@ impl LightSpeed {
                 None if row.kind == SidebarRowKind::Header => &mut rich,
                 None => rich.icon_space(),
             };
+            // Extra icon-width blanks beyond the one every row already gets
+            // above -- the commit graph's own lane clearance (see
+            // `ListRow::icon_spaces`'s doc comment). Zero for every other
+            // row, so this is a no-op everywhere else.
+            for _ in 0..row.icon_spaces.saturating_sub(1) {
+                rich.icon_space();
+            }
             if let Some(icon) = row.icon {
                 // A file's icon carries its own characteristic color
                 // (`icon_color`, set alongside it by `icon_for_file`) --
@@ -3847,9 +5044,18 @@ impl LightSpeed {
                 rich.icon(icon, color);
                 rich.plain(" ");
             }
-            rich.colored(&truncate(&row.label), self.theme.sidebar_row_color(row.kind));
+            let line_start = rich.text.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            if let Some((start, end)) = push_row_label(
+                &mut rich,
+                &row.label,
+                row.highlight,
+                max_chars,
+                self.theme.sidebar_row_color(row.kind),
+            ) {
+                highlights.push((row_index, start - line_start, end - line_start));
+            }
         }
-        rich
+        (rich, highlights)
     }
 
     /// The Search panel's own three-line header, in place of the plain title
@@ -3877,7 +5083,9 @@ impl LightSpeed {
         let digit = layout.metrics.digit_width.max(1.0);
         let margin = 16.0 * layout.scale;
 
-        // Row 0: "SEARCH", right-aligned action icons.
+        // Row 0: "SEARCH", right-aligned action icons -- Refresh, Clear All,
+        // Search in New Editor, and Collapse All (lit while results are
+        // grouped by file).
         rich.colored("SEARCH", dim);
         let header_icons = [Icon::Refresh, Icon::ClearAll, Icon::NewFile, Icon::CollapseAll];
         let used = margin
@@ -3885,14 +5093,15 @@ impl LightSpeed {
             + header_icons.len() as f32 * layout.metrics.icon_width;
         rich.plain(&" ".repeat((((layout.sidebar.width - used) / digit).max(0.0)) as usize));
         for icon in header_icons {
-            rich.icon(icon, dim);
+            let lit = icon == Icon::CollapseAll && self.search_collapsed;
+            rich.icon(icon, if lit { self.theme.activity_icon_active } else { dim });
         }
         rich.newline();
 
         // Row 1: the search field -- a magnifier, the query (typed so far,
         // or the last submitted one while browsing results, or a dim
-        // placeholder if there is neither), a caret only while actually
-        // typing, then the case/word/regex toggles.
+        // placeholder if there is neither), a caret only while it has the
+        // keyboard, then the case/word/regex toggles, lit while on.
         let typing = self.search_query_input.is_some();
         let submitted = self.core.workspace_search_result().map(|result| result.query.as_str());
         let query = self.search_query_input.as_deref().or(submitted).unwrap_or("");
@@ -3904,32 +5113,97 @@ impl LightSpeed {
         } else {
             rich.colored(&query_shown, self.theme.text);
         }
-        if typing {
+        if typing && !self.search_replace_focused {
             rich.colored("\u{2588}", self.theme.cursor);
         }
-        let toggle_icons = [Icon::CaseSensitive, Icon::WholeWord, Icon::Regex];
+        let toggles = [
+            (Icon::CaseSensitive, self.search_options.case_sensitive),
+            (Icon::WholeWord, self.search_options.whole_word),
+            (Icon::Regex, self.search_options.regex),
+        ];
         let used = margin
             + layout.metrics.icon_width
             + digit
             + query_shown.chars().count() as f32 * digit
-            + toggle_icons.len() as f32 * layout.metrics.icon_width;
+            + toggles.len() as f32 * layout.metrics.icon_width;
         rich.plain(&" ".repeat((((layout.sidebar.width - used) / digit).max(0.0)) as usize));
-        for icon in toggle_icons {
-            rich.icon(icon, dim);
+        for (icon, on) in toggles {
+            rich.icon(icon, if on { self.theme.activity_icon_active } else { dim });
         }
         rich.newline();
 
-        // Row 2: the replace field -- not wired to anything (there is no
-        // find-and-replace behind it yet), shown collapsed and dim the way
-        // VS Code's own replace field reads before it has ever been typed
-        // into.
+        // Row 2: the replace field -- typed into exactly like the query
+        // field (Tab moves between them), with a "Replace All" action on
+        // its trailing icon. A regex search error is shown here too, since
+        // this is the row right above where a broken pattern's "no results"
+        // would otherwise read as simply nothing having matched.
         rich.icon(Icon::Replace, dim);
         rich.plain(" ");
-        rich.colored("Replace", dim);
-        let used = margin + layout.metrics.icon_width + digit + "Replace".len() as f32 * digit
+        let replace_shown = truncate(&self.search_replace_input);
+        if self.search_replace_input.is_empty() && !self.search_replace_focused {
+            rich.colored("Replace", dim);
+        } else {
+            rich.colored(&replace_shown, self.theme.text);
+        }
+        if self.search_replace_focused {
+            rich.colored("\u{2588}", self.theme.cursor);
+        }
+        let used = margin
+            + layout.metrics.icon_width
+            + digit
+            + replace_shown.chars().count() as f32 * digit
             + layout.metrics.icon_width;
         rich.plain(&" ".repeat((((layout.sidebar.width - used) / digit).max(0.0)) as usize));
         rich.icon(Icon::Ellipsis, dim);
+    }
+
+    /// The Source Control panel's own three-row header, in place of the
+    /// plain title line every other panel gets: a title row with a Refresh
+    /// icon, a commit-message field typed into exactly like Search's query
+    /// field, and a Commit button. Matches `sidebar_header_lines()`'s count
+    /// of `3`, the same as `push_search_header`.
+    fn push_git_header(
+        &self,
+        rich: &mut crate::text::RichText,
+        layout: &Layout,
+        truncate: &impl Fn(&str) -> String,
+    ) {
+        use crate::icons::Icon;
+        let dim = self.theme.dim_text;
+        let digit = layout.metrics.digit_width.max(1.0);
+        let margin = 16.0 * layout.scale;
+
+        // Row 0: "SOURCE CONTROL", right-aligned Refresh icon.
+        rich.colored("SOURCE CONTROL", dim);
+        let used = margin + "SOURCE CONTROL".len() as f32 * digit + layout.metrics.icon_width;
+        rich.plain(&" ".repeat((((layout.sidebar.width - used) / digit).max(0.0)) as usize));
+        rich.icon(Icon::Refresh, dim);
+        rich.newline();
+
+        // Row 1: the commit-message field -- typed into exactly like the
+        // Search panel's query field, with a caret only while it has the
+        // keyboard.
+        let message = self.commit_message_input.as_str();
+        let message_shown = truncate(message);
+        let typing = self.focus == InputFocus::CommitMessage;
+        if message.is_empty() && !typing {
+            rich.colored("Message (Enter to commit)", dim);
+        } else {
+            rich.colored(&message_shown, self.theme.text);
+        }
+        if typing {
+            rich.colored("\u{2588}", self.theme.cursor);
+        }
+        rich.newline();
+
+        // Row 2: the Commit button -- lit only once there is a message and
+        // something to commit, so an empty or no-op commit reads as
+        // unavailable before it is ever attempted rather than after.
+        let has_message = !message.trim().is_empty();
+        let has_changes = self.core.git_status().is_some_and(|status| !status.is_clean());
+        let ready = has_message && has_changes;
+        rich.plain("  ");
+        rich.colored("Commit", if ready { self.theme.activity_icon_active } else { dim });
     }
 
     /// The activity bar's icon column: one glyph per cell, the active one
@@ -4010,10 +5284,24 @@ impl LightSpeed {
 
     /// The header's right cluster: run and settings.
     fn title_right_rich(&self) -> crate::text::RichText {
+        // Settings moved to the activity bar's own bottom-pinned cell (see
+        // `activity_settings_rich`), so only Run is left in the title bar.
         let mut rich = crate::text::RichText::new();
         rich.icon(crate::icons::Icon::Play, self.theme.activity_icon_active);
-        rich.plain(" ");
-        rich.icon(crate::icons::Icon::SettingsGear, self.theme.activity_icon_active);
+        rich
+    }
+
+    /// The Settings cell pinned to the bottom of the activity bar: one icon,
+    /// its own region so it never has to share `Region::ActivityBar` with
+    /// the scrolling top list.
+    fn activity_settings_rich(&self) -> crate::text::RichText {
+        let mut rich = crate::text::RichText::new();
+        let color = if self.settings_open {
+            self.theme.activity_icon_active
+        } else {
+            self.theme.activity_icon_inactive
+        };
+        rich.icon(crate::icons::Icon::SettingsGear, color);
         rich
     }
 
@@ -4062,11 +5350,11 @@ impl LightSpeed {
     /// How many lines at the top of the sidebar's row buffer are its own
     /// header rather than a list entry. A plain title is one line; the
     /// Search panel's own header (title + action icons, the search field,
-    /// the replace field -- see `push_search_header`) is three, in either of
-    /// its two states (typing a query, or browsing results), since the
-    /// header block is drawn the same either way.
+    /// the replace field -- see `push_search_header`) and Source Control's
+    /// own header (title + Refresh, the commit-message field, the Commit
+    /// button -- see `push_git_header`) are both three.
     fn sidebar_header_lines(&self) -> usize {
-        if self.showing_search_panel() {
+        if self.showing_search_panel() || self.showing_git_panel() {
             3
         } else {
             1
@@ -4077,6 +5365,42 @@ impl LightSpeed {
     /// query is being typed, or because its results are on screen.
     fn showing_search_panel(&self) -> bool {
         self.search_query_input.is_some() || self.active_list == Some(ListKind::SearchResults)
+    }
+
+    /// Whether the sidebar is showing the Source Control panel -- the
+    /// counterpart `showing_search_panel` check that gates
+    /// `push_git_header`/`click_git_header`.
+    fn showing_git_panel(&self) -> bool {
+        self.active_list == Some(ListKind::GitStatus)
+    }
+
+    /// The Source Control panel's commit graph, laid out in screen terms
+    /// (`compose::SidebarGraph`), when it is showing one -- real branch/merge
+    /// lane topology from `ls_core::commit_graph::lanes`, not a single
+    /// straight line, so `compose.rs` can draw an actual fork or merge.
+    fn git_graph_rows(&self) -> Option<crate::compose::SidebarGraph> {
+        if !self.showing_git_panel() {
+            return None;
+        }
+        let rows = self.list_rows();
+        let graph_header = rows.iter().position(|row| row.kind == crate::theme::SidebarRowKind::Header)?;
+        let first = graph_header + 1;
+        if rows.len() <= first {
+            return None;
+        }
+        let log = self.core.git_log()?;
+        let lanes = ls_core::commit_graph::lanes(log);
+        let offset = self.sidebar_header_lines();
+        let graph_rows = lanes
+            .into_iter()
+            .zip(log)
+            .map(|(lane_row, commit)| crate::compose::SidebarGraphRow {
+                lane: lane_row.lane,
+                edges: lane_row.edges,
+                color: commit_graph_color(&commit.hash),
+            })
+            .collect::<Vec<_>>();
+        Some(crate::compose::SidebarGraph { first_row: first + offset, rows: graph_rows })
     }
 
     /// Puts the keyboard in the search field, restoring the query that
@@ -4093,6 +5417,210 @@ impl LightSpeed {
         }
         self.active_list = Some(ListKind::SearchResults);
         self.focus = InputFocus::SearchQuery;
+        self.search_replace_focused = false;
+        self.request_redraw();
+    }
+
+    /// Puts the keyboard in the replace field, the same way
+    /// `focus_search_field` does for the query field.
+    fn focus_replace_field(&mut self) {
+        self.active_list = Some(ListKind::SearchResults);
+        self.focus = InputFocus::SearchQuery;
+        self.search_replace_focused = true;
+        self.request_redraw();
+    }
+
+    /// Routes a click somewhere in the Search panel's three header rows to
+    /// whichever control it actually landed on.
+    fn click_search_header(&mut self, row: usize, x: f32, layout: &Layout) {
+        let hit =
+            search_header_click(row, x, layout.sidebar.right(), layout.metrics.icon_width);
+        match hit {
+            SearchHeaderClick::QueryField => self.focus_search_field(),
+            SearchHeaderClick::ReplaceField => self.focus_replace_field(),
+            SearchHeaderClick::TitleIcon(index) => match index {
+                0 => self.refresh_search(),
+                1 => self.clear_search(),
+                2 => self.open_search_results_as_document(),
+                _ => self.search_collapsed = !self.search_collapsed,
+            },
+            SearchHeaderClick::ToggleIcon(index) => {
+                match index {
+                    0 => self.search_options.case_sensitive = !self.search_options.case_sensitive,
+                    1 => self.search_options.whole_word = !self.search_options.whole_word,
+                    _ => self.search_options.regex = !self.search_options.regex,
+                }
+                self.run_pending_search();
+            }
+            SearchHeaderClick::ReplaceIcon => self.replace_all_in_results(),
+        }
+        self.request_redraw();
+    }
+
+    /// Re-runs the last submitted query under the current toggles -- the
+    /// title row's Refresh icon.
+    fn refresh_search(&mut self) {
+        let query = self
+            .search_query_input
+            .clone()
+            .or_else(|| self.core.workspace_search_result().map(|result| result.query.clone()));
+        if let Some(query) = query {
+            self.search_query_input = Some(query);
+            self.run_pending_search();
+        }
+    }
+
+    /// Empties the query and whatever results are on screen -- the title
+    /// row's Clear All icon.
+    fn clear_search(&mut self) {
+        self.search_query_input = Some(String::new());
+        self.list_selected = 0;
+        self.focus_search_field();
+    }
+
+    /// Dumps the current results as a new untitled document -- one line per
+    /// hit, `path:line: preview` -- the title row's New Search Editor icon.
+    /// Nothing already open is touched; this is a snapshot, not a live view.
+    fn open_search_results_as_document(&mut self) {
+        let Some(result) = self.core.workspace_search_result().cloned() else {
+            self.set_status("Nothing to show yet -- run a search first", Severity::Warning);
+            return;
+        };
+        if result.hits.is_empty() {
+            self.set_status("No results to show", Severity::Warning);
+            return;
+        }
+        let mut text = format!("# Search results for \"{}\"\n\n", result.query);
+        for hit in &result.hits {
+            text.push_str(&format!(
+                "{}:{}: {}\n",
+                hit.path.display(),
+                hit.line_number,
+                hit.preview
+            ));
+        }
+        let count = result.hits.len();
+        let id = self.core.new_document();
+        let _ = self.core.execute("edit.insert_text", CommandArgs::Text(text));
+        self.adopt_new_document(id);
+        self.set_status(format!("{count} results"), Severity::Success);
+    }
+
+    /// Rewrites every matched line across every result's file, replacing the
+    /// exact match each hit already found with the replace field's text --
+    /// the replace row's own icon. Runs the search fresh immediately after,
+    /// since the files just changed under it.
+    fn replace_all_in_results(&mut self) {
+        let Some(result) = self.core.workspace_search_result().cloned() else {
+            self.set_status("Nothing to replace -- run a search first", Severity::Warning);
+            return;
+        };
+        if result.hits.is_empty() {
+            self.set_status("No matches to replace", Severity::Warning);
+            return;
+        }
+        let Some(root) = self.core.workspace().root().map(|root| root.as_path().to_path_buf())
+        else {
+            return;
+        };
+        let replacement = self.search_replace_input.clone();
+
+        // Grouped by file first: several hits can land in the same file,
+        // and each rewrite has to account for every one of them at once
+        // rather than reading the file fresh (and stale) per hit.
+        let mut by_file: std::collections::BTreeMap<PathBuf, Vec<usize>> = Default::default();
+        for hit in &result.hits {
+            by_file.entry(hit.path.clone()).or_default().push(hit.line_number);
+        }
+
+        let mut files_changed = 0usize;
+        let mut lines_changed = 0usize;
+        for (relative, line_numbers) in by_file {
+            let full = root.join(&relative);
+            let Ok(contents) = std::fs::read_to_string(&full) else { continue };
+            let wanted: std::collections::HashSet<usize> = line_numbers.into_iter().collect();
+            let mut rewritten = String::with_capacity(contents.len());
+            let mut changed_here = false;
+            for (index, line) in contents.split_inclusive('\n').enumerate() {
+                let line_number = index + 1;
+                if wanted.contains(&line_number) {
+                    if let Some(replaced) = replace_first_match(line, &self.search_options, &result.query, &replacement)
+                    {
+                        rewritten.push_str(&replaced);
+                        changed_here = true;
+                        lines_changed += 1;
+                        continue;
+                    }
+                }
+                rewritten.push_str(line);
+            }
+            if changed_here && ls_platform::write_file_atomic(&full, rewritten.as_bytes()).is_ok() {
+                files_changed += 1;
+            }
+        }
+
+        self.set_status(
+            format!("Replaced {lines_changed} match{} across {files_changed} file{}",
+                if lines_changed == 1 { "" } else { "es" },
+                if files_changed == 1 { "" } else { "s" }),
+            Severity::Success,
+        );
+        self.run_pending_search();
+    }
+
+    /// Puts the keyboard in the commit-message field -- the Source Control
+    /// panel's counterpart to `focus_search_field`.
+    fn focus_commit_message(&mut self) {
+        self.active_list = Some(ListKind::GitStatus);
+        self.focus = InputFocus::CommitMessage;
+        self.request_redraw();
+    }
+
+    /// Re-requests both the status and the history list -- the Source
+    /// Control header's Refresh icon.
+    fn refresh_git_status(&mut self) {
+        let _ = self.core.request_git_status();
+        let _ = self.core.request_git_log();
+        self.request_redraw();
+    }
+
+    /// Stages every change and commits it with the typed message in one
+    /// step -- the same "just commit everything" default VS Code's Source
+    /// Control view falls back to when nothing has been staged by hand, and
+    /// the only staging model this panel offers today (see the module doc
+    /// comment on `crates/core/src/git.rs` for why per-file staging is not
+    /// attempted yet). Does nothing with an empty message or a clean tree,
+    /// mirroring the Commit button's own dimmed state so a stray Enter can
+    /// never fire an accidental empty commit.
+    fn commit_all_changes(&mut self) {
+        let message = self.commit_message_input.trim().to_string();
+        if message.is_empty() {
+            self.set_status("Type a commit message first", Severity::Warning);
+            return;
+        }
+        let has_changes = self.core.git_status().is_some_and(|status| !status.is_clean());
+        if !has_changes {
+            self.set_status("Nothing to commit", Severity::Warning);
+            return;
+        }
+        match self.core.request_git_commit(message) {
+            Ok(_) => self.commit_message_input.clear(),
+            Err(error) => self.set_status(error.to_string(), Severity::Error),
+        }
+        self.request_redraw();
+    }
+
+    /// Routes a click somewhere in the Source Control panel's three header
+    /// rows to whichever control it actually landed on. Mirrors
+    /// `click_search_header`.
+    fn click_git_header(&mut self, row: usize, x: f32, layout: &Layout) {
+        let hit = git_header_click(row, x, layout.sidebar.right(), layout.metrics.icon_width);
+        match hit {
+            GitHeaderClick::Refresh => self.refresh_git_status(),
+            GitHeaderClick::Title => self.focus_list(),
+            GitHeaderClick::MessageField => self.focus_commit_message(),
+            GitHeaderClick::CommitButton => self.commit_all_changes(),
+        }
         self.request_redraw();
     }
 
@@ -4282,7 +5810,7 @@ impl LightSpeed {
         }
 
         let panel_rows = self.panel_rows();
-        let sidebar_rich = self.sidebar_rows(&layout);
+        let (sidebar_rich, sidebar_search_highlights) = self.sidebar_rows(&layout);
         // Clamped here rather than only where the wheel mutates it: the row
         // list itself can shrink between frames (a directory collapses, a
         // search returns fewer hits) and leave a stale scroll position
@@ -4336,6 +5864,7 @@ impl LightSpeed {
             if self.bottom_panel_visible() { self.bottom_panel_rows(&layout) } else { Vec::new() };
         let activity_active = self.activity_active_index();
         let activity = self.activity_rich();
+        let activity_settings = self.activity_settings_rich();
         let bottom_panel_rail = self.bottom_panel_rail_rich();
         let title_left = self.title_left_rich();
         let title_center = self.title_center_rich();
@@ -4396,6 +5925,17 @@ impl LightSpeed {
             placeholder: dependency_placeholder,
         });
 
+        // Only when the active document actually is Markdown -- toggling
+        // the flag on anything else is the quiet no-op
+        // `toggle_markdown_preview`'s own doc comment describes.
+        let markdown_preview_source: Option<String> = self
+            .markdown_preview
+            .then(|| self.core.active_document())
+            .flatten()
+            .filter(|document| document.language() == ls_core::Language::Markdown)
+            .map(|document| document.text().to_string());
+
+        let sidebar_graph = self.git_graph_rows();
         let renderer = self.renderer.as_mut().expect("renderer checked above");
         let frame = Frame {
             layout,
@@ -4419,6 +5959,9 @@ impl LightSpeed {
             sidebar_selected_row,
             sidebar_hovered_row: self.sidebar_hovered_row,
             sidebar_scroll_y: self.sidebar_scroll_y,
+            sidebar_graph,
+            sidebar_search_highlights: &sidebar_search_highlights,
+            terminal_selection: self.terminal_selection,
             palette: palette_rich.as_ref(),
             palette_panel: self.palette_geometry,
             palette_selected,
@@ -4426,6 +5969,10 @@ impl LightSpeed {
             activity: &activity,
             activity_active,
             activity_hovered: self.activity_hovered,
+            activity_settings: &activity_settings,
+            activity_settings_active: self.settings_open,
+            activity_settings_hovered: self.activity_settings_hovered,
+            title_actions_hovered: self.title_actions_hovered,
             bottom_panel: (!bottom_panel_rows.is_empty()).then_some(bottom_panel_rows.as_slice()),
             bottom_panel_rail: &bottom_panel_rail,
             title_left: &title_left,
@@ -4436,6 +5983,8 @@ impl LightSpeed {
             tab_actions: &tab_actions,
             dependency,
             settings: settings_frame,
+            markdown_preview: markdown_preview_source.as_deref(),
+            markdown_scroll_y: view.scroll_y,
         };
 
         match renderer.render(&frame) {
@@ -4566,6 +6115,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
             self.request_redraw();
         }
         self.tick_search_debounce();
+        self.tick_toolchain_rechecks();
         match self.next_wakeup() {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),
             None => event_loop.set_control_flow(ControlFlow::Wait),
@@ -4577,6 +6127,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
         match event {
             UserEvent::TaskCompleted => self.pump_background_work(),
             UserEvent::TerminalOutput => self.drain_terminal_output(),
+            UserEvent::TaskTerminalOutput => self.drain_task_terminal_output(),
             UserEvent::LspDiagnostics => self.drain_lsp_diagnostics(),
             UserEvent::FolderPicked(result) => self.folder_picked(*result),
         }
@@ -4601,6 +6152,16 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
+            }
+            // `open_path` already treats a directory as "open this as the
+            // workspace" (the same rule `lightspeed .` on the command line
+            // uses) and a file as an ordinary open, so a drop needs nothing
+            // beyond handing it the path. One `DroppedFile` event per path,
+            // so dropping several files at once opens each in turn rather
+            // than needing to batch them.
+            WindowEvent::DroppedFile(path) => {
+                self.open_path(path);
+                self.request_redraw();
             }
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => {
                 if event.state != ElementState::Pressed {
@@ -4709,6 +6270,16 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                 // The command runner owns the keyboard while it is shown.
                 if self.focus == InputFocus::Terminal {
                     match &event.logical_key {
+                        // Copies the selected span of the terminal's own
+                        // rows (`terminal_selection`), not whatever a
+                        // document might have selected -- checked first, so
+                        // it never falls through to `terminal_insert` as a
+                        // literal "c".
+                        winit::keyboard::Key::Character(text)
+                            if self.modifiers.control_key() && text.eq_ignore_ascii_case("c") =>
+                        {
+                            self.copy_terminal_selection();
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape)
                         | winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) => {
                             self.toggle_terminal();
@@ -4739,11 +6310,19 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                         // do nothing, which is what made the caret look
                         // stuck in place.
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowLeft) => {
-                            self.terminal_move_left();
+                            if self.modifiers.control_key() {
+                                self.terminal_move_word_left();
+                            } else {
+                                self.terminal_move_left();
+                            }
                             self.request_redraw();
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight) => {
-                            self.terminal_move_right();
+                            if self.modifiers.control_key() {
+                                self.terminal_move_word_right();
+                            } else {
+                                self.terminal_move_right();
+                            }
                             self.request_redraw();
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home) => {
@@ -4804,20 +6383,36 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
                             self.search_query_input = None;
                             self.search_debounce_deadline = None;
+                            self.search_replace_focused = false;
                             self.refresh_focus();
                             self.request_redraw();
                         }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Tab) => {
+                            // Steps between the query and replace fields,
+                            // the way Tab already moves between fields
+                            // everywhere else in the chrome.
+                            self.search_replace_focused = !self.search_replace_focused;
+                            self.request_redraw();
+                        }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
-                            if let Some(query) = self.search_query_input.as_mut() {
-                                query.pop();
+                            if self.search_replace_focused {
+                                self.search_replace_input.pop();
+                                self.request_redraw();
+                            } else {
+                                if let Some(query) = self.search_query_input.as_mut() {
+                                    query.pop();
+                                }
+                                self.schedule_search_debounce();
                             }
-                            self.schedule_search_debounce();
                         }
                         winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
-                            // Enter on a highlighted result opens it; with no
-                            // results yet it forces the pending search to run
-                            // now rather than waiting out the debounce.
-                            if self.search_result_rows() == 0 {
+                            if self.search_replace_focused {
+                                self.replace_all_in_results();
+                            } else if self.search_result_rows() == 0 {
+                                // Enter on a highlighted result opens it;
+                                // with no results yet it forces the pending
+                                // search to run now rather than waiting out
+                                // the debounce.
                                 self.run_pending_search();
                             } else {
                                 self.activate_list_selection();
@@ -4839,10 +6434,46 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                                 let printable: String =
                                     text.chars().filter(|c| !c.is_control()).collect();
                                 if !printable.is_empty() {
-                                    if let Some(query) = self.search_query_input.as_mut() {
-                                        query.push_str(&printable);
+                                    if self.search_replace_focused {
+                                        self.search_replace_input.push_str(&printable);
+                                        self.request_redraw();
+                                    } else {
+                                        if let Some(query) = self.search_query_input.as_mut() {
+                                            query.push_str(&printable);
+                                        }
+                                        self.schedule_search_debounce();
                                     }
-                                    self.schedule_search_debounce();
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Typing a commit message. Enter (with or without Ctrl, since
+                // there is no multi-line body to a Return in this single-line
+                // field) commits; Escape drops back to the panel's list the
+                // same way it drops the search query.
+                if self.focus == InputFocus::CommitMessage {
+                    match &event.logical_key {
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape) => {
+                            self.focus_list();
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Backspace) => {
+                            self.commit_message_input.pop();
+                            self.request_redraw();
+                        }
+                        winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter) => {
+                            self.commit_all_changes();
+                        }
+                        _ => {
+                            if let Some(text) = event.text.as_ref() {
+                                let printable: String =
+                                    text.chars().filter(|c| !c.is_control()).collect();
+                                if !printable.is_empty() {
+                                    self.commit_message_input.push_str(&printable);
+                                    self.request_redraw();
                                 }
                             }
                         }
@@ -4927,6 +6558,23 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.pending_input.get_or_insert_with(Instant::now);
+                // Ctrl+scroll zooms the font, wherever the pointer is --
+                // the same modifier every other editor and every browser
+                // already uses for it, so it works without landing on the
+                // editor's text specifically the way a plain scroll's
+                // target-routing below requires.
+                if self.modifiers.control_key() {
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, dy) => dy,
+                        MouseScrollDelta::PixelDelta(position) => position.y as f32 / 40.0,
+                    };
+                    if dy > 0.0 {
+                        self.adjust_font_size(1);
+                    } else if dy < 0.0 {
+                        self.adjust_font_size(-1);
+                    }
+                    return;
+                }
                 let (x, y) = self.pointer;
                 let target = match self.last_layout {
                     Some(layout) => wheel_target(&layout, self.focus, x, y),
@@ -5063,6 +6711,16 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                             crate::layout::clamp_bottom_panel_height(requested);
                         self.request_redraw();
                     }
+                } else if self.dragging_terminal_selection {
+                    if let (Some(layout), Some(renderer)) = (self.last_layout, self.renderer.as_ref())
+                    {
+                        let (x, y) = self.pointer;
+                        let point = renderer.terminal_position_at_point(&layout, x, y);
+                        if let Some((anchor, _)) = self.terminal_selection {
+                            self.terminal_selection = Some((anchor, point));
+                        }
+                        self.request_redraw();
+                    }
                 } else if let Some(layout) = self.last_layout {
                     self.update_pointer_interaction(&layout);
                 }
@@ -5080,6 +6738,7 @@ impl ApplicationHandler<UserEvent> for LightSpeed {
                         self.dragging_scrollbar = false;
                         self.dragging_sidebar = false;
                         self.dragging_bottom_panel = false;
+                        self.dragging_terminal_selection = false;
                     }
                 }
             }
@@ -5132,8 +6791,17 @@ mod tests {
         // finishing -- used to see the still-open panel and hand focus
         // straight back to it, so every keystroke after the first went to
         // the list's Up/Down/Enter handler instead of the document.
-        let focus =
-            derive_focus(InputFocus::Editor, false, false, false, false, true, false, false);
+        let focus = derive_focus(
+            InputFocus::Editor,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+        );
         assert_eq!(
             focus,
             InputFocus::Editor,
@@ -5147,11 +6815,21 @@ mod tests {
         // none of these should be able to bounce focus away from wherever
         // the user actually is, as long as that surface is still open.
         assert_eq!(
-            derive_focus(InputFocus::List, false, false, false, false, true, false, false),
+            derive_focus(InputFocus::List, false, false, false, false, true, false, false, false),
             InputFocus::List
         );
         assert_eq!(
-            derive_focus(InputFocus::Terminal, false, false, false, false, false, true, false),
+            derive_focus(
+                InputFocus::Terminal,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false
+            ),
             InputFocus::Terminal
         );
     }
@@ -5159,11 +6837,23 @@ mod tests {
     #[test]
     fn a_resting_focus_falls_back_to_the_editor_once_its_surface_closes() {
         assert_eq!(
-            derive_focus(InputFocus::List, false, false, false, false, false, false, false),
+            derive_focus(
+                InputFocus::List, false, false, false, false, false, false, false, false
+            ),
             InputFocus::Editor
         );
         assert_eq!(
-            derive_focus(InputFocus::Terminal, false, false, false, false, false, false, false),
+            derive_focus(
+                InputFocus::Terminal,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             InputFocus::Editor
         );
     }
@@ -5175,11 +6865,21 @@ mod tests {
         // simply opening the explorer while the user is mid-edit would yank
         // the keyboard away without them asking for it.
         assert_eq!(
-            derive_focus(InputFocus::Editor, false, false, false, false, true, false, false),
+            derive_focus(InputFocus::Editor, false, false, false, false, true, false, false, false),
             InputFocus::Editor
         );
         assert_eq!(
-            derive_focus(InputFocus::Editor, false, false, false, false, false, true, false),
+            derive_focus(
+                InputFocus::Editor,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false
+            ),
             InputFocus::Editor
         );
     }
@@ -5197,8 +6897,17 @@ mod tests {
             (false, false, true, false),
             (false, false, false, true),
         ] {
-            let focus =
-                derive_focus(InputFocus::List, prompt, menu, false, find, true, false, palette);
+            let focus = derive_focus(
+                InputFocus::List,
+                prompt,
+                menu,
+                false,
+                find,
+                true,
+                false,
+                palette,
+                false,
+            );
             assert_ne!(focus, InputFocus::List, "an exclusive surface must win over a resting one");
         }
     }
@@ -5212,19 +6921,76 @@ mod tests {
         // diagnostics update, a heartbeat tick) -- the editor read as
         // permanently stuck until Escape.
         assert_eq!(
-            derive_focus(InputFocus::Editor, false, false, true, false, false, false, false),
+            derive_focus(InputFocus::Editor, false, false, true, false, false, false, false, false),
             InputFocus::Editor,
             "a query being open must not be able to grab focus the click already left"
         );
         assert_eq!(
-            derive_focus(InputFocus::SearchQuery, false, false, true, false, false, false, false),
+            derive_focus(
+                InputFocus::SearchQuery,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             InputFocus::SearchQuery,
             "but it is still a resting focus: unrelated refreshes must not evict it either"
         );
         assert_eq!(
-            derive_focus(InputFocus::SearchQuery, false, false, false, false, false, false, false),
+            derive_focus(
+                InputFocus::SearchQuery,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
             InputFocus::Editor,
             "falls back to the editor once the query itself closes"
+        );
+    }
+
+    #[test]
+    fn commit_message_focus_rests_while_the_source_control_panel_stays_open() {
+        // The same resting treatment as `SearchQuery` above, keyed on the
+        // Source Control panel (not the message text) staying open, so an
+        // unrelated refresh mid-commit-draft cannot bounce focus away.
+        assert_eq!(
+            derive_focus(
+                InputFocus::CommitMessage,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            InputFocus::CommitMessage,
+            "stays put while the panel is still open"
+        );
+        assert_eq!(
+            derive_focus(
+                InputFocus::CommitMessage,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ),
+            InputFocus::Editor,
+            "falls back to the editor once the panel itself closes"
         );
     }
 
@@ -5471,9 +7237,9 @@ mod tests {
         // -- including the search field itself. Clicking the field claimed
         // list focus, so every keystroke after that went to the results
         // instead of the box the caret was blinking in.
-        assert_eq!(sidebar_click(1, 3, true), SidebarClick::SearchField, "the query field");
-        assert_eq!(sidebar_click(2, 3, true), SidebarClick::SearchField, "the replace field");
-        assert_eq!(sidebar_click(0, 3, true), SidebarClick::SearchField, "the title row");
+        assert_eq!(sidebar_click(1, 3, true), SidebarClick::HeaderField, "the query field");
+        assert_eq!(sidebar_click(2, 3, true), SidebarClick::HeaderField, "the replace field");
+        assert_eq!(sidebar_click(0, 3, true), SidebarClick::HeaderField, "the title row");
     }
 
     #[test]
@@ -5485,11 +7251,92 @@ mod tests {
 
     #[test]
     fn an_ordinary_panels_title_row_is_not_a_text_field() {
-        // The explorer and git panels have a caption, not an input: clicking
-        // it must not try to focus something that does not exist.
+        // The explorer has a caption, not an input: clicking it must not try
+        // to focus something that does not exist.
         assert_eq!(sidebar_click(0, 1, false), SidebarClick::Header);
         assert_eq!(sidebar_click(1, 1, false), SidebarClick::Row(0));
         assert_eq!(sidebar_click(4, 1, false), SidebarClick::Row(3));
+    }
+
+    #[test]
+    fn clicking_the_commit_message_field_focuses_it_instead_of_the_changes_list() {
+        // Same fix as the Search panel's field-header regression, applied to
+        // Source Control's own three-row header (title/Refresh, message,
+        // Commit button).
+        assert_eq!(sidebar_click(0, 3, true), SidebarClick::HeaderField, "the title row");
+        assert_eq!(sidebar_click(1, 3, true), SidebarClick::HeaderField, "the message field");
+        assert_eq!(sidebar_click(2, 3, true), SidebarClick::HeaderField, "the commit button");
+        assert_eq!(sidebar_click(3, 3, true), SidebarClick::Row(0), "past the header, a real row");
+    }
+
+    #[test]
+    fn git_header_click_resolves_each_of_its_three_rows() {
+        let right = 300.0;
+        let icon = 20.0;
+        assert_eq!(git_header_click(0, right - icon / 2.0, right, icon), GitHeaderClick::Refresh);
+        assert_eq!(git_header_click(0, 10.0, right, icon), GitHeaderClick::Title);
+        assert_eq!(git_header_click(1, 10.0, right, icon), GitHeaderClick::MessageField);
+        assert_eq!(git_header_click(1, right - 1.0, right, icon), GitHeaderClick::MessageField);
+        assert_eq!(git_header_click(2, 10.0, right, icon), GitHeaderClick::CommitButton);
+        assert_eq!(
+            git_header_click(2, right - 1.0, right, icon),
+            GitHeaderClick::CommitButton,
+            "row 2 is the button in full -- there is nothing else on it to hit-test apart from"
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_titles_icon_strip_names_the_right_icon() {
+        // [Refresh, ClearAll, NewFile, CollapseAll], right-aligned against
+        // the sidebar's own edge.
+        let right = 300.0;
+        let icon = 20.0;
+        for index in 0..4 {
+            let x = right - 4.0 * icon + icon * index as f32 + icon / 2.0;
+            assert_eq!(
+                search_header_click(0, x, right, icon),
+                SearchHeaderClick::TitleIcon(index),
+                "icon {index} at x={x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_left_of_the_icon_strip_is_the_field_it_sits_on() {
+        let right = 300.0;
+        let icon = 20.0;
+        assert_eq!(search_header_click(1, 10.0, right, icon), SearchHeaderClick::QueryField);
+        assert_eq!(search_header_click(2, 10.0, right, icon), SearchHeaderClick::ReplaceField);
+    }
+
+    #[test]
+    fn the_toggle_row_has_exactly_three_icons_in_order() {
+        let right = 300.0;
+        let icon = 20.0;
+        assert_eq!(
+            search_header_click(1, right - 1.5 * icon, right, icon),
+            SearchHeaderClick::ToggleIcon(1),
+            "case-sensitive(0), whole-word(1), regex(2)"
+        );
+    }
+
+    #[test]
+    fn the_replace_row_has_one_icon_the_ellipsis() {
+        let right = 300.0;
+        let icon = 20.0;
+        assert_eq!(
+            search_header_click(2, right - icon / 2.0, right, icon),
+            SearchHeaderClick::ReplaceIcon
+        );
+    }
+
+    #[test]
+    fn a_click_exactly_at_the_sidebars_edge_still_resolves_to_the_last_icon() {
+        // Floating point can land a click a hair past the strip's own
+        // right edge; it must still name the last icon rather than nothing.
+        let right = 300.0;
+        let icon = 20.0;
+        assert_eq!(search_header_click(0, right, right, icon), SearchHeaderClick::TitleIcon(3));
     }
 
     #[test]
@@ -5569,7 +7416,15 @@ mod tests {
         let core = editor_at(&root);
 
         let mut rows = Vec::new();
-        append_tree_level(&core, &std::collections::HashSet::new(), &root, 0, &mut rows);
+        append_tree_level(
+            &core,
+            &std::collections::HashSet::new(),
+            &ls_core::gitignore::IgnoreSet::default(),
+            &root,
+            &root,
+            0,
+            &mut rows,
+        );
 
         assert_eq!(rows.len(), 2, "one directory row, one file row, nothing from inside src/");
         let dir_row = rows.iter().find(|r| r.label.contains("src")).unwrap();
@@ -5594,7 +7449,15 @@ mod tests {
         let mut expanded = std::collections::HashSet::new();
         expanded.insert(root.join("src"));
         let mut rows = Vec::new();
-        append_tree_level(&core, &expanded, &root, 0, &mut rows);
+        append_tree_level(
+            &core,
+            &expanded,
+            &ls_core::gitignore::IgnoreSet::default(),
+            &root,
+            &root,
+            0,
+            &mut rows,
+        );
 
         assert_eq!(rows.len(), 2, "the directory row, plus main.rs inside it");
         let dir_row = &rows[0];
@@ -5631,7 +7494,15 @@ mod tests {
         expanded.insert(root.join("alpha"));
         expanded.insert(root.join("beta"));
         let mut rows = Vec::new();
-        append_tree_level(&core, &expanded, &root, 0, &mut rows);
+        append_tree_level(
+            &core,
+            &expanded,
+            &ls_core::gitignore::IgnoreSet::default(),
+            &root,
+            &root,
+            0,
+            &mut rows,
+        );
 
         assert_eq!(rows.len(), 4, "alpha, a.rs, beta, b.rs");
         assert!(rows.iter().any(|r| r.label.contains("a.rs")));
@@ -5652,8 +7523,58 @@ mod tests {
         let core = editor_at(&root);
 
         let mut rows = Vec::new();
-        append_tree_level(&core, &std::collections::HashSet::new(), &root, 0, &mut rows);
+        append_tree_level(
+            &core,
+            &std::collections::HashSet::new(),
+            &ls_core::gitignore::IgnoreSet::default(),
+            &root,
+            &root,
+            0,
+            &mut rows,
+        );
         assert_eq!(rows.len(), 1, "only the collapsed huge/ row itself, none of its 50 files");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_gitignored_entry_never_becomes_a_row() {
+        let root = scratch_workspace("ignored");
+        std::fs::create_dir_all(root.join("node_modules")).unwrap();
+        std::fs::write(root.join("node_modules/pkg.js"), "").unwrap();
+        std::fs::write(root.join("keep.rs"), "").unwrap();
+        let core = editor_at(&root);
+        let ignore = ls_core::gitignore::IgnoreSet::load(&root); // no .gitignore yet
+
+        let mut rows = Vec::new();
+        append_tree_level(
+            &core,
+            &std::collections::HashSet::new(),
+            &ignore,
+            &root,
+            &root,
+            0,
+            &mut rows,
+        );
+        assert_eq!(rows.len(), 2, "both node_modules/ and keep.rs show up with no .gitignore yet");
+
+        std::fs::write(root.join(".gitignore"), "node_modules\n").unwrap();
+        let ignore = ls_core::gitignore::IgnoreSet::load(&root);
+        let mut rows = Vec::new();
+        append_tree_level(
+            &core,
+            &std::collections::HashSet::new(),
+            &ignore,
+            &root,
+            &root,
+            0,
+            &mut rows,
+        );
+        // node_modules/ is gone; keep.rs and the newly-written .gitignore
+        // itself (which matches no pattern of its own) are the only rows.
+        assert_eq!(rows.len(), 2, "node_modules/ is gone once .gitignore names it");
+        assert!(!rows.iter().any(|row| row.label.contains("node_modules")));
+        assert!(rows.iter().any(|row| row.label.contains("keep.rs")));
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -147,6 +147,23 @@ fn parameters() -> SimulationParameters {
 
 // --- stage 1: the settled simulation (expensive, cached) ---------------------
 
+/// One reference from one file to another, carried from
+/// `ls_core::dependency_graph::Edge` through the simulation and into the
+/// scene the view draws.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EdgeRef {
+    /// Index into `Settled::files`/`Scene::nodes` for the importing file.
+    pub from: usize,
+    /// Index into `Settled::files`/`Scene::nodes` for the imported file.
+    pub to: usize,
+    /// 1-based line, in `from`, where the reference was written -- what an
+    /// edge click in the view jumps to.
+    pub line: usize,
+    /// The reference as written (`models.User`, `./widget`, `crate::parser`)
+    /// -- drawn as the edge's own label in the view.
+    pub label: String,
+}
+
 /// Where the simulation left every file, and what joins them.
 ///
 /// Everything here depends only on the code that was scanned -- not on the
@@ -156,8 +173,8 @@ fn parameters() -> SimulationParameters {
 pub struct Settled {
     /// Workspace-relative paths, in the order everything else indexes them.
     pub files: Vec<PathBuf>,
-    /// `(importer, imported)` pairs, as indices into `files`.
-    pub edges: Vec<(usize, usize)>,
+    /// Every reference found, indices into `files`.
+    pub edges: Vec<EdgeRef>,
     /// Where each file came to rest, in the simulation's own coordinates.
     pub positions: Vec<(f32, f32)>,
     /// Whether the scan stopped early because the workspace was too large.
@@ -170,7 +187,7 @@ pub fn settle_graph(graph: &DependencyGraph) -> Settled {
         graph.files.iter().enumerate().map(|(at, file)| (file.as_path(), at)).collect();
 
     let mut degree = vec![0.0_f32; graph.files.len()];
-    let mut edges: Vec<(usize, usize)> = Vec::with_capacity(graph.edges.len());
+    let mut edges: Vec<EdgeRef> = Vec::with_capacity(graph.edges.len());
     for edge in &graph.edges {
         let (Some(from), Some(to)) = (index.get(edge.from.as_path()), index.get(edge.to.as_path()))
         else {
@@ -178,11 +195,12 @@ pub fn settle_graph(graph: &DependencyGraph) -> Settled {
         };
         degree[*from] += 1.0;
         degree[*to] += 1.0;
-        edges.push((*from, *to));
+        edges.push(EdgeRef { from: *from, to: *to, line: edge.line, label: edge.label.clone() });
     }
 
+    let endpoints: Vec<(usize, usize)> = edges.iter().map(|edge| (edge.from, edge.to)).collect();
     Settled {
-        positions: settle(&degree, &edges),
+        positions: settle(&degree, &endpoints),
         files: graph.files.clone(),
         edges,
         truncated: graph.truncated,
@@ -251,7 +269,7 @@ fn seed(at: usize) -> (f32, f32) {
 
 /// Version marker on the first line of a cache file. Bumped whenever the
 /// format changes, so an old file is ignored rather than misread.
-const CACHE_VERSION: &str = "lightspeed-depgraph 1";
+const CACHE_VERSION: &str = "lightspeed-depgraph 3";
 
 /// Writes a settled graph out as text.
 ///
@@ -274,8 +292,10 @@ pub fn encode(root: &Path, settled: &Settled) -> String {
         out.push_str(&format!("{x:.3} {y:.3} {}\n", file.display()));
     }
     out.push_str(&format!("edges {}\n", settled.edges.len()));
-    for (from, to) in &settled.edges {
-        out.push_str(&format!("{from} {to}\n"));
+    for edge in &settled.edges {
+        // The label comes last on its line for the same reason a path does
+        // above: it is the one field that may itself contain a space.
+        out.push_str(&format!("{} {} {} {}\n", edge.from, edge.to, edge.line, edge.label));
     }
     out
 }
@@ -316,12 +336,17 @@ pub fn decode(root: &Path, text: &str) -> Option<Settled> {
     let count: usize = lines.next()?.strip_prefix("edges ")?.parse().ok()?;
     let mut edges = Vec::with_capacity(count);
     for _ in 0..count {
-        let (from, to) = lines.next()?.split_once(' ')?;
-        let edge = (from.parse::<usize>().ok()?, to.parse::<usize>().ok()?);
-        if edge.0 >= files.len() || edge.1 >= files.len() {
+        // `splitn(4, ..)` so a label containing a space is read back whole
+        // rather than truncated at its first word.
+        let mut parts = lines.next()?.splitn(4, ' ');
+        let from: usize = parts.next()?.parse().ok()?;
+        let to: usize = parts.next()?.parse().ok()?;
+        let line: usize = parts.next()?.parse().ok()?;
+        let label = parts.next().unwrap_or("").to_string();
+        if from >= files.len() || to >= files.len() {
             return None;
         }
-        edges.push(edge);
+        edges.push(EdgeRef { from, to, line, label });
     }
 
     Some(Settled { files, edges, positions, truncated })
@@ -363,8 +388,8 @@ pub struct Scene {
     /// rather than disappearing behind it.
     pub nodes: Vec<Node>,
     pub segments: Vec<Segment>,
-    /// `(importer, imported)` as indices into `nodes`.
-    pub edges: Vec<(usize, usize)>,
+    /// `from`/`to` are indices into `nodes`.
+    pub edges: Vec<EdgeRef>,
     /// The pane this was fitted to.
     pub width: f32,
     pub height: f32,
@@ -379,14 +404,21 @@ pub struct Scene {
 impl Scene {
     /// Whether `node` is either end of `edge`.
     pub fn touches(&self, edge: usize, node: usize) -> bool {
-        self.edges.get(edge).is_some_and(|(from, to)| *from == node || *to == node)
+        self.edges.get(edge).is_some_and(|edge| edge.from == node || edge.to == node)
     }
 
     /// How many files this one imports, and how many import it.
     pub fn connections(&self, node: usize) -> (usize, usize) {
-        let out = self.edges.iter().filter(|(from, _)| *from == node).count();
-        let inward = self.edges.iter().filter(|(_, to)| *to == node).count();
+        let out = self.edges.iter().filter(|edge| edge.from == node).count();
+        let inward = self.edges.iter().filter(|edge| edge.to == node).count();
         (out, inward)
+    }
+
+    /// The file an edge's reference was written in, and the line it was
+    /// written on -- what a click on the edge in the view opens.
+    pub fn edge_source(&self, edge: usize) -> Option<(&Path, usize)> {
+        let edge = self.edges.get(edge)?;
+        Some((self.nodes.get(edge.from)?.path.as_path(), edge.line))
     }
 }
 
@@ -404,10 +436,10 @@ pub fn build_scene(settled: &Settled, viewport: (f32, f32)) -> Scene {
 
     let mut degree = vec![0.0_f32; settled.files.len()];
     let mut imported = vec![false; settled.files.len()];
-    for (from, to) in &settled.edges {
-        degree[*from] += 1.0;
-        degree[*to] += 1.0;
-        imported[*to] = true;
+    for edge in &settled.edges {
+        degree[edge.from] += 1.0;
+        degree[edge.to] += 1.0;
+        imported[edge.to] = true;
     }
 
     // Fitted twice: the first pass reserves room for the biggest circle a
@@ -415,8 +447,10 @@ pub fn build_scene(settled: &Settled, viewport: (f32, f32)) -> Scene {
     // actually got, which is what decides how big the circles really are.
     // The second pass then reclaims whatever the first over-reserved.
     let roomy = fit(&settled.positions, MAX_RADIUS, viewport);
+    let neighbour_gaps: Vec<(usize, usize)> =
+        settled.edges.iter().map(|edge| (edge.from, edge.to)).collect();
     let cap =
-        (crowding(&roomy, &settled.edges) * RADIUS_OF_SPACING).clamp(MIN_RADIUS, MAX_RADIUS);
+        (crowding(&roomy, &neighbour_gaps) * RADIUS_OF_SPACING).clamp(MIN_RADIUS, MAX_RADIUS);
     let placed = fit(&settled.positions, cap, viewport);
     let radii: Vec<f32> = degree.iter().map(|degree| radius_for(*degree, cap)).collect();
 
@@ -443,11 +477,20 @@ pub fn build_scene(settled: &Settled, viewport: (f32, f32)) -> Scene {
         })
         .collect();
 
-    let edges: Vec<(usize, usize)> =
-        settled.edges.iter().map(|(from, to)| (drawn_at[*from], drawn_at[*to])).collect();
+    let edges: Vec<EdgeRef> = settled
+        .edges
+        .iter()
+        .map(|edge| EdgeRef {
+            from: drawn_at[edge.from],
+            to: drawn_at[edge.to],
+            line: edge.line,
+            label: edge.label.clone(),
+        })
+        .collect();
 
     let mut segments = Vec::with_capacity(edges.len() * 3);
-    for (at, (from, to)) in edges.iter().enumerate() {
+    for (at, edge) in edges.iter().enumerate() {
+        let (from, to) = (&edge.from, &edge.to);
         let (start, end) = (nodes[*from].centre, nodes[*to].centre);
         // Trimmed to the rims, so the arrowhead lands against the circle it
         // points at rather than underneath it.
@@ -589,10 +632,10 @@ pub const MAX_ZOOM: f32 = 8.0;
 /// Furthest it may be zoomed out. Below this the scene is smaller than the
 /// pane it was already fitted to, which shows nothing new.
 pub const MIN_ZOOM: f32 = 0.4;
-/// How far inside the pane the middle of the graph is kept, so it can never
-/// be dragged away and lost. Comfortably more than the largest circle, so
-/// whatever sits at the middle is drawn whole.
-const MUST_STAY_VISIBLE: f32 = 100.0;
+/// Slack added to a node's own on-screen radius when deciding how much of
+/// the graph the pan clamp must keep reachable. See `View::clamped`'s
+/// `inset`.
+const MUST_STAY_VISIBLE: f32 = 8.0;
 
 /// A pan and zoom over the scene.
 ///
@@ -644,37 +687,90 @@ impl View {
 
     /// Pulls the pan back until the graph is on screen again, so a hard
     /// flick of the mouse can never leave the reader staring at an empty
-    /// pane with no way back.
+    /// pane with no way back -- and, the other direction, never refuses to
+    /// let a zoomed-in reader reach the rest of the graph.
     ///
-    /// What is kept on screen is the *middle* of the circles -- not the
-    /// pane the scene was fitted to, and not merely a sliver of the
-    /// bounding box. Both weaker rules were tried and both lost the graph: a
-    /// small graph occupies a patch in the middle of its pane, so guarding
-    /// the pane guards nothing; and eighty pixels of bounding box can be
-    /// eighty pixels of empty space between circles, which draws nothing
-    /// because a circle only half inside the pane is dropped rather than
-    /// clipped. The middle of a force layout is where its nodes are.
+    /// # The bug this replaced
+    ///
+    /// The first version kept the *middle* of the scene bounds within a
+    /// fixed inset of the pane's own middle, and that inset never grew with
+    /// zoom. At 1x, where `build_scene` has already fitted the whole graph
+    /// inside the pane, that happened to look fine. But zoom in a few
+    /// notches and the scaled scene became many times taller than the pane
+    /// while the allowed pan range stayed exactly the same fixed width --
+    /// so past some zoom level the top (and bottom, and sides) of the graph
+    /// became permanently unreachable, clamped back before a drag ever got
+    /// there. Reported as "I cannot go over a certain limit on the top of
+    /// the view", which is exactly that: the clamp, not the drag.
+    ///
+    /// # What it does instead
+    ///
+    /// `inset` pixels of the graph must stay on screen from each direction:
+    /// the near edge of the bounds may not cross past `extent - inset`, and
+    /// the far edge may not withdraw past `inset`. Solving those two
+    /// inequalities for `pan` gives a range that scales with `zoom` (through
+    /// `low`/`high`, which are already scene coordinates multiplied by it),
+    /// so the further in the reader zooms, the further they can pan --
+    /// every part of the graph stays reachable at any zoom, and a small
+    /// graph in a big pane still cannot be dragged out of sight.
     pub fn clamped(self, scene: &Scene, pane: Rect) -> View {
         if scene.nodes.is_empty() {
             return self;
         }
         let (left, top, right, bottom) = scene.bounds;
+        // The guaranteed-visible sliver has to be at least one node's own
+        // on-screen size, or the promise is empty: a slice narrower than
+        // the smallest circle guarantees nothing actually fits inside it.
+        // Radii scale with zoom (`Node::radius * self.zoom`), so this has
+        // to as well -- a fixed pixel inset was the earlier bug here: fine
+        // at 1x, and by 6x smaller than half of one ordinary node.
+        let inset = (MAX_RADIUS * self.zoom + MUST_STAY_VISIBLE).min(pane.width.min(pane.height) / 2.0);
         let axis = |low: f32, high: f32, extent: f32, pan: f32| {
-            let middle = (low + high) / 2.0 * self.zoom;
-            // Inset far enough that a circle sitting at the middle is whole
-            // rather than straddling the border.
-            let inset = MUST_STAY_VISIBLE.min(extent / 2.0);
-            let lowest = inset - middle;
-            let highest = extent - inset - middle;
+            let lowest = inset - high * self.zoom;
+            let highest = extent - inset - low * self.zoom;
             pan.clamp(lowest.min(highest), highest.max(lowest))
         };
-        View {
+        let bounded = View {
             pan: (
                 axis(left, right, pane.width, self.pan.0),
                 axis(top, bottom, pane.height, self.pan.1),
             ),
             ..self
+        };
+
+        // The bounding-box clamp above only promises that the box drawn
+        // around every node overlaps the pane -- correct, and cheap, for
+        // the graphs this view actually shows, where dozens of nodes fill
+        // that box reasonably evenly. It is not correct for two nodes
+        // sitting in opposite corners of an otherwise empty box: the
+        // overlap it guarantees can land in the empty middle, on top of
+        // neither node, and the reader would still see nothing. Rather than
+        // special-case that shape, check for it directly and fall back to
+        // centring whichever node was closest to on screen already.
+        if scene.nodes.iter().any(|node| {
+            circle_fits(pane, bounded.to_screen(node.centre, pane), (node.radius * bounded.zoom).max(MIN_RADIUS))
+        }) {
+            return bounded;
         }
+        self.centred_on_nearest_node(scene, pane)
+    }
+
+    /// Pans so whichever node's unclamped position is closest to the pane's
+    /// centre lands exactly on it -- always fully visible, and the least
+    /// surprising choice available when the ordinary clamp above cannot
+    /// promise that on its own.
+    fn centred_on_nearest_node(self, scene: &Scene, pane: Rect) -> View {
+        let middle = (pane.x + pane.width / 2.0, pane.y + pane.height / 2.0);
+        let nearest = scene
+            .nodes
+            .iter()
+            .map(|node| self.to_screen(node.centre, pane))
+            .min_by(|a, b| {
+                let distance = |p: (f32, f32)| (p.0 - middle.0).powi(2) + (p.1 - middle.1).powi(2);
+                distance(*a).total_cmp(&distance(*b))
+            })
+            .unwrap_or(middle);
+        View { pan: (self.pan.0 + (middle.0 - nearest.0), self.pan.1 + (middle.1 - nearest.1)), ..self }
     }
 }
 
@@ -710,6 +806,55 @@ pub fn hit_test(scene: &Scene, pane: Rect, view: View, at: (f32, f32)) -> Option
         dx * dx + dy * dy <= radius * radius
     })
     .map(|(at, _)| at)
+}
+
+/// How close the pointer has to land to an edge's own line to count as a
+/// click on it, in screen pixels. Wider than the line is actually drawn
+/// (`EDGE_THICKNESS`): a 1px line is nearly impossible to land a click on
+/// exactly, and the arrows carry no fill a click could land inside the way
+/// a node's circle does.
+const EDGE_CLICK_TOLERANCE: f32 = 5.0;
+
+/// The edge under a screen position, if any -- checked against every
+/// segment (shaft and both arrowhead barbs) that belongs to it, so the
+/// clickable strip runs the whole visible length of the line, arrowhead
+/// included.
+///
+/// Tried only once a node hit fails: nodes draw over the edges that meet
+/// them, so a point that lands inside a circle should always mean the node,
+/// never the sliver of line just inside its own rim.
+pub fn edge_hit_test(scene: &Scene, pane: Rect, view: View, at: (f32, f32)) -> Option<usize> {
+    if !pane.contains(at.0, at.1) {
+        return None;
+    }
+    let mut best: Option<(usize, f32)> = None;
+    for segment in &scene.segments {
+        let from = view.to_screen(segment.from, pane);
+        let to = view.to_screen(segment.to, pane);
+        let distance = distance_to_segment(at, from, to);
+        if distance > EDGE_CLICK_TOLERANCE {
+            continue;
+        }
+        if best.is_none_or(|(_, closest)| distance < closest) {
+            best = Some((segment.edge, distance));
+        }
+    }
+    best.map(|(edge, _)| edge)
+}
+
+/// Shortest distance from a point to a line segment.
+fn distance_to_segment(point: (f32, f32), from: (f32, f32), to: (f32, f32)) -> f32 {
+    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    let length_squared = dx * dx + dy * dy;
+    if length_squared < 0.001 {
+        // A degenerate (zero-length) segment is just its one point.
+        let (px, py) = (point.0 - from.0, point.1 - from.1);
+        return (px * px + py * py).sqrt();
+    }
+    let t = (((point.0 - from.0) * dx + (point.1 - from.1) * dy) / length_squared).clamp(0.0, 1.0);
+    let closest = (from.0 + t * dx, from.1 + t * dy);
+    let (px, py) = (point.0 - closest.0, point.1 - closest.1);
+    (px * px + py * py).sqrt()
 }
 
 // --- drawing -----------------------------------------------------------------
@@ -769,12 +914,15 @@ pub fn pane_quads(
 
 /// A circle quad, if the pane contains the whole of it.
 fn inside(pane: Rect, centre: (f32, f32), radius: f32, colour: crate::theme::Color) -> Option<Quad> {
+    circle_fits(pane, centre, radius)
+        .then(|| Quad::ellipse(Rect::new(centre.0 - radius, centre.1 - radius, radius * 2.0, radius * 2.0), colour))
+}
+
+/// Whether a circle of `radius` centred at `centre` (screen coordinates) is
+/// wholly within `pane`.
+fn circle_fits(pane: Rect, centre: (f32, f32), radius: f32) -> bool {
     let rect = Rect::new(centre.0 - radius, centre.1 - radius, radius * 2.0, radius * 2.0);
-    let fits = rect.x >= pane.x
-        && rect.y >= pane.y
-        && rect.right() <= pane.right()
-        && rect.bottom() <= pane.bottom();
-    fits.then(|| Quad::ellipse(rect, colour))
+    rect.x >= pane.x && rect.y >= pane.y && rect.right() <= pane.right() && rect.bottom() <= pane.bottom()
 }
 
 /// Clips a line segment to `pane`, returning the part inside it, or `None`
@@ -890,10 +1038,7 @@ pub fn label_rows(
     for at in order {
         let node = &scene.nodes[at];
         let centre = view.to_screen(node.centre, pane);
-        // Room grows with the circle, so zooming in fills names out.
-        let radius = node.radius * view.zoom;
-        let room = ((radius * 2.5) / digit).floor() as usize;
-        let room = room.clamp(LABEL_FLOOR, LABEL_CAP);
+        let room = room_for(node.radius * view.zoom, digit);
         if room <= LABEL_FLOOR && node.name.chars().count() > LABEL_FLOOR * 2 {
             // Too little room to say anything useful; better blank.
             continue;
@@ -931,10 +1076,76 @@ pub fn label_rows(
         }
     }
 
+    // Edge labels: what `ls_core::dependency_graph::Edge::label` actually
+    // pulled from `from` into `to`, stamped at the edge's own on-screen
+    // midpoint through the exact same grid so it never collides with a node
+    // name (node labels are stamped first and keep priority) or another
+    // edge's. A line is a thinner target than a circle, so this is worth
+    // less room than a node gets -- just enough for a short reference to
+    // read, past which an ellipsis says there was more.
+    const EDGE_LABEL_ROOM: usize = 16;
+    for edge in &scene.edges {
+        if edge.label.is_empty() {
+            continue;
+        }
+        let (Some(from), Some(to)) = (scene.nodes.get(edge.from), scene.nodes.get(edge.to)) else {
+            continue;
+        };
+        let midpoint =
+            ((from.centre.0 + to.centre.0) / 2.0, (from.centre.1 + to.centre.1) / 2.0);
+        let centre = view.to_screen(midpoint, pane);
+
+        let text = cut(&edge.label, EDGE_LABEL_ROOM);
+        let length = text.chars().count();
+        if length == 0 {
+            continue;
+        }
+
+        let row = ((centre.1 - origin.1) / line).round();
+        if row < 0.0 || row as usize >= rows {
+            continue;
+        }
+        let row = row as usize;
+        let column = ((centre.0 - origin.0 - length as f32 * digit / 2.0) / digit).round();
+        if column < 0.0 || column as usize + length > columns {
+            continue;
+        }
+        let column = column as usize;
+
+        let cells = &mut grid[row];
+        if cells.len() < column + length {
+            cells.resize(column + length, ' ');
+        }
+        let from_cell = column.saturating_sub(1);
+        let to_cell = (column + length + 1).min(cells.len());
+        if cells[from_cell..to_cell].iter().any(|cell| *cell != ' ') {
+            continue;
+        }
+        for (offset, character) in text.chars().enumerate() {
+            cells[column + offset] = character;
+        }
+    }
+
     LabelGrid {
         text: grid.iter().map(|cells| cells.iter().collect::<String>()).collect::<Vec<_>>().join("\n"),
         origin,
     }
+}
+
+/// How many characters of a label fit on a node of this on-screen radius.
+///
+/// Bounded at the circle's own diameter, never past it: an earlier version
+/// allowed up to 1.25x the diameter, on the reasoning that a little overhang
+/// reads fine against empty pane. It does not read fine against a
+/// *neighbouring node*, and these circles sit close enough
+/// (`RADIUS_OF_SPACING`) that the overhang routinely landed on top of one.
+/// This is the "wrap, and if that does not fit, cut it short" the view
+/// asks for: there is no second line to wrap into, so what does not fit at
+/// the node's own width is truncated with an ellipsis by [`cut`] instead,
+/// and what is too small to say anything ([`LABEL_FLOOR`]) is left blank by
+/// the caller.
+fn room_for(radius: f32, digit: f32) -> usize {
+    (((radius * 2.0) / digit.max(1.0)).floor() as usize).clamp(LABEL_FLOOR, LABEL_CAP)
 }
 
 /// A name cut to `room` characters, ellipsis included in the count.
@@ -961,7 +1172,12 @@ mod tests {
             files: files.iter().map(PathBuf::from).collect(),
             edges: edges
                 .iter()
-                .map(|(from, to)| Edge { from: PathBuf::from(from), to: PathBuf::from(to) })
+                .map(|(from, to)| Edge {
+                    from: PathBuf::from(from),
+                    to: PathBuf::from(to),
+                    line: 1,
+                    label: String::new(),
+                })
                 .collect(),
             truncated: false,
         }
@@ -1189,6 +1405,66 @@ mod tests {
     }
 
     #[test]
+    fn zooming_in_reaches_a_node_the_old_clamp_could_never_show() {
+        // The literal bug report: past some zoom level, panning stopped
+        // being able to reach the top of the graph at all. The reason was
+        // an inset that never grew with zoom: it kept the *centre* of the
+        // whole bounding box within a fixed ~100px of the pane's own
+        // centre, and at high zoom that fixed window sat nowhere near
+        // either end of a bbox now thousands of pixels tall -- so pushing
+        // as hard as possible still left both ends off screen.
+        //
+        // Two nodes stacked on the same x, far enough apart in y that this
+        // is exactly that shape, with x fixed so it is never the limiting
+        // factor and this isolates the one axis under test.
+        let top = Node {
+            centre: (600.0, 100.0),
+            radius: 20.0,
+            path: PathBuf::from("top.rs"),
+            name: "top.rs".into(),
+            imported: false,
+        };
+        let bottom = Node { centre: (600.0, 2000.0), ..top.clone() };
+        let scene = Scene {
+            bounds: (
+                top.centre.0 - top.radius,
+                top.centre.1 - top.radius,
+                bottom.centre.0 + bottom.radius,
+                bottom.centre.1 + bottom.radius,
+            ),
+            nodes: vec![top.clone(), bottom],
+            width: PANE.width,
+            height: PANE.height,
+            ..Scene::default()
+        };
+
+        // What the old, unscaled-inset formula would have clamped to: the
+        // bbox centre held within a fixed ~100px window of the pane centre,
+        // regardless of zoom.
+        let old_formula = |zoom: f32| -> f32 {
+            let middle = (scene.bounds.1 + scene.bounds.3) / 2.0 * zoom;
+            let inset = 100.0_f32.min(PANE.height / 2.0);
+            PANE.height - inset - middle
+        };
+        let old_pan_at_6x = old_formula(6.0);
+        let old_screen_y = top.centre.1 * 6.0 + old_pan_at_6x;
+        assert!(
+            !(0.0..PANE.height).contains(&old_screen_y),
+            "the old formula was supposed to lose the node at 6x zoom, but placed it at {old_screen_y}"
+        );
+
+        // The actual fix: push as hard as possible toward the top at 6x
+        // zoom, and `top.rs` must be fully back on screen.
+        let close = View::default().zoomed_at(6.0, (600.0, 100.0), PANE);
+        let close_pushed = close.panned((0.0, 100_000.0)).clamped(&scene, PANE);
+        let onscreen = close_pushed.to_screen(top.centre, PANE);
+        assert!(
+            circle_fits(PANE, onscreen, top.radius * close_pushed.zoom),
+            "top.rs is not fully visible at {onscreen:?}"
+        );
+    }
+
+    #[test]
     fn a_zoomed_in_graph_can_still_be_dragged_across() {
         // The clamp must not be so tight that zooming in pins the graph:
         // at 4x most of it is off-pane by design, and the reader has to be
@@ -1215,6 +1491,66 @@ mod tests {
             assert_eq!(hit_test(&scene, PANE, view, centre), Some(at), "{}", node.name);
         }
         assert_eq!(hit_test(&scene, PANE, view, (0.5, 0.5)), None, "the corner is empty");
+    }
+
+    #[test]
+    fn a_midpoint_click_on_a_straight_edge_finds_it() {
+        let scene = scene_of(&["a.rs", "b.rs"], &[("a.rs", "b.rs")]);
+        let view = View::default();
+        let segment = scene.segments.first().expect("at least the shaft is drawn");
+        let from = view.to_screen(segment.from, PANE);
+        let to = view.to_screen(segment.to, PANE);
+        let midpoint = ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0);
+        assert_eq!(edge_hit_test(&scene, PANE, view, midpoint), Some(segment.edge));
+    }
+
+    #[test]
+    fn clicking_a_node_never_reports_the_edge_that_meets_it() {
+        // Nodes draw over the edges that reach them, so a click that lands
+        // inside a circle has to mean the node, not the sliver of line
+        // right at its own rim.
+        let scene = scene_of(&["a.rs", "b.rs"], &[("a.rs", "b.rs")]);
+        let view = View::default();
+        for node in &scene.nodes {
+            let centre = view.to_screen(node.centre, PANE);
+            assert!(
+                hit_test(&scene, PANE, view, centre).is_some(),
+                "a node click has to resolve to a node first"
+            );
+        }
+    }
+
+    #[test]
+    fn a_click_far_from_every_edge_finds_nothing() {
+        let scene = scene_of(&["a.rs", "b.rs"], &[("a.rs", "b.rs")]);
+        assert_eq!(edge_hit_test(&scene, PANE, View::default(), (5.0, 695.0)), None);
+    }
+
+    #[test]
+    fn distance_to_a_segment_is_zero_on_it_and_measured_off_it() {
+        assert_eq!(distance_to_segment((5.0, 0.0), (0.0, 0.0), (10.0, 0.0)), 0.0);
+        assert_eq!(distance_to_segment((5.0, 3.0), (0.0, 0.0), (10.0, 0.0)), 3.0);
+        // Past either end, distance is to the nearest endpoint, not the
+        // infinite line through it.
+        assert_eq!(distance_to_segment((20.0, 0.0), (0.0, 0.0), (10.0, 0.0)), 10.0);
+    }
+
+    #[test]
+    fn a_pressed_edge_reports_the_file_and_line_that_caused_it() {
+        let root = std::env::temp_dir().join("lightspeed-depgraph-edge-source");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "fn x() {}
+mod b;
+").unwrap();
+        std::fs::write(root.join("b.rs"), "").unwrap();
+        let graph = ls_core::dependency_graph::build(&root);
+        let scene = build_scene(&settle_graph(&graph), VIEWPORT);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(scene.edges.len(), 1);
+        let (path, line) = scene.edge_source(0).expect("the one edge has a source");
+        assert_eq!(path, std::path::Path::new("a.rs"));
+        assert_eq!(line, 2, "the `mod b;` line, not the file's first line");
     }
 
     #[test]
@@ -1455,6 +1791,80 @@ mod tests {
     }
 
     #[test]
+    fn a_labels_room_never_exceeds_its_circles_own_diameter() {
+        // The regression this exists for: room used to be sized at 1.25x
+        // the diameter, and on a packed graph that overhang routinely
+        // spilled the label across a neighbouring node. It has to stay at
+        // or inside the circle's own width now, for every radius the view
+        // actually draws.
+        for radius in [MIN_RADIUS, 12.0, MAX_RADIUS, MAX_RADIUS * MAX_ZOOM] {
+            let room = room_for(radius, METRICS.digit_width);
+            let diameter_columns = ((radius * 2.0) / METRICS.digit_width).floor() as usize;
+            assert!(
+                room <= diameter_columns.max(LABEL_FLOOR),
+                "radius {radius}: room {room} exceeds its {diameter_columns}-column diameter"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stamped_label_is_never_wider_than_the_room_it_was_given() {
+        let scene = Scene {
+            nodes: vec![Node {
+                centre: (100.0, 100.0),
+                radius: 20.0,
+                path: PathBuf::from("a_name_far_too_long_to_ever_fit_on_this_node.rs"),
+                name: "a_name_far_too_long_to_ever_fit_on_this_node.rs".into(),
+                imported: false,
+            }],
+            width: PANE.width,
+            height: PANE.height,
+            ..Scene::default()
+        };
+        let grid = label_rows(&scene, PANE, View::default(), METRICS, None);
+        let drawn = grid.text.lines().find(|line| !line.trim().is_empty()).unwrap_or("");
+        let expected_room = room_for(20.0, METRICS.digit_width);
+        assert!(
+            drawn.trim().chars().count() <= expected_room,
+            "drew {:?} ({} chars) for a node given only {expected_room} columns of room",
+            drawn.trim(),
+            drawn.trim().chars().count()
+        );
+    }
+
+    #[test]
+    fn an_edges_label_is_stamped_at_its_midpoint() {
+        let scene = Scene {
+            nodes: vec![
+                Node {
+                    centre: (100.0, 100.0),
+                    radius: 10.0,
+                    path: PathBuf::from("a.py"),
+                    name: "a.py".into(),
+                    imported: false,
+                },
+                Node {
+                    centre: (300.0, 100.0),
+                    radius: 10.0,
+                    path: PathBuf::from("b.py"),
+                    name: "b.py".into(),
+                    imported: true,
+                },
+            ],
+            edges: vec![EdgeRef { from: 0, to: 1, line: 1, label: "models.User".to_string() }],
+            width: PANE.width,
+            height: PANE.height,
+            ..Scene::default()
+        };
+        let grid = label_rows(&scene, PANE, View::default(), METRICS, None);
+        assert!(
+            grid.text.contains("models.User"),
+            "the edge's label never made it into the stamped grid: {:?}",
+            grid.text
+        );
+    }
+
+    #[test]
     fn a_name_is_cut_with_an_ellipsis_that_counts_towards_the_room() {
         assert_eq!(cut("workspace_search.rs", 8), "workspa\u{2026}");
         assert_eq!(cut("app.rs", 8), "app.rs");
@@ -1508,8 +1918,9 @@ mod tests {
         let cut = whole.lines().take(4).collect::<Vec<_>>().join("\n");
         assert!(decode(root, &cut).is_none(), "a truncated file is not half-read");
 
-        // An edge pointing at a file that is not there.
-        let bent = whole.replace("\n0 1\n", "\n0 99\n");
+        // An edge pointing at a file that is not there. Trailing space is
+        // the (empty, for this synthetic graph) label field.
+        let bent = whole.replace("\n0 1 1 \n", "\n0 99 1 \n");
         assert!(decode(root, &bent).is_none(), "an out-of-range edge is refused");
 
         // Junk where a number should be.
@@ -1523,6 +1934,24 @@ mod tests {
         let settled = settle_graph(&graph_of(&[], &[]));
         let decoded = decode(root, &encode(root, &settled)).expect("an empty graph is cacheable");
         assert!(decoded.files.is_empty());
+    }
+
+    #[test]
+    fn an_edges_label_round_trips_through_the_cache() {
+        let root = Path::new("/work/app");
+        let graph = DependencyGraph {
+            files: vec![PathBuf::from("a.py"), PathBuf::from("b.py")],
+            edges: vec![Edge {
+                from: PathBuf::from("a.py"),
+                to: PathBuf::from("b.py"),
+                line: 3,
+                label: "from . import b".to_string(),
+            }],
+            truncated: false,
+        };
+        let settled = settle_graph(&graph);
+        let decoded = decode(root, &encode(root, &settled)).expect("a real edge is cacheable");
+        assert_eq!(decoded.edges[0].label, "from . import b");
     }
 }
 

@@ -86,6 +86,36 @@ const SHELL_CANDIDATES: &[ShellSpec] = &[
 const SHELL_CANDIDATES: &[ShellSpec] =
     &[ShellSpec { program: "/bin/bash", args: &[] }, ShellSpec { program: "/bin/sh", args: &[] }];
 
+/// Whether `spec` is the shell the "Terminal: Shell" setting names --
+/// matched by the program's own name with any `.exe` stripped, so
+/// `"powershell"` (the setting's option text) matches `powershell.exe` (the
+/// candidate's program) on Windows and the bare name everywhere else.
+fn shell_matches(spec: &ShellSpec, preference: &str) -> bool {
+    let program = spec.program.rsplit(['/', '\\']).next().unwrap_or(spec.program);
+    program.trim_end_matches(".exe").eq_ignore_ascii_case(preference)
+}
+
+/// `SHELL_CANDIDATES`, reordered so a configured preference is tried first.
+///
+/// `"auto"` (the setting's default) matches no candidate's name, so this
+/// returns the built-in order unchanged for it -- no special case needed.
+/// Any other value that *is* one of the candidates moves to the front; the
+/// rest still follow in their usual order, so a preference that turns out
+/// not to be installed still falls back rather than refusing to open a
+/// terminal at all.
+fn ordered_candidates(preference: &str) -> Vec<&'static ShellSpec> {
+    let mut ordered: Vec<&'static ShellSpec> = Vec::with_capacity(SHELL_CANDIDATES.len());
+    if let Some(preferred) = SHELL_CANDIDATES.iter().find(|spec| shell_matches(spec, preference)) {
+        ordered.push(preferred);
+    }
+    for spec in SHELL_CANDIDATES {
+        if !ordered.iter().any(|already| std::ptr::eq(*already, spec)) {
+            ordered.push(spec);
+        }
+    }
+    ordered
+}
+
 /// `PATH` for the shell, with Git for Windows' Unix tools appended if they
 /// are installed.
 ///
@@ -167,13 +197,18 @@ impl Terminal {
     /// Spawns the platform shell. `wake` is called from a reader thread every
     /// time output arrives, so the caller can post a wakeup to the event
     /// loop without the reader thread touching any editor state itself.
-    pub fn spawn(wake: impl Fn() + Send + Clone + 'static) -> std::io::Result<Self> {
-        // The most capable shell available, not a fixed one -- see
-        // `SHELL_CANDIDATES` for why that is what makes commands from
-        // different families work in one session.
+    ///
+    /// `shell_preference` is the "Terminal: Shell" setting's value --
+    /// `"auto"` tries the built-in candidates in their usual best-first
+    /// order (see `SHELL_CANDIDATES`); anything else tries that one first
+    /// and falls back to the rest if it is not actually installed.
+    pub fn spawn(
+        shell_preference: &str,
+        wake: impl Fn() + Send + Clone + 'static,
+    ) -> std::io::Result<Self> {
         let augmented_path = augmented_path(std::env::var("PATH").ok().as_deref());
         let mut spawned = None;
-        for shell in SHELL_CANDIDATES {
+        for shell in ordered_candidates(shell_preference) {
             // `ls_platform::command`, not `Command::new`: a bare spawn gives
             // the shell a console window of its own, so the panel appeared
             // inside the editor *and* a separate `cmd.exe` window appeared
@@ -415,7 +450,7 @@ mod tests {
     fn spawning_and_running_one_command_produces_output() {
         let wake_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = wake_count.clone();
-        let mut terminal = Terminal::spawn(move || {
+        let mut terminal = Terminal::spawn("auto", move || {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         })
         .expect("the platform shell should be available in CI and dev");
@@ -468,6 +503,47 @@ mod shell_tests {
         assert_eq!(augmented_path(Some(r"C:\Windows\System32")), None);
         assert_eq!(augmented_path(None), None);
     }
+
+    #[test]
+    #[cfg(windows)]
+    fn auto_leaves_the_built_in_order_unchanged() {
+        // Regression test: "Terminal: Shell" existed as a setting with six
+        // options, but nothing in the codebase ever read it -- changing it
+        // had no effect on which shell actually started. `"auto"`, its
+        // default, must still behave exactly as it always did.
+        let ordered = ordered_candidates("auto");
+        let programs: Vec<&str> = ordered.iter().map(|spec| spec.program).collect();
+        let defaults: Vec<&str> = SHELL_CANDIDATES.iter().map(|spec| spec.program).collect();
+        assert_eq!(programs, defaults);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_named_preference_is_tried_first_but_the_rest_still_follow() {
+        // Whichever candidate matches the name moves to the front; the
+        // others stay reachable as a fallback if it turns out not to be
+        // installed, rather than the terminal simply refusing to open.
+        let ordered = ordered_candidates("cmd");
+        assert_eq!(ordered[0].program, SHELL_CANDIDATES.last().unwrap().program, "cmd is named");
+        assert_eq!(ordered.len(), SHELL_CANDIDATES.len(), "nothing was dropped");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn an_unrecognized_preference_behaves_like_auto() {
+        let ordered = ordered_candidates("fish");
+        let programs: Vec<&str> = ordered.iter().map(|spec| spec.program).collect();
+        let defaults: Vec<&str> = SHELL_CANDIDATES.iter().map(|spec| spec.program).collect();
+        assert_eq!(programs, defaults, "a preference this build cannot offer falls back cleanly");
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_and_ignores_the_exe_suffix() {
+        let spec = ShellSpec { program: "PowerShell.exe", args: &[] };
+        assert!(shell_matches(&spec, "powershell"));
+        assert!(shell_matches(&spec, "PowerShell"));
+        assert!(!shell_matches(&spec, "pwsh"));
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -486,7 +562,7 @@ mod live_shell_tests {
     #[ignore = "spawns a real shell"]
     fn every_shell_family_of_command_runs_in_one_session() {
         let started = std::time::Instant::now();
-        let mut terminal = Terminal::spawn(|| {}).expect("a shell should start");
+        let mut terminal = Terminal::spawn("auto", || {}).expect("a shell should start");
         println!("shell start: {:?}", started.elapsed());
 
         // cmd builtin, PowerShell cmdlet, PowerShell's Unix alias, and a

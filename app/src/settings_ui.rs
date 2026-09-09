@@ -37,8 +37,20 @@ pub const ROWS_BETWEEN: usize = 1;
 pub const ROWS_PER_HEADING: usize = 2;
 /// Width of the section list down the left, in characters.
 pub const CATEGORY_COLUMNS: usize = 22;
-/// Left inset of the list's text, in characters.
-const INDENT: usize = 2;
+/// Rows above the first section in the category list: the "User  Workspace"
+/// scope line, then a blank line under it -- exactly what
+/// `build_settings_text` (in `renderer.rs`) draws as the first two lines of
+/// the same buffer `category_rows` indexes into. These two have to agree, or
+/// a click resolves against a section two rows away from the one actually
+/// under the pointer -- which is exactly the bug this constant replaced: the
+/// category rows used to assume the list started at row 0.
+const CATEGORY_LIST_HEADER_ROWS: usize = 2;
+/// Left inset of the list's text, in characters. Shared with
+/// `Row::Choice`'s rendering in `renderer.rs`, since a choice's option pills
+/// have to land exactly under the option labels drawn for them -- both have
+/// to start from the same indent or the two disagree about where the row
+/// begins.
+pub const INDENT: usize = 2;
 /// Width of a text or number field, in characters.
 const FIELD_COLUMNS: usize = 28;
 
@@ -63,6 +75,10 @@ pub struct Screen {
     pub search: Rect,
     pub categories: Rect,
     pub list: Rect,
+    /// The "User" half of the scope line above the section list.
+    pub user_scope: Rect,
+    /// The "Workspace" half of the scope line above the section list.
+    pub workspace_scope: Rect,
     /// One entry per section shown down the left, in `SECTIONS` order.
     pub category_rows: Vec<Rect>,
     pub placements: Vec<Placement>,
@@ -76,6 +92,10 @@ pub enum Hit {
     Search,
     /// A section in the left-hand list, by index into `SECTIONS`.
     Category(usize),
+    /// The "User" half of the scope line.
+    UserScope,
+    /// The "Workspace" half of the scope line.
+    WorkspaceScope,
     /// A checkbox or a field, to be toggled or focused.
     Control(&'static str),
     /// One option of a choice: the setting, and the option's text.
@@ -93,6 +113,8 @@ impl Default for Screen {
             search: nothing,
             categories: nothing,
             list: nothing,
+            user_scope: nothing,
+            workspace_scope: nothing,
             category_rows: Vec::new(),
             placements: Vec::new(),
             total_rows: 0,
@@ -134,11 +156,19 @@ pub fn layout(
 ) -> Screen {
     let (search, categories, list) = frame(pane, line_height, digit_width);
 
+    // "User" is 4 characters, then a two-character gap, then "Workspace" --
+    // exactly the literal strings `build_settings_text` draws on this same
+    // row, in the same monospace grid this whole screen is laid out on.
+    let user_scope = Rect::new(categories.x, categories.y, 4.0 * digit_width, line_height);
+    let workspace_scope =
+        Rect::new(categories.x + 6.0 * digit_width, categories.y, 9.0 * digit_width, line_height);
+
     let category_rows = ls_core::settings::SECTIONS
         .iter()
         .enumerate()
         .map(|(at, _)| {
-            Rect::new(categories.x, categories.y + at as f32 * line_height, categories.width, line_height)
+            let row = (at + CATEGORY_LIST_HEADER_ROWS) as f32;
+            Rect::new(categories.x, categories.y + row * line_height, categories.width, line_height)
         })
         .collect();
 
@@ -184,7 +214,16 @@ pub fn layout(
         row += ROWS_PER_SETTING + ROWS_BETWEEN;
     }
 
-    Screen { search, categories, list, category_rows, placements, total_rows: row }
+    Screen {
+        search,
+        categories,
+        list,
+        user_scope,
+        workspace_scope,
+        category_rows,
+        placements,
+        total_rows: row,
+    }
 }
 
 /// How many rows of the list fit on screen at once.
@@ -214,6 +253,12 @@ pub fn hit(screen: &Screen, visible: &[&'static SettingDescriptor], x: f32, y: f
         return Hit::Search;
     }
     if screen.categories.contains(x, y) {
+        if screen.user_scope.contains(x, y) {
+            return Hit::UserScope;
+        }
+        if screen.workspace_scope.contains(x, y) {
+            return Hit::WorkspaceScope;
+        }
         for (at, row) in screen.category_rows.iter().enumerate() {
             if row.contains(x, y) {
                 return Hit::Category(at);
@@ -259,6 +304,13 @@ pub enum Row {
     /// sits beside the control: the value of a field, or nothing for a
     /// checkbox.
     Value(String),
+    /// A choice's own value line: one label per option, paired with whether
+    /// it is the one currently picked, in the same order `layout` placed
+    /// their pills. Kept separate from `Value` because a choice needs each
+    /// label positioned and colored individually rather than drawn as one
+    /// run of text -- `layout`'s pill widths and this row's padding both
+    /// derive from `option.chars().count()`, so the two stay in lockstep.
+    Choice(Vec<(&'static str, bool)>),
 }
 
 /// Builds the rows for `visible`, in the order [`layout`] measured them.
@@ -289,16 +341,19 @@ pub fn rows(
         }
         rows.push(Row::Title(title));
         rows.push(Row::Description(setting.description.to_string()));
-        rows.push(Row::Value(match setting.kind {
+        rows.push(match setting.kind {
             // The checkbox is a quad; the words beside it say what ticking
             // it does, the way VS Code words its own.
-            SettingKind::Bool => format!("    {}", setting.title),
-            SettingKind::Choice(_) => String::new(),
-            _ => match editing {
+            SettingKind::Bool => Row::Value(format!("    {}", setting.title)),
+            SettingKind::Choice(options) => {
+                let current = settings.text(setting.key);
+                Row::Choice(options.iter().map(|option| (*option, *option == current)).collect())
+            }
+            _ => Row::Value(match editing {
                 Some((key, draft)) if key == setting.key => format!("{draft}{}", '\u{2588}'),
                 _ => settings.text(setting.key),
-            },
-        }));
+            }),
+        });
         rows.push(Row::Blank);
     }
     rows
@@ -474,6 +529,43 @@ mod tests {
     }
 
     #[test]
+    fn category_rows_sit_two_lines_below_the_scope_line_not_at_its_top() {
+        // Regression test: `build_settings_text` draws "User  Workspace"
+        // then a blank line before the first section, but `category_rows`
+        // used to start counting from `categories.y` with no offset -- so a
+        // click on the first *visible* section ("Text Editor") landed on
+        // `category_rows[2]` ("Terminal") instead, and a click on the
+        // "Workspace" label itself landed on `category_rows[0]`
+        // ("Text Editor"). Both were real, reported bugs.
+        let visible = all();
+        let screen = layout(PANE, LINE, DIGIT, &visible, &Settings::new(), 0);
+        assert_eq!(
+            screen.category_rows[0].y,
+            screen.categories.y + CATEGORY_LIST_HEADER_ROWS as f32 * LINE,
+            "the first section sits two rows down, not at the top of the categories rect"
+        );
+        let first = screen.category_rows[0];
+        assert_eq!(
+            hit(&screen, &visible, first.x + 5.0, first.y + 5.0),
+            Hit::Category(0),
+            "clicking where \"Text Editor\" is actually drawn must select it, not \"Terminal\""
+        );
+    }
+
+    #[test]
+    fn clicking_either_half_of_the_scope_line_selects_that_scope() {
+        let visible = all();
+        let screen = layout(PANE, LINE, DIGIT, &visible, &Settings::new(), 0);
+        let user = screen.user_scope;
+        assert_eq!(hit(&screen, &visible, user.x + 2.0, user.y + 2.0), Hit::UserScope);
+        let workspace = screen.workspace_scope;
+        assert_eq!(
+            hit(&screen, &visible, workspace.x + 2.0, workspace.y + 2.0),
+            Hit::WorkspaceScope
+        );
+    }
+
+    #[test]
     fn a_control_scrolled_below_the_fold_cannot_be_clicked() {
         // Its rectangle is still measured -- scrolling has to move it -- but
         // it is outside the list, and a click there must not reach it.
@@ -608,6 +700,36 @@ mod tests {
         assert!(
             rows.iter().any(|row| matches!(row, Row::Value(text) if text == "JetBrains Mono")),
             "the current value is on screen"
+        );
+    }
+
+    #[test]
+    fn a_choices_row_names_every_option_and_marks_the_one_picked() {
+        // Regression test: a choice used to emit `Row::Value(String::new())`
+        // for its value line -- the pills were drawn (as quads, in
+        // renderer.rs) but nothing ever wrote their labels, so an unpicked
+        // pill was invisible and the picked one read as an unlabeled block
+        // of color.
+        let mut settings = Settings::new();
+        settings.set("terminal.shell", "bash");
+        let visible = all();
+        let rows = rows(&visible, &settings, None);
+        let choice = rows
+            .iter()
+            .find_map(|row| match row {
+                Row::Choice(options) => Some(options),
+                _ => None,
+            })
+            .expect("terminal.shell is a Choice setting");
+        assert_eq!(
+            choice.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec!["auto", "pwsh", "powershell", "cmd", "bash", "sh"],
+            "every option is named, in the same order layout placed their pills"
+        );
+        assert_eq!(
+            choice.iter().filter(|(_, picked)| *picked).map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec!["bash"],
+            "exactly the current value is marked picked"
         );
     }
 

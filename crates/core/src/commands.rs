@@ -312,6 +312,11 @@ fn view_toggle_git_status(core: &mut EditorCore, _args: CommandArgs) -> Result<(
     Ok(())
 }
 
+fn view_toggle_markdown_preview(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ToggleMarkdownPreview);
+    Ok(())
+}
+
 fn view_open_settings(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
     core.request_shell(ShellRequest::ToggleSettings);
     Ok(())
@@ -332,6 +337,24 @@ fn view_refresh_dependencies(
 
 fn view_toggle_terminal(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
     core.request_shell(ShellRequest::ToggleTerminal);
+    Ok(())
+}
+
+/// The font size itself lives in the shell's settings, not core state, so
+/// these three just ask for a `ShellRequest` the same way every other
+/// shell-owned toggle here does.
+fn view_zoom_in(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ZoomIn);
+    Ok(())
+}
+
+fn view_zoom_out(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ZoomOut);
+    Ok(())
+}
+
+fn view_reset_zoom(core: &mut EditorCore, _args: CommandArgs) -> Result<(), EditorError> {
+    core.request_shell(ShellRequest::ResetZoom);
     Ok(())
 }
 
@@ -409,6 +432,15 @@ pub enum ShellRequest {
     ToggleTerminal,
     /// Show or hide the status bar.
     ToggleStatusBar,
+    /// Grows the editor's font size by one step (Ctrl+= / Ctrl+scroll up).
+    ZoomIn,
+    /// Shrinks the editor's font size by one step (Ctrl+- / Ctrl+scroll down).
+    ZoomOut,
+    /// Puts the font size back to its default (Ctrl+0).
+    ResetZoom,
+    /// Shows or hides a Markdown document's rendered form in place of its
+    /// raw source (Ctrl+Shift+V).
+    ToggleMarkdownPreview,
     /// Diagnostics: issue several requests for one path at once, so the join
     /// path is observable in a running editor.
     DiagnosticsDuplicateStorm,
@@ -798,6 +830,30 @@ pub const COMMANDS: &[CommandDescriptor] = &[
         display_name: "Toggle Terminal",
         enabled: always,
         execute: view_toggle_terminal,
+    },
+    CommandDescriptor {
+        id: "view.zoom_in",
+        display_name: "Zoom In (Font Size)",
+        enabled: always,
+        execute: view_zoom_in,
+    },
+    CommandDescriptor {
+        id: "view.zoom_out",
+        display_name: "Zoom Out (Font Size)",
+        enabled: always,
+        execute: view_zoom_out,
+    },
+    CommandDescriptor {
+        id: "view.reset_zoom",
+        display_name: "Reset Zoom (Font Size)",
+        enabled: always,
+        execute: view_reset_zoom,
+    },
+    CommandDescriptor {
+        id: "view.toggle_markdown_preview",
+        display_name: "Toggle Markdown Preview",
+        enabled: has_document,
+        execute: view_toggle_markdown_preview,
     },
     CommandDescriptor {
         id: "document.cancel_load",

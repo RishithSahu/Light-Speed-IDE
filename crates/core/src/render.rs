@@ -8,9 +8,74 @@
 //! a 1 GB file costs the same to render as a small one.
 
 use crate::document::{ContentRevision, Document, DocumentId, ExternalState, PersistenceState};
-use ls_buffer::{unicode, DisplayColumn, LineIndex};
+use ls_buffer::{unicode, CharOffset, DisplayColumn, LineIndex, TextBuffer};
 use std::ops::Range;
 use std::sync::Arc;
+
+/// The three bracket pairs a caret sitting next to one is matched against.
+const BRACKET_PAIRS: [(char, char); 3] = [('(', ')'), ('[', ']'), ('{', '}')];
+
+/// Finds the bracket that closes (or opens) whichever bracket sits at or
+/// just before `position` -- table stakes for "a real editor", and cheap:
+/// this is a scan from the caret using the buffer's own `char_at`, the same
+/// primitive `selection::word_at` already walks the buffer with, not a new
+/// subsystem.
+///
+/// A caret sitting *between* two brackets (`"|)"`) prefers the one it is
+/// about to walk into over the one it just passed, since that is the one
+/// the next keystroke actually interacts with.
+///
+/// Returns both positions, unordered, or `None` if neither adjacent
+/// character is a bracket, or its match runs off the end of the buffer --
+/// an unbalanced file, mid-edit, is not an error here, just nothing to
+/// highlight.
+fn matching_bracket(buffer: &TextBuffer, position: CharOffset) -> Option<(CharOffset, CharOffset)> {
+    let position = buffer.clamp(position);
+    let after = buffer.char_at(position);
+    let before = if position > CharOffset::ZERO { buffer.char_at(position - 1) } else { None };
+
+    let bracket_at = |ch: char| BRACKET_PAIRS.iter().copied().find(|(o, c)| *o == ch || *c == ch);
+    let (open, close, at) = after
+        .and_then(bracket_at)
+        .map(|(o, c)| (o, c, position))
+        .or_else(|| before.and_then(bracket_at).map(|(o, c)| (o, c, position - 1)))?;
+
+    if buffer.char_at(at) == Some(open) {
+        let mut depth = 1i32;
+        let mut cursor = at + 1;
+        while cursor < buffer.end() {
+            match buffer.char_at(cursor) {
+                Some(ch) if ch == open => depth += 1,
+                Some(ch) if ch == close => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((at, cursor));
+                    }
+                }
+                _ => {}
+            }
+            cursor += 1;
+        }
+        None
+    } else {
+        let mut depth = 1i32;
+        let mut cursor = at;
+        while cursor > CharOffset::ZERO {
+            cursor -= 1;
+            match buffer.char_at(cursor) {
+                Some(ch) if ch == close => depth += 1,
+                Some(ch) if ch == open => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((cursor, at));
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
 
 /// What changed since the previous snapshot (specification section 28).
 ///
@@ -253,6 +318,10 @@ pub enum DecorationKind {
     SyntaxToken(crate::highlight::TokenKind),
     GitChange,
     SearchMatch,
+    /// One half of a `{}`/`()`/`[]` pair, highlighted because the caret sits
+    /// next to the other half. Always produced in a pair -- see
+    /// `matching_bracket`.
+    BracketMatch,
 }
 
 impl RenderSnapshot {
@@ -380,8 +449,39 @@ pub fn build_snapshot(document: &mut Document, viewport: Viewport) -> RenderSnap
             },
         );
 
-    let decorations: Vec<Decoration> =
-        syntax_decorations.into_iter().chain(search_decorations).collect();
+    // Re-borrowed rather than reusing the `buffer` above: this runs after
+    // `document.tokenize_visible_line`/`take_invalidation`, both `&mut`
+    // calls, so the earlier immutable borrow cannot still be alive here.
+    let buffer = document.text();
+    // Only when the primary caret is a plain caret (not a selection) and
+    // actually sits next to a bracket -- `matching_bracket` returning `None`
+    // covers both "not next to one" and "no match found".
+    let primary_selection = document.selections().primary();
+    let bracket_decorations = primary_selection
+        .is_caret()
+        .then(|| matching_bracket(buffer, primary_selection.head))
+        .flatten()
+        .into_iter()
+        .flat_map(|(first, second)| [first, second])
+        .filter_map(|position| {
+            let line = buffer.char_to_line(position);
+            if !range.contains(&line.get()) {
+                return None;
+            }
+            let column = position - buffer.line_range(line).start;
+            Some(Decoration {
+                line,
+                start_column_chars: column,
+                end_column_chars: column + 1,
+                kind: DecorationKind::BracketMatch,
+            })
+        });
+
+    let decorations: Vec<Decoration> = syntax_decorations
+        .into_iter()
+        .chain(search_decorations)
+        .chain(bracket_decorations)
+        .collect();
 
     RenderSnapshot {
         document_id,
@@ -652,5 +752,74 @@ mod tests {
             d.line == LineIndex::new(1) && matches!(d.kind, DecorationKind::SyntaxToken(_))
         });
         assert!(!comment_on_line_1, "the comment closed on line 0, so line 1 must be code again");
+    }
+
+    fn bracket_decorations(snapshot: &RenderSnapshot) -> Vec<(usize, usize)> {
+        let mut found: Vec<(usize, usize)> = snapshot
+            .decorations
+            .iter()
+            .filter(|d| d.kind == DecorationKind::BracketMatch)
+            .map(|d| (d.line.get(), d.start_column_chars))
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[test]
+    fn a_caret_before_an_open_bracket_highlights_it_and_its_close() {
+        let mut document = document("fn f(x) {}");
+        document.set_selection(Selection::caret(CharOffset::new(4))); // just before '('
+        let snapshot = build_snapshot(&mut document, viewport(0, 10));
+        assert_eq!(bracket_decorations(&snapshot), vec![(0, 4), (0, 6)]);
+    }
+
+    #[test]
+    fn a_caret_just_after_a_close_bracket_highlights_it_and_its_open() {
+        let mut document = document("fn f(x) {}");
+        document.set_selection(Selection::caret(CharOffset::new(7))); // just after ')'
+        let snapshot = build_snapshot(&mut document, viewport(0, 10));
+        assert_eq!(bracket_decorations(&snapshot), vec![(0, 4), (0, 6)]);
+    }
+
+    #[test]
+    fn nested_brackets_match_their_own_partner_not_the_nearest_one() {
+        let mut document = document("(a (b) c)");
+        document.set_selection(Selection::caret(CharOffset::ZERO)); // before the outer '('
+        let snapshot = build_snapshot(&mut document, viewport(0, 10));
+        assert_eq!(bracket_decorations(&snapshot), vec![(0, 0), (0, 8)]);
+    }
+
+    #[test]
+    fn a_caret_with_no_bracket_beside_it_highlights_nothing() {
+        let mut document = document("plain text");
+        document.set_selection(Selection::caret(CharOffset::new(3)));
+        let snapshot = build_snapshot(&mut document, viewport(0, 10));
+        assert!(bracket_decorations(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn an_unbalanced_bracket_highlights_nothing_rather_than_guessing() {
+        let mut document = document("fn f(x {");
+        document.set_selection(Selection::caret(CharOffset::new(4)));
+        let snapshot = build_snapshot(&mut document, viewport(0, 10));
+        assert!(bracket_decorations(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn a_real_selection_not_a_caret_highlights_no_brackets() {
+        let mut document = document("fn f(x) {}");
+        document.set_selection(Selection::new(CharOffset::new(4), CharOffset::new(6)));
+        let snapshot = build_snapshot(&mut document, viewport(0, 10));
+        assert!(bracket_decorations(&snapshot).is_empty());
+    }
+
+    #[test]
+    fn a_caret_between_two_brackets_prefers_the_one_it_is_walking_into() {
+        // At "(|)", the caret is both just after '(' and just before ')'.
+        // The one it is about to type into (')') wins, matching back to '('.
+        let mut document = document("()");
+        document.set_selection(Selection::caret(CharOffset::new(1)));
+        let snapshot = build_snapshot(&mut document, viewport(0, 10));
+        assert_eq!(bracket_decorations(&snapshot), vec![(0, 0), (0, 1)]);
     }
 }

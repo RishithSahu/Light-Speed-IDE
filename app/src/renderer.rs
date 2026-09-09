@@ -16,7 +16,7 @@ use crate::quads::{Quad, QuadRenderer};
 use crate::tabs::TabGeometry;
 use crate::text::{Region, RichText, TextEngine, TextRegionPlacement};
 use crate::theme::{Color, Theme};
-use ls_core::{DecorationKind, RenderSnapshot};
+use ls_core::{DecorationKind, DiagnosticSeverity, RenderSnapshot};
 use std::sync::Arc;
 use winit::window::Window;
 
@@ -107,6 +107,20 @@ pub struct Frame<'a> {
     /// highlight quads alike) so a click still resolves against what the
     /// pointer is actually over.
     pub sidebar_scroll_y: f32,
+    /// The Source Control panel's commit graph, laid out for drawing. See
+    /// `Chrome::sidebar_graph`.
+    pub sidebar_graph: Option<crate::compose::SidebarGraph>,
+    /// Every search match's position within `sidebar`'s own text --
+    /// `(row, start_byte, end_byte)` -- drawn as a real background box (see
+    /// `render`'s own highlight pass) rather than the color-only treatment
+    /// a match used to get. Empty whenever the Search panel is not the one
+    /// showing.
+    pub sidebar_search_highlights: &'a [(usize, usize, usize)],
+    /// The terminal's own text selection -- `(anchor, current)`, each a
+    /// `(row, byte)` into `Region::BottomPanel`'s current rows, unordered
+    /// (`render`'s highlight pass sorts them). `None` outside an active or
+    /// just-finished drag.
+    pub terminal_selection: Option<((usize, usize), (usize, usize))>,
     /// The command palette's own content (query row + filtered commands),
     /// and its floating panel rectangle, when it is open.
     pub palette: Option<&'a RichText>,
@@ -117,6 +131,12 @@ pub struct Frame<'a> {
     pub activity: &'a RichText,
     pub activity_active: Option<usize>,
     pub activity_hovered: Option<usize>,
+    /// The Settings cell pinned to the bottom of the activity bar.
+    pub activity_settings: &'a RichText,
+    pub activity_settings_active: bool,
+    pub activity_settings_hovered: bool,
+    /// Whether the pointer is over the title bar's Play button.
+    pub title_actions_hovered: bool,
     /// Rows for the docked bottom panel's content, when it is shown.
     pub bottom_panel: Option<&'a [String]>,
     /// The bottom panel's own icon rail.
@@ -134,6 +154,16 @@ pub struct Frame<'a> {
     pub dependency: Option<DependencyFrame<'a>>,
     /// The settings screen, when it has.
     pub settings: Option<SettingsFrame<'a>>,
+    /// The active document's raw Markdown source, when
+    /// `view.toggle_markdown_preview` is on and it actually is one -- its
+    /// rendered form (`markdown::render`) stands in for `Region::Editor`
+    /// the same way `dependency` does.
+    pub markdown_preview: Option<&'a str>,
+    /// The active document's own vertical scroll, in pixels -- unlike
+    /// `scroll_fraction` (a sub-line remainder for the editor's virtualized,
+    /// line-indexed scrolling), the preview shapes its whole content at
+    /// once and needs the raw pixel amount to shift its drawn origin by.
+    pub markdown_scroll_y: f32,
 }
 
 /// Everything the settings screen needs drawn, already measured.
@@ -381,6 +411,26 @@ impl Renderer {
         (line_index.min(snapshot.total_lines.saturating_sub(1)), column)
     }
 
+    /// The (row, byte offset) `Region::BottomPanel`'s shaped text has under
+    /// `(x, y)` -- the terminal's own `position_at_point`, so a click or
+    /// drag in the output/input area resolves to a real position in the
+    /// currently-shaped rows rather than an assumed character width. The
+    /// row is not clamped to the panel's actual row count; the caller
+    /// already knows that count (`terminal_visible_lines` plus its own
+    /// chrome rows) and is in a better position to decide what an
+    /// out-of-range click means.
+    pub fn terminal_position_at_point(&self, layout: &Layout, x: f32, y: f32) -> (usize, usize) {
+        let line_height = layout.metrics.line_height.max(1.0);
+        let relative_y = (y - layout.bottom_panel.y).max(0.0);
+        let row = (relative_y / line_height).floor() as usize;
+        // Matches `compose.rs`'s own `Region::BottomPanel` origin exactly
+        // (`panel.x + 8.0 * scale`) -- without it, every resolved byte
+        // offset drifts left by that margin.
+        let relative_x = (x - layout.bottom_panel.x - 8.0 * layout.scale).max(0.0);
+        let byte = self.text.byte_at_x(Region::BottomPanel, row, relative_x);
+        (row, byte)
+    }
+
     /// Draws one frame.
     pub fn render(&mut self, frame: &Frame<'_>) -> Result<(), FrameError> {
         let layout = frame.layout;
@@ -401,16 +451,92 @@ impl Renderer {
             sidebar_selected_row: frame.sidebar_selected_row,
             sidebar_hovered_row: frame.sidebar_hovered_row,
             sidebar_scroll_y: frame.sidebar_scroll_y,
+            sidebar_graph: frame.sidebar_graph.clone(),
             palette_panel: frame.palette_panel,
             palette_selected: frame.palette_selected,
             palette_hovered: frame.palette_hovered,
 
             activity_active: frame.activity_active,
             activity_hovered: frame.activity_hovered,
+            activity_settings_active: frame.activity_settings_active,
+            activity_settings_hovered: frame.activity_settings_hovered,
+            title_actions_hovered: frame.title_actions_hovered,
             bottom_panel: layout.bottom_panel_visible.then_some(layout.bottom_panel),
             bottom_panel_rail: layout.bottom_panel_visible.then_some(layout.bottom_panel_rail),
         });
         self.add_editor_layer(frame, &mut draw);
+
+        // A real background box over every search match, from the row's
+        // already-shaped glyphs (`highlight_spans`) rather than an assumed
+        // monospace character width -- the same mechanism the editor's own
+        // text selection uses (see the `snapshot.selections` loop above),
+        // just against `Region::Sidebar` instead of `Region::Editor`. Has to
+        // run after `build_text` has shaped this frame's sidebar content
+        // (already true by this point) and cannot live in `compose.rs`,
+        // which never touches `self.text` by design.
+        if layout.sidebar_visible {
+            let panel = layout.sidebar;
+            let scale = layout.scale;
+            let origin_x = panel.x + 8.0 * scale;
+            for &(row, start_byte, end_byte) in frame.sidebar_search_highlights {
+                let top = panel.y + row as f32 * layout.metrics.line_height - frame.sidebar_scroll_y;
+                if top + layout.metrics.line_height <= panel.y || top >= panel.bottom() {
+                    continue;
+                }
+                for (x, width) in
+                    self.text.highlight_spans(Region::Sidebar, row, start_byte, end_byte)
+                {
+                    if width <= 0.0 {
+                        continue;
+                    }
+                    draw.push_quad(
+                        Layer::Base,
+                        Quad::new(
+                            Rect::new(origin_x + x, top, width, layout.metrics.line_height),
+                            theme.selection,
+                        ),
+                    );
+                }
+            }
+        }
+
+        // The terminal's own text selection -- same mechanism, against
+        // `Region::BottomPanel` and `layout.bottom_panel` instead.
+        if let (true, Some((anchor, current))) =
+            (layout.bottom_panel_visible, frame.terminal_selection)
+        {
+            let (start, end) = if anchor <= current { (anchor, current) } else { (current, anchor) };
+            if start != end {
+                let panel = layout.bottom_panel;
+                let origin_x = panel.x + 8.0 * layout.scale;
+                for row in start.0..=end.0 {
+                    let top = panel.y + row as f32 * layout.metrics.line_height;
+                    if top + layout.metrics.line_height <= panel.y || top >= panel.bottom() {
+                        continue;
+                    }
+                    let from = if row == start.0 { start.1 } else { 0 };
+                    // A row's own text length is not known here (that is
+                    // `bottom_panel_rows`' job, on the app side) -- an
+                    // end byte past it is exactly what `highlight_spans`
+                    // already treats as "to the end of the shaped run", so
+                    // there is nothing to clamp.
+                    let to = if row == end.0 { end.1 } else { usize::MAX };
+                    for (x, width) in self.text.highlight_spans(Region::BottomPanel, row, from, to)
+                    {
+                        if width <= 0.0 {
+                            continue;
+                        }
+                        draw.push_quad(
+                            Layer::Base,
+                            Quad::new(
+                                Rect::new(origin_x + x, top, width, layout.metrics.line_height),
+                                theme.selection,
+                            ),
+                        );
+                    }
+                }
+            }
+        }
 
         // Acquire the swapchain image, recovering from the recoverable states.
         let surface_frame = match self.surface.get_current_texture() {
@@ -589,6 +715,26 @@ impl Renderer {
                 &text,
                 layout.text.width.max(1.0) + 4096.0,
                 layout.text.height.max(layout.metrics.line_height),
+            );
+        }
+
+        // The Markdown preview: shaped to its own full height (not the
+        // pane's), the same reason the sidebar's own `set_rich_text` call
+        // does -- a buffer sized to the visible area alone would silently
+        // never shape a row past it, and `origin_y` shifting at draw time
+        // can only move an already-fixed window, never reveal one.
+        if let Some(source) = frame.markdown_preview {
+            let rich = crate::markdown::render(source, frame.theme);
+            let lines = rich.text.matches('\n').count() + 1;
+            let content_height =
+                (lines as f32 * layout.metrics.line_height).max(layout.text.height);
+            self.text.set_rich_text(
+                Region::MarkdownPreview,
+                &rich.text,
+                layout.text.width.max(1.0),
+                content_height.max(layout.metrics.line_height),
+                frame.theme.text,
+                &rich.spans,
             );
         }
 
@@ -837,6 +983,18 @@ impl Renderer {
             layout.activity_bar.width,
         );
 
+        let settings_font = icons::cell_icon_font_size(layout.activity_settings.width);
+        self.text.set_icon_cluster(
+            Region::ActivitySettings,
+            &frame.activity_settings.text,
+            layout.activity_settings.width.max(1.0),
+            layout.activity_settings.height.max(1.0),
+            frame.theme.activity_icon_active,
+            &frame.activity_settings.spans,
+            settings_font,
+            layout.activity_settings.width,
+        );
+
         self.bottom_panel_text.clear();
         if let Some(lines) = frame.bottom_panel {
             for (index, line) in lines.iter().enumerate() {
@@ -992,6 +1150,24 @@ impl Renderer {
                     // start of this line.
                     self.settings_rich.plain("     ");
                     self.settings_rich.colored(text, theme.text);
+                }
+                Row::Choice(options) => {
+                    // Regression fix: a choice used to draw its pill quads
+                    // with nothing at all written on them -- an unpicked
+                    // pill (dark on dark) was invisible and the picked one
+                    // read as a single unlabeled blue box. Each label is
+                    // padded to exactly the width `settings_ui::layout` gave
+                    // its pill (`option.chars().count() + 4`, a single space
+                    // between pills) so the text lands inside the pill it
+                    // names rather than merely near it.
+                    self.settings_rich.plain(&" ".repeat(crate::settings_ui::INDENT));
+                    for (index, (option, picked)) in options.iter().enumerate() {
+                        if index > 0 {
+                            self.settings_rich.plain(" ");
+                        }
+                        let colour = if *picked { theme.text } else { theme.dim_text };
+                        self.settings_rich.colored(&format!("  {option}  "), colour);
+                    }
                 }
             }
             self.settings_rich.newline();
@@ -1171,6 +1347,22 @@ impl Renderer {
             return;
         }
 
+        // The Markdown preview stands in for the document too -- read-only,
+        // so no caret, selection or gutter work below applies to it either.
+        if frame.markdown_preview.is_some() {
+            draw.push_text(
+                Layer::Base,
+                TextRegionPlacement {
+                    region: Region::MarkdownPreview,
+                    origin_x: layout.text.x,
+                    origin_y: layout.text.y - frame.markdown_scroll_y,
+                    clip: layout.text,
+                    color: theme.text,
+                },
+            );
+            return;
+        }
+
         // The dependency view stands in for the document, so none of the
         // caret, selection or decoration work below applies to it.
         if let Some(dependency) = &frame.dependency {
@@ -1244,6 +1436,100 @@ impl Renderer {
                 draw.push_quad(
                     Layer::Base,
                     Quad::new(Rect::new(origin_x + x, top, width, line_height), theme.search_match),
+                );
+            }
+        }
+
+        // The bracket pair the caret sits next to, if any -- same drawing
+        // shape as the search-match loop just above (one quad per matched
+        // character), just its own decoration kind and color.
+        for decoration in &snapshot.decorations {
+            if decoration.kind != DecorationKind::BracketMatch {
+                continue;
+            }
+            let Some(row) = decoration.line.get().checked_sub(first_line) else { continue };
+            let Some(line) = snapshot.lines.get(row) else { continue };
+            let top = layout.row_top(row, frame.scroll_fraction);
+            if top + line_height <= layout.text.y || top >= layout.text.bottom() {
+                continue;
+            }
+            let start_byte = Self::byte_for_column(&line.text, decoration.start_column_chars);
+            let end_byte = Self::byte_for_column(&line.text, decoration.end_column_chars);
+            for (x, width) in self.text.highlight_spans(Region::Editor, row, start_byte, end_byte) {
+                if width <= 0.0 {
+                    continue;
+                }
+                draw.push_quad(
+                    Layer::Base,
+                    Quad::new(Rect::new(origin_x + x, top, width, line_height), theme.bracket_match),
+                );
+            }
+        }
+
+        // Diagnostics: the data has existed since the LSP client's first
+        // `apply_diagnostics` call (`Document::diagnostics`,
+        // `RenderSnapshot.diagnostics`) with nothing ever drawn from it --
+        // this is that other half. A thin underline at the flagged span in
+        // the text, plus one dot per line in the gutter (the line's most
+        // severe diagnostic wins the color, so one squiggle never hides
+        // under another).
+        let underline_height = (2.0 * layout.scale).max(1.0);
+        for diagnostic in &snapshot.diagnostics {
+            let Some(row) = diagnostic.line.get().checked_sub(first_line) else { continue };
+            let Some(line) = snapshot.lines.get(row) else { continue };
+            let top = layout.row_top(row, frame.scroll_fraction);
+            if top + line_height <= layout.text.y || top >= layout.text.bottom() {
+                continue;
+            }
+            let color = theme.diagnostic_color(diagnostic.severity);
+            let end_column = diagnostic.end_column_chars.max(diagnostic.start_column_chars + 1);
+            let start_byte = Self::byte_for_column(&line.text, diagnostic.start_column_chars);
+            let end_byte = Self::byte_for_column(&line.text, end_column);
+            for (x, width) in self.text.highlight_spans(Region::Editor, row, start_byte, end_byte) {
+                if width <= 0.0 {
+                    continue;
+                }
+                draw.push_quad(
+                    Layer::Base,
+                    Quad::new(
+                        Rect::new(origin_x + x, top + line_height - underline_height, width, underline_height),
+                        color,
+                    ),
+                );
+            }
+        }
+        if layout.show_line_numbers {
+            let dot_size = (line_height * 0.28).max(2.0);
+            let dot_x = layout.gutter.right() - dot_size - 4.0 * layout.scale;
+            for row in 0..snapshot.lines.len() {
+                let line = &snapshot.lines[row];
+                let worst = snapshot
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.line == line.index)
+                    .map(|d| d.severity)
+                    .max_by_key(|severity| match severity {
+                        DiagnosticSeverity::Error => 3,
+                        DiagnosticSeverity::Warning => 2,
+                        DiagnosticSeverity::Information => 1,
+                        DiagnosticSeverity::Hint => 0,
+                    });
+                let Some(severity) = worst else { continue };
+                let top = layout.row_top(row, frame.scroll_fraction);
+                if top + line_height <= layout.gutter.y || top >= layout.gutter.bottom() {
+                    continue;
+                }
+                draw.push_quad(
+                    Layer::Base,
+                    Quad::new(
+                        Rect::new(
+                            dot_x,
+                            top + (line_height - dot_size) / 2.0,
+                            dot_size,
+                            dot_size,
+                        ),
+                        theme.diagnostic_color(severity),
+                    ),
                 );
             }
         }
